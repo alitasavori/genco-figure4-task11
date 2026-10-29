@@ -1,0 +1,7 @@
+vendor/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+*.pem
+results/logs/

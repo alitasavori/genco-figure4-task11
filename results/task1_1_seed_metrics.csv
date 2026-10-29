@@ -1,0 +1,17 @@
+model,task,test_category,seed,mean_pbl_pu,checkpoint_path,source
+GENCO Base,1.1,N,aggregate,0.0014,,published_figure4_table
+GENCO Base,1.1,N-1,aggregate,0.042,,published_figure4_table
+GENCO Base,1.1,N-2,aggregate,0.05,,published_figure4_table
+GENCO Base,1.1,C2I,aggregate,0.3,,published_figure4_table
+PFNet,1.1,N,aggregate,0.32,,published_figure4_table
+PFNet,1.1,N-1,aggregate,0.52,,published_figure4_table
+PFNet,1.1,N-2,aggregate,0.53,,published_figure4_table
+PFNet,1.1,C2I,aggregate,1.4,,published_figure4_table
+CANOS-PF,1.1,N,aggregate,0.027,,published_figure4_table
+CANOS-PF,1.1,N-1,aggregate,0.7,,published_figure4_table
+CANOS-PF,1.1,N-2,aggregate,0.56,,published_figure4_table
+CANOS-PF,1.1,C2I,aggregate,1.1,,published_figure4_table
+GNS-S,1.1,N,aggregate,0.53,,published_figure4_table
+GNS-S,1.1,N-1,aggregate,0.68,,published_figure4_table
+GNS-S,1.1,N-2,aggregate,0.71,,published_figure4_table
+GNS-S,1.1,C2I,aggregate,1,,published_figure4_table

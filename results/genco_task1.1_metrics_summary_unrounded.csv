@@ -1,0 +1,5 @@
+model,test_category,mean_pbl_pu,std_pbl_pu,source
+GENCO Base,N,0.0014365429679552711,0.00038566372924967053,genco_metrics_summary_csv
+GENCO Base,N-1,0.042099264462788895,0.02183983789776223,genco_metrics_summary_csv
+GENCO Base,N-2,0.05048130909601847,0.026133216315799984,genco_metrics_summary_csv
+GENCO Base,C2I,0.3007470300462511,0.082013997457341,genco_metrics_summary_csv

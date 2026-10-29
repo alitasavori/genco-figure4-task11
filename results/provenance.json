@@ -1,0 +1,34 @@
+{
+  "task": "1.1",
+  "system": "IEEE 118-bus",
+  "pinned_commits": {
+    "gridfm-paper-genco": {
+      "url": "https://github.com/gridfm/gridfm-paper-genco.git",
+      "branch": "main",
+      "sha": "107ae0be34660fb7de5e629fa74c60ee63afad2e"
+    },
+    "gridfm-graphkit": {
+      "url": "https://github.com/gridfm/gridfm-graphkit.git",
+      "branch": "genco-paper-repro-pfdelta",
+      "sha": "310e2f989b46058f3e6c5b4a56b7d03de06a3340"
+    },
+    "pfdelta": {
+      "url": "https://github.com/MOSSLab-MIT/pfdelta.git",
+      "branch": "main",
+      "sha": "0fb3aeda2bbca807418a49cc934e4640f988964a"
+    }
+  },
+  "canos_pf_loss_correction": {
+    "date": "2026-03-26",
+    "status": "fixed_in_pinned_pfdelta_commit",
+    "detail": "The PFDelta README at 0fb3aeda states that constraint_violations_loss_pf incorrectly calculated reactive-power mismatch and line-branch-flow mismatch, and that the bug has been fixed. Full reproduction uses that corrected implementation. Figure 4 reused the previously published PFDelta baseline numbers, so retrained CANOS-PF can differ from those bars. The correction is not reverted."
+  },
+  "std_convention": "Sample standard deviation with Bessel correction (numpy.std ddof=1), matching torch.Tensor.std in scripts/test_error.py.",
+  "metric": "Mean over samples of the mean over buses of sqrt(dP^2 + dQ^2), in per unit on a 100 MVA base.",
+  "genco_mode": "published",
+  "genco_yaml_seeds": {
+    "1": 0,
+    "2": 42,
+    "3": 1234
+  }
+}
