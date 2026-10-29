@@ -7,7 +7,11 @@ and plotting live in the Python files.
 
 ## Open in Colab
 
-Use a separate runtime for each notebook. The GENCO runtime and the PFΔ runtime cannot share one Python environment.
+Open this notebook. It installs the plotting packages, runs the scripts, and shows the published figure. It does not train the models.
+
+- [Task1_1.ipynb](https://colab.research.google.com/github/alitasavori/genco-figure4-task11/blob/main/Task1_1.ipynb)
+
+Training, which has not been run, is split across two later notebooks because the two codebases pin different PyTorch versions:
 
 - [GENCO_Task1_1.ipynb](https://colab.research.google.com/github/alitasavori/genco-figure4-task11/blob/main/GENCO_Task1_1.ipynb)
 - [PFDelta_Baselines_Task1_1.ipynb](https://colab.research.google.com/github/alitasavori/genco-figure4-task11/blob/main/PFDelta_Baselines_Task1_1.ipynb)
