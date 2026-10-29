@@ -11,8 +11,6 @@ Open this notebook on a GPU runtime. The first cell runs `install_train.py`, whi
 
 - [Task1_1.ipynb](https://colab.research.google.com/github/alitasavori/genco-figure4-task11/blob/main/Task1_1.ipynb)
 
-`GENCO_Task1_1.ipynb` and `PFDelta_Baselines_Task1_1.ipynb` train the same models one stack at a time. Use them only if you want to rerun one stack by itself.
-
 Or clone it yourself:
 
 ```bash
@@ -38,13 +36,7 @@ says which models are absent. Paper numbers are not copied into that figure.
 PFΔ pins `torch==2.1.2`. The GENCO graphkit commit pins `torch>=2.7.1,<2.9`.
 `install_train.py` puts each pin in its own Python 3.11 environment. `train_and_test_task11.py` runs GENCO in the first environment and the three baselines in the second.
 
-| Notebook | What it runs |
-| --- | --- |
-| `Task1_1.ipynb` | All four models. Install cell, then train-and-test cell. |
-| `GENCO_Task1_1.ipynb` | GENCO Base only, in the notebook kernel. |
-| `PFDelta_Baselines_Task1_1.ipynb` | PFNet, CANOS-PF, and GNS-S only, in the notebook kernel. |
-
-`MODE = "full"` trains three seeds and tests them. Finished seeds are skipped. `quick` does not train the baselines. `published` only redraws the authors' table.
+`Task1_1.ipynb` is the notebook. Its install cell runs `install_train.py`. Its second cell runs `train_and_test_task11.py` with `MODE = "full"`, which trains three seeds, tests them, and writes the figure. Finished seeds are skipped.
 
 ## Execution sequence
 
