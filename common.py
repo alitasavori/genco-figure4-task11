@@ -11,8 +11,25 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-RESULTS = ROOT / "results"
+
+
+def resolve_results() -> Path:
+    override = os.environ.get("GENCO_RESULTS_DIR")
+    path = Path(override) if override else ROOT / "results"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+RESULTS = resolve_results()
 LOGS = RESULTS / "logs"
+
+
+def use_selected_results() -> None:
+    """Re-read GENCO_RESULTS_DIR after Drive is mounted."""
+    global RESULTS, LOGS
+    RESULTS = resolve_results()
+    LOGS = RESULTS / "logs"
+    LOGS.mkdir(parents=True, exist_ok=True)
 
 # Recorded from the GitHub API on 2026-10-29. Install scripts check these SHAs
 # out explicitly so a later branch move does not change the reproduction.
@@ -134,21 +151,28 @@ def run_command(cmd: list[str], cwd: Path | None, log_path: Path, env: dict | No
     if env:
         merged.update(env)
     merged["PYTHONUNBUFFERED"] = "1"
-    print("Running:", " ".join(cmd))
+    print("Running:", " ".join(cmd), flush=True)
     with log_path.open("w", encoding="utf-8") as handle:
         handle.write(" ".join(cmd) + "\n\n")
         handle.flush()
-        process = subprocess.run(
+        process = subprocess.Popen(
             cmd,
             cwd=str(cwd) if cwd is not None else None,
             env=merged,
-            stdout=handle,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            bufsize=1,
         )
-    if process.returncode != 0:
+        assert process.stdout is not None
+        for line in process.stdout:
+            handle.write(line)
+            handle.flush()
+            print(line, end="", flush=True)
+        returncode = process.wait()
+    if returncode != 0:
         tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
-        raise SystemExit(f"Command failed ({process.returncode}). Log: {log_path}\n{tail}")
+        raise SystemExit(f"Command failed ({returncode}). Log: {log_path}\n{tail}")
 
 
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:

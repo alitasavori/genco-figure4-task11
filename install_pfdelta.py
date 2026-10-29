@@ -7,9 +7,60 @@ with a newer torch if the pin fails to see the GPU.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
+from shutil import which
 
 from common import LOGS, clone_repo, ensure_dirs, in_colab, report_environment, run_command, work_root
+
+
+def _torch_probe() -> tuple[str, bool]:
+    probe = subprocess.run(
+        [sys.executable, "-c", "import torch; print(torch.__version__); print(int(torch.cuda.is_available()))"],
+        text=True,
+        capture_output=True,
+    )
+    if probe.returncode != 0:
+        raise SystemExit(probe.stderr or probe.stdout)
+    lines = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+    return lines[0], lines[-1] == "1"
+
+
+def ensure_cuda_build() -> None:
+    """Keep torch==2.1.2. Swap in the cu121 wheel when a GPU is present but unseen."""
+    gpu = bool(os.environ.get("COLAB_GPU") or which("nvidia-smi"))
+    version, cuda_ok = _torch_probe()
+    if not gpu:
+        print(f"No NVIDIA GPU detected. Leaving torch {version} as installed by requirements.txt.")
+        return
+    if cuda_ok:
+        print(f"torch {version} sees the GPU.")
+        return
+    print(
+        f"torch {version} does not see the GPU. Reinstalling the cu121 build of the same "
+        "torch==2.1.2, torchvision==0.16.2, and torchaudio==2.1.2 pins."
+    )
+    run_command(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--force-reinstall",
+            "torch==2.1.2",
+            "torchvision==0.16.2",
+            "torchaudio==2.1.2",
+            "--index-url",
+            "https://download.pytorch.org/whl/cu121",
+        ],
+        cwd=None,
+        log_path=LOGS / "pip_pfdelta_torch_cu121.log",
+    )
+    version, cuda_ok = _torch_probe()
+    if not cuda_ok:
+        raise SystemExit(f"torch {version} still cannot see the GPU. Training was not started.")
+    print(f"torch {version} now sees the GPU.")
 
 
 def main() -> None:
@@ -44,6 +95,12 @@ def main() -> None:
         cwd=repo,
         log_path=LOGS / "pip_pfdelta_requirements.log",
     )
+    run_command(
+        [sys.executable, "-m", "pip", "install", "pyyaml"],
+        cwd=None,
+        log_path=LOGS / "pip_pfdelta_pyyaml.log",
+    )
+    ensure_cuda_build()
     report_environment()
     (LOGS / "pfdelta_compatibility.txt").write_text(
         "\n".join(

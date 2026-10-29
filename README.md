@@ -7,14 +7,11 @@ and plotting live in the Python files.
 
 ## Open in Colab
 
-Open this notebook. It installs the plotting packages, runs the scripts, and shows the published figure. It does not train the models.
+Open this notebook on a GPU runtime. The first cell runs `install_train.py`, which builds two Python 3.11 environments because the codebases pin different PyTorch versions. The second cell runs `train_and_test_task11.py` with `MODE = "full"`, which trains three seeds of GENCO Base, PFNet, CANOS-PF, and GNS-S, tests them, and displays the measurements.
 
 - [Task1_1.ipynb](https://colab.research.google.com/github/alitasavori/genco-figure4-task11/blob/main/Task1_1.ipynb)
 
-Training, which has not been run, is split across two later notebooks because the two codebases pin different PyTorch versions:
-
-- [GENCO_Task1_1.ipynb](https://colab.research.google.com/github/alitasavori/genco-figure4-task11/blob/main/GENCO_Task1_1.ipynb)
-- [PFDelta_Baselines_Task1_1.ipynb](https://colab.research.google.com/github/alitasavori/genco-figure4-task11/blob/main/PFDelta_Baselines_Task1_1.ipynb)
+`GENCO_Task1_1.ipynb` and `PFDelta_Baselines_Task1_1.ipynb` train the same models one stack at a time. Use them only if you want to rerun one stack by itself.
 
 Or clone it yourself:
 
@@ -36,38 +33,31 @@ figure is written only after independent training finishes for GENCO Base,
 CANOS-PF, GNS-S, and PFNet. If it is missing, `results/figure4_task1.1_retrained_NOT_RUN.txt`
 says which models are absent. Paper numbers are not copied into that figure.
 
-## Two runtimes
+## Two environments, one notebook
 
 PFΔ pins `torch==2.1.2`. The GENCO graphkit commit pins `torch>=2.7.1,<2.9`.
-Use a fresh Colab runtime for each notebook.
+`install_train.py` puts each pin in its own Python 3.11 environment. `train_and_test_task11.py` runs GENCO in the first environment and the three baselines in the second.
 
-| Notebook | Script | Models |
-| --- | --- | --- |
-| `GENCO_Task1_1.ipynb` | `install_genco.py`, `reproduce_genco.py` | GENCO Base |
-| `PFDelta_Baselines_Task1_1.ipynb` | `install_pfdelta.py`, `reproduce_pfdelta.py` | PFNet, CANOS-PF, GNS-S |
+| Notebook | What it runs |
+| --- | --- |
+| `Task1_1.ipynb` | All four models. Install cell, then train-and-test cell. |
+| `GENCO_Task1_1.ipynb` | GENCO Base only, in the notebook kernel. |
+| `PFDelta_Baselines_Task1_1.ipynb` | PFNet, CANOS-PF, and GNS-S only, in the notebook kernel. |
 
-In the reproduction cell, `MODE` is `quick` or `full`.
-
-- `published` refreshes the table figure and does not download or train. It is available from the command line.
-- `quick` on the GENCO notebook evaluates the released checkpoints and refreshes the published figure.
-- `quick` on the PFΔ notebook checks the pinned configs and does not train. The published baseline bars are the PFΔ paper values, which is how Figure 4 was made.
-- `full` trains that notebook's models for three seeds, evaluates them, and updates the summary. Run the GENCO full mode and the PFΔ full mode before expecting `figure4_task1.1_retrained.pdf`.
+`MODE = "full"` trains three seeds and tests them. Finished seeds are skipped. `quick` does not train the baselines. `published` only redraws the authors' table.
 
 ## Execution sequence
 
-1. Open `GENCO_Task1_1.ipynb` in a Python 3.10–3.12 runtime with a GPU.
-2. Run the install cell, then the reproduction cell with `MODE = "quick"`.
-3. Open `PFDelta_Baselines_Task1_1.ipynb` in a different runtime.
-4. Run its install cell, then its reproduction cell. Leave `MODE = "quick"` to inspect the published comparison, or set `MODE = "full"` to train the baselines.
-5. For independent GENCO weights, set `MODE = "full"` in the GENCO notebook and run the reproduction cell again. Finished seeds are skipped. A Lightning `last.ckpt` is resumed.
+1. Open `Task1_1.ipynb` on a GPU runtime.
+2. Run the install cell. Accept the Google Drive prompt so checkpoints survive a disconnect.
+3. Run the training cell. Leave `MODE = "full"`.
+4. If Colab disconnects, run both cells again. Completed seeds are not repeated.
 
 Command-line equivalents, from this directory:
 
 ```bash
-python install_genco.py
-python reproduce_genco.py --mode quick
-python install_pfdelta.py
-python reproduce_pfdelta.py --mode full
+python install_train.py
+python train_and_test_task11.py --mode full
 python plot_task1_1.py
 python -m unittest tests.test_task11
 ```

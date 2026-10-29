@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+from shutil import which
 
 from common import LOGS, clone_repo, ensure_dirs, in_colab, report_environment, run_command, work_root
 
@@ -39,19 +40,22 @@ def torch_version_ok() -> bool:
 
 
 def install_torch() -> None:
+    gpu = bool(os.environ.get("COLAB_GPU") or which("nvidia-smi"))
     if torch_version_ok():
         import torch
 
-        print(f"Keeping existing torch {torch.__version__}")
-        return
+        if (not gpu) or torch.cuda.is_available():
+            print(f"Keeping existing torch {torch.__version__}")
+            return
+        print(f"Replacing CPU torch {torch.__version__} with torch==2.8.0+cu124.")
     index = []
     try:
         import torch
 
         cuda = torch.version.cuda
     except Exception:
-        cuda = os.environ.get("COLAB_GPU")
-    if cuda or os.environ.get("COLAB_GPU"):
+        cuda = None
+    if cuda or gpu:
         # cu124 wheels cover the torch 2.8 pin used with this graphkit commit.
         index = ["--index-url", "https://download.pytorch.org/whl/cu124"]
         print("Installing torch==2.8.0+cu124 to satisfy graphkit torch>=2.7.1,<2.9.")
