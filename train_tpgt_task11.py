@@ -996,25 +996,81 @@ def numbered_epoch_checkpoints(model_dir: Path) -> list[tuple[int, Path]]:
     return found
 
 
-def load_resume_checkpoint(model_dir: Path, device: torch.device) -> tuple[dict | None, Path | None]:
-    """Load last.pt, or a newer epoch_k.pt if that file finished later."""
+def checkpoint_version_reason(payload: dict) -> str | None:
+    """Return a short reason when ``payload`` must not be restored; else None."""
+    found = payload.get("checkpoint_version")
+    if found is None:
+        return f"missing checkpoint_version (expected {CHECKPOINT_VERSION})"
+    if found != CHECKPOINT_VERSION:
+        return f"checkpoint_version {found!r} != {CHECKPOINT_VERSION!r}"
+    return None
+
+
+def pair_encoder_input_mismatch(payload: dict) -> str | None:
+    """Detect checkpoints from an older RPE width (e.g. 6-feature tree RPE) before load."""
+    state = payload.get("model")
+    if not isinstance(state, dict):
+        return None
+    weight = state.get("pair_encoder.net.0.weight")
+    if weight is None or not hasattr(weight, "shape"):
+        return None
+    in_features = int(weight.shape[1])
+    if in_features == RPE_DIM:
+        return None
+    return f"pair_encoder expects {RPE_DIM} RPE features, checkpoint has {in_features}"
+
+
+def try_load_checkpoint_file(path: Path, device: torch.device) -> dict | None:
+    try:
+        loaded = torch.load(path, map_location=device, weights_only=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def log_checkpoint_obsolete(seed: int, reason: str) -> None:
+    print(f"Seed {seed}: checkpoint obsolete ({reason}); training from epoch 0.", flush=True)
+
+
+def load_resume_checkpoint(
+    model_dir: Path,
+    device: torch.device,
+) -> tuple[dict | None, Path | None, str | None]:
+    """Pick the newest compatible checkpoint; ignore wrong-version numbered files."""
     last_path = model_dir / "last.pt"
-    numbered = numbered_epoch_checkpoints(model_dir)
-    saved = None
-    chosen: Path | None = None
+    obsolete_reason: str | None = None
+    candidates: list[tuple[int, Path, dict]] = []
+
     if last_path.is_file():
-        saved = torch.load(last_path, map_location=device, weights_only=False)
-        chosen = last_path
-    if numbered:
-        epoch_number, epoch_path = numbered[-1]
-        saved_epoch = int(saved["epoch"]) if saved is not None else -1
-        if epoch_number > saved_epoch:
-            saved = torch.load(epoch_path, map_location=device, weights_only=False)
-            chosen = epoch_path
-    return saved, chosen
+        last_payload = try_load_checkpoint_file(last_path, device)
+        if last_payload is None:
+            obsolete_reason = "last.pt unreadable or corrupt"
+        else:
+            version_reason = checkpoint_version_reason(last_payload)
+            if version_reason is not None:
+                obsolete_reason = version_reason
+            else:
+                candidates.append((int(last_payload.get("epoch", 0)), last_path, last_payload))
+
+    for epoch_number, epoch_path in numbered_epoch_checkpoints(model_dir):
+        epoch_payload = try_load_checkpoint_file(epoch_path, device)
+        if epoch_payload is None:
+            continue
+        if checkpoint_version_reason(epoch_payload) is not None:
+            continue
+        candidates.append((epoch_number, epoch_path, epoch_payload))
+
+    if candidates:
+        _epoch, chosen_path, payload = max(candidates, key=lambda item: item[0])
+        return payload, chosen_path, None
+
+    if obsolete_reason is None and any(model_dir.glob("epoch_*.pt")):
+        obsolete_reason = f"no checkpoint with checkpoint_version {CHECKPOINT_VERSION!r}"
+    return None, last_path if last_path.is_file() else None, obsolete_reason
 
 
 def read_completed_epochs(done_path: Path) -> int:
+    """Epochs finished for the current code version only (old complete.json counts as 0)."""
     try:
         payload = json.loads(done_path.read_text(encoding="utf-8"))
         if payload.get("checkpoint_version") != CHECKPOINT_VERSION:
@@ -1028,23 +1084,31 @@ def restore_checkpoint_payload(
     model: TPGT,
     optimizer: torch.optim.Optimizer,
     payload: dict | None,
-) -> dict | None:
-    """Load weights if the checkpoint matches the current model; otherwise return None."""
+) -> tuple[dict | None, str | None]:
+    """Load weights when compatible; return (restored, obsolete_reason)."""
     if payload is None:
-        return None
-    if payload.get("checkpoint_version") != CHECKPOINT_VERSION:
-        return None
+        return None, None
+    version_reason = checkpoint_version_reason(payload)
+    if version_reason is not None:
+        return None, version_reason
+    rpe_reason = pair_encoder_input_mismatch(payload)
+    if rpe_reason is not None:
+        return None, rpe_reason
     try:
         model.load_state_dict(payload["model"], strict=True)
         optimizer.load_state_dict(payload["optimizer"])
-    except RuntimeError:
-        return None
-    return {
-        "epoch": int(payload["epoch"]),
-        "best_val": float(payload["best_val"]),
-        "wait": int(payload["wait"]),
-        "best_state": payload["best_state"],
-    }
+    except RuntimeError as error:
+        detail = str(error).split("\n", maxsplit=1)[0]
+        return None, f"state_dict incompatible with current model ({detail})"
+    return (
+        {
+            "epoch": int(payload["epoch"]),
+            "best_val": float(payload["best_val"]),
+            "wait": int(payload["wait"]),
+            "best_state": payload["best_state"],
+        },
+        None,
+    )
 
 
 def saves_checkpoint_epoch(epoch_number: int) -> bool:
@@ -1111,25 +1175,24 @@ def train_seed(
     best_val = float("inf")
     wait = 0
     best_state = None
-    saved, resumed_from = load_resume_checkpoint(model_dir, device)
-    restored = restore_checkpoint_payload(model, optimizer, saved)
+    saved, resumed_from, load_obsolete = load_resume_checkpoint(model_dir, device)
+    restored, restore_obsolete = restore_checkpoint_payload(model, optimizer, saved)
     if restored is not None:
         start_epoch = restored["epoch"]
         best_val = restored["best_val"]
         wait = restored["wait"]
         best_state = restored["best_state"]
-    elif saved is not None:
-        print(
-            f"Seed {seed}: checkpoint version mismatch; starting from epoch 0.",
-            flush=True,
-        )
+    else:
+        obsolete_reason = restore_obsolete or load_obsolete
+        if obsolete_reason is not None:
+            log_checkpoint_obsolete(seed, obsolete_reason)
     if done_path.exists() and read_completed_epochs(done_path) >= EPOCHS:
         print(f"Seed {seed} already completed {EPOCHS} epochs. Skipping.", flush=True)
         state = best_state
         if state is None:
-            fallback, _path = load_resume_checkpoint(model_dir, device)
+            fallback, _path, _load_obsolete = load_resume_checkpoint(model_dir, device)
             if fallback is not None:
-                restored_done = restore_checkpoint_payload(model, optimizer, fallback)
+                restored_done, _restore_obsolete = restore_checkpoint_payload(model, optimizer, fallback)
                 if restored_done is not None:
                     state = restored_done["best_state"]
         if state is None:
