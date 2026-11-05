@@ -25,9 +25,9 @@ Performance notes (Colab / large train split)
   ``118×118`` (one kernel graph per stage instead of eighteen Python loops).
   Optional ``GENCO_TPGT_COMPILE=1`` or ``--compile`` wraps the model in
   ``torch.compile`` (may differ slightly in numerics).
-* **Batch 64**: Optimizer steps use 64 cases per batch. On memory-limited GPUs,
+* **Batch 32**: Optimizer steps use 32 cases per batch. On memory-limited GPUs,
   forward/backward run in smaller **micro-batches** (default 16) with weighted
-  gradient accumulation so the effective batch stays 64. Override with
+  gradient accumulation so the effective batch stays 32. Override with
   ``GENCO_TPGT_MICRO_BATCH`` or ``--micro-batch``. CUDA training uses AMP (fp16).
 """
 
@@ -68,7 +68,7 @@ D_A = 24
 HEADS = 2
 DEPTH = 2
 ETA = 1.0
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 LEARNING_RATE = 1e-4
 EPOCHS = 100
 # Drive checkpoints (and results CSV / comparison plot) every 3rd epoch and at the final epoch.
