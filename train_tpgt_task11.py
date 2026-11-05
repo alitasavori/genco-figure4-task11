@@ -64,7 +64,7 @@ D = 32
 D_E = 16
 D_A = 16
 HEADS = 2
-DEPTH = 3
+DEPTH = 2
 ETA = 1.0
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
@@ -82,7 +82,7 @@ CACHE_VERSION = "tpgt-cache-2"
 RPE_WALK_STEPS = 5
 RPE_DIM = RPE_WALK_STEPS + 5
 # Bumped when pair-encoder input size or architecture changes; old Drive checkpoints are ignored.
-CHECKPOINT_VERSION = "meshed-rpe-10-v4"
+CHECKPOINT_VERSION = "meshed-rpe-10-v5-depth2"
 # Off-diagonal |Y_pq| below this are treated as disconnected for admittance scaling.
 Y_ADMITTANCE_EPS = 1e-10
 # PQ voltage unknown is clamped to this band when evaluating Ybus injections (p.u.).
