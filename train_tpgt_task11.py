@@ -68,7 +68,8 @@ ETA = 1.0
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
 EPOCHS = 100
-# Drive checkpoints and the four held-out test scores are written every 3rd epoch and at the final epoch.
+# Drive checkpoints (and results CSV / comparison plot) every 3rd epoch and at the final epoch.
+# The four held-out test PBL scores are printed every epoch (see on_epoch_end in train_seed).
 CHECKPOINT_EVERY = 3
 SEEDS = (0, 1, 2)
 BASE_MVA = 100.0
@@ -1029,8 +1030,8 @@ def restore_checkpoint_payload(
     }
 
 
-def reports_test_scores(epoch_number: int) -> bool:
-    """True on epochs 3, 6, ..., 99 and on the final epoch."""
+def saves_checkpoint_epoch(epoch_number: int) -> bool:
+    """True on epochs 3, 6, ..., 99 and on the final epoch (Drive checkpoint + results CSV)."""
     if epoch_number <= 0:
         return False
     return epoch_number == EPOCHS or epoch_number % CHECKPOINT_EVERY == 0
@@ -1050,7 +1051,11 @@ def train_seed(
     train_split: Split,
     val_split: Split,
     device: torch.device,
-    after_periodic_checkpoint: Callable[[TPGT, Path, int], None] | None = None,
+    on_epoch_end: Callable[[TPGT, int], tuple[dict[str, float], dict[str, int]]] | None = None,
+    after_periodic_checkpoint: Callable[
+        [TPGT, Path, int, dict[str, float], dict[str, int]], None
+    ]
+    | None = None,
 ) -> TPGT:
     model_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = model_dir / "last.pt"
@@ -1096,7 +1101,10 @@ def train_seed(
         model.load_state_dict(state, strict=True)
         return model
 
-    def save_epoch(epoch_number: int) -> None:
+    def save_epoch(
+        epoch_number: int,
+        test_scores: tuple[dict[str, float], dict[str, int]] | None = None,
+    ) -> None:
         epoch_path = model_dir / f"epoch_{epoch_number}.pt"
         payload = {
             "checkpoint_version": CHECKPOINT_VERSION,
@@ -1114,20 +1122,36 @@ def train_seed(
             flush=True,
         )
         if after_periodic_checkpoint is not None:
-            after_periodic_checkpoint(model, epoch_path, epoch_number)
+            if test_scores is None:
+                raise RuntimeError(
+                    f"Seed {seed} epoch {epoch_number}: checkpoint publish requires test scores "
+                    "(run on_epoch_end before save_epoch)."
+                )
+            scores, counts = test_scores
+            after_periodic_checkpoint(model, epoch_path, epoch_number, scores, counts)
         (model_dir / f"epoch_{epoch_number}.compared").write_text(
             json.dumps({"epoch": epoch_number}),
             encoding="utf-8",
         )
 
-    pending_test = reports_test_scores(start_epoch) and not (model_dir / f"epoch_{start_epoch}.compared").exists()
+    def finish_checkpoint_epoch(epoch_number: int) -> None:
+        """Run held-out test (print every epoch) then save Drive checkpoint when due."""
+        test_scores: tuple[dict[str, float], dict[str, int]] | None = None
+        if on_epoch_end is not None:
+            test_scores = on_epoch_end(model, epoch_number)
+        if saves_checkpoint_epoch(epoch_number):
+            save_epoch(epoch_number, test_scores)
+
+    pending_test = saves_checkpoint_epoch(start_epoch) and not (
+        model_dir / f"epoch_{start_epoch}.compared"
+    ).exists()
     finished = start_epoch >= EPOCHS
     if finished and pending_test:
         print(
             f"Seed {seed} epoch {start_epoch} checkpoint exists; running the missing test scores.",
             flush=True,
         )
-        save_epoch(start_epoch)
+        finish_checkpoint_epoch(start_epoch)
     elif finished:
         print(f"Seed {seed} already completed {EPOCHS} epochs. Skipping.", flush=True)
     elif restored is not None:
@@ -1136,7 +1160,7 @@ def train_seed(
             flush=True,
         )
         if pending_test:
-            save_epoch(start_epoch)
+            finish_checkpoint_epoch(start_epoch)
 
     if not finished:
         for epoch in range(start_epoch, EPOCHS):
@@ -1190,8 +1214,7 @@ def train_seed(
             else:
                 wait += 1
             start_epoch = epoch + 1
-            if reports_test_scores(start_epoch):
-                save_epoch(start_epoch)
+            finish_checkpoint_epoch(start_epoch)
     if best_state is None:
         raise RuntimeError(f"Seed {seed} produced no checkpoint.")
     model.load_state_dict(best_state)
@@ -1429,7 +1452,7 @@ def main() -> None:
             print(f"Seed {seed} already completed {EPOCHS} epochs. Skipping.", flush=True)
             continue
 
-        def publish_checkpoint(model: TPGT, checkpoint: Path, epoch_number: int, seed: int = seed) -> None:
+        def on_epoch_end(model: TPGT, epoch_number: int, seed: int = seed) -> tuple[dict[str, float], dict[str, int]]:
             scores, counts = test_model(model, data, device, active_cache, persistent_cache)
             c2i_counts = {
                 "C2I-N": counts["C2I-N"],
@@ -1439,6 +1462,17 @@ def main() -> None:
             reported = dict(scores)
             reported["C2I"] = aggregate_c2i(reported, c2i_counts)
             print(test_pbl_line(seed, epoch_number, reported), flush=True)
+            return scores, counts
+
+        def publish_checkpoint(
+            model: TPGT,
+            checkpoint: Path,
+            epoch_number: int,
+            scores: dict[str, float],
+            counts: dict[str, int],
+            seed: int = seed,
+        ) -> None:
+            # record_seed / summary CSV / plot only on Drive checkpoint epochs (not every epoch).
             record_seed(results, seed, scores, counts, checkpoint, epoch_number)
             summary = write_summary(results)
             print_comparison(summary)
@@ -1450,6 +1484,7 @@ def main() -> None:
             train_split,
             val_split,
             device,
+            on_epoch_end=on_epoch_end,
             after_periodic_checkpoint=publish_checkpoint,
         )
 
