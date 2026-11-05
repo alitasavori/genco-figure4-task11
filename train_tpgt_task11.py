@@ -743,10 +743,12 @@ def split_cache_dirs(checkpoints: Path) -> tuple[Path, Path]:
     return persistent, persistent
 
 
-def _mirror_cache_file(source: Path, destination: Path) -> None:
+def _mirror_cache_file(source: Path, destination: Path) -> bool:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if not destination.exists() or source.stat().st_mtime > destination.stat().st_mtime:
         shutil.copy2(source, destination)
+        return True
+    return False
 
 
 def sync_split_cache_from_drive(persistent: Path, active: Path) -> None:
@@ -756,8 +758,7 @@ def sync_split_cache_from_drive(persistent: Path, active: Path) -> None:
     active.mkdir(parents=True, exist_ok=True)
     copied = 0
     for path in sorted(persistent.iterdir()):
-        if path.is_file():
-            _mirror_cache_file(path, active / path.name)
+        if path.is_file() and _mirror_cache_file(path, active / path.name):
             copied += 1
     if copied:
         print(
@@ -1271,17 +1272,17 @@ def train_seed(
             running_phys = 0.0
             running_phys_stages = [0.0] * DEPTH
             batches = 0
-            first_batch_started: float | None = None
+            logged_first_batch = False
             batch_durations: list[float] = []
             for network_id, index in iterate_indexes(train_split, seed, epoch, shuffle=True):
                 optimizer.zero_grad(set_to_none=True)
-                if first_batch_started is None:
+                if not logged_first_batch:
                     first_batch_started = time.perf_counter()
                 step_started = time.perf_counter()
                 breakdown, _score = run_batch(model, train_split, train_networks[network_id], index, device)
                 breakdown.total.backward()
                 optimizer.step()
-                if first_batch_started is not None:
+                if not logged_first_batch:
                     if device.type == "cuda":
                         torch.cuda.synchronize()
                     elapsed = time.perf_counter() - first_batch_started
@@ -1290,7 +1291,7 @@ def train_seed(
                         f"forward+backward {elapsed:.2f}s",
                         flush=True,
                     )
-                    first_batch_started = None
+                    logged_first_batch = True
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 batch_durations.append(time.perf_counter() - step_started)
