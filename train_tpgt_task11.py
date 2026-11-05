@@ -7,6 +7,23 @@ choices so a Colab GPU can finish a run. They are not paper hyperparameters.
 IEEE 118 is meshed, so pair features use the full in-service topology:
 admittance, adjacency, hop distance, effective resistance, and weighted
 random walks. See `meshed_rpe`.
+
+Performance notes (Colab / large train split)
+---------------------------------------------
+* **Drive I/O**: The 48600-case train/valid tensors live under the checkpoint
+  tree on Google Drive. ``torch.load`` from Drive is often minutes slower than
+  from ``/content`` local disk. On Colab, ``split_cache_dirs`` mirrors ``.pt``
+  caches to ``/content/tpgt_task11_cache`` after the first Drive read or build.
+* **``meshed_rpe``**: Computed only when building or refreshing the split cache,
+  once per *distinct* in-service topology (see ``read_split`` representatives),
+  not per scenario and not per training batch.
+* **``pair_encoder``**: Runs once per forward on the static ``118×118`` RPE for
+  the batch's topology. Weights train, so training must re-encode every step;
+  in ``eval`` mode encoded pairs are cached on ``Network.pair_embed``.
+* **Nine type-pair loops**: Each ``CorrectionStage`` uses Python loops over
+  nine receiver–sender pairs and two heads (see ``CorrectionStage._messages``).
+  That dominates GPU time versus batch size; larger batches amortize overhead
+  but do not remove the per-pair loop cost.
 """
 
 from __future__ import annotations
@@ -14,10 +31,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -241,8 +260,10 @@ class TPGT(nn.Module):
         rpe: torch.Tensor,
         component: torch.Tensor,
         ybus: torch.Tensor,
+        pair: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        pair = self.pair_encoder(rpe)
+        if pair is None:
+            pair = self.pair_encoder(rpe)
         hidden = specified.new_zeros(specified.shape[0], specified.shape[1], D)
         unknown = flat_start(specified, types)
         for type_id, encoder in enumerate(self.encoders):
@@ -363,6 +384,7 @@ class Network:
     rpe: torch.Tensor
     component: torch.Tensor
     types: torch.Tensor
+    pair_embed: torch.Tensor | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -631,6 +653,8 @@ def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
                 )
             )
         features, component = meshed_rpe(118, branches, ybus)
+        if len(networks) == 0:
+            print(f"  meshed_rpe computed once for {name} topology (not per scenario)", flush=True)
         solved = np.exp(1j * angle[local]) * voltage[local]
         injection = solved * np.conj(ybus.astype(np.complex128) @ solved)
         mismatch = np.sqrt((power_p[local] - injection.real) ** 2 + (power_q[local] - injection.imag) ** 2)
@@ -679,29 +703,82 @@ def raw_dir(data_root: Path, split: str, topology: str, condition: str) -> Path:
     return data_root / "case118" / split / "case118" / topology / condition / "raw"
 
 
-def cached_split(cache: Path, raw: Path, name: str) -> Split:
+def split_cache_dirs(checkpoints: Path) -> tuple[Path, Path]:
+    """Return (fast_cache, persistent_cache). On Colab, fast_cache is local SSD."""
+    persistent = checkpoints / "cache"
+    if in_colab():
+        return COLAB_LOCAL_CACHE, persistent
+    return persistent, persistent
+
+
+def _mirror_cache_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.exists() or source.stat().st_mtime > destination.stat().st_mtime:
+        shutil.copy2(source, destination)
+
+
+def sync_split_cache_from_drive(persistent: Path, active: Path) -> None:
+    """Copy Drive split caches to local disk so ``torch.load`` is fast on Colab."""
+    if persistent == active or not persistent.is_dir():
+        return
+    active.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for path in sorted(persistent.iterdir()):
+        if path.is_file():
+            _mirror_cache_file(path, active / path.name)
+            copied += 1
+    if copied:
+        print(
+            f"Mirrored {copied} split-cache file(s) from Drive ({persistent}) to {active}",
+            flush=True,
+        )
+
+
+def sync_split_cache_to_drive(active: Path, persistent: Path) -> None:
+    """Persist freshly built caches back to Drive checkpoints."""
+    if persistent == active:
+        return
+    persistent.mkdir(parents=True, exist_ok=True)
+    for path in sorted(active.iterdir()):
+        if path.is_file():
+            _mirror_cache_file(path, persistent / path.name)
+
+
+def cached_split(active: Path, persistent: Path, raw: Path, name: str) -> Split:
+    sync_split_cache_from_drive(persistent, active)
     stamp = {
         "version": CACHE_VERSION,
         "bytes": raw.joinpath("bus_data.parquet").stat().st_size,
     }
-    stamp_path = cache / f"{name}.json"
-    tensor_path = cache / f"{name}.pt"
+    stamp_path = active / f"{name}.json"
+    tensor_path = active / f"{name}.pt"
     if stamp_path.exists() and tensor_path.exists():
         saved = json.loads(stamp_path.read_text(encoding="utf-8"))
         if saved == stamp:
+            load_started = time.perf_counter()
             print(f"Loading cached {name} split from {tensor_path}", flush=True)
             payload = torch.load(tensor_path, map_location="cpu", weights_only=False)
+            elapsed = time.perf_counter() - load_started
+            print(f"  loaded {name} split in {elapsed:.1f}s ({tensor_path})", flush=True)
+            sync_split_cache_to_drive(active, persistent)
             return payload
-    cache.mkdir(parents=True, exist_ok=True)
+    active.mkdir(parents=True, exist_ok=True)
+    build_started = time.perf_counter()
     split = read_split(raw, name)
+    print(f"  built {name} split from parquet in {time.perf_counter() - build_started:.1f}s", flush=True)
+    save_started = time.perf_counter()
     torch.save(split, tensor_path)
     stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
+    print(f"  saved {name} cache in {time.perf_counter() - save_started:.1f}s", flush=True)
+    sync_split_cache_to_drive(active, persistent)
     return split
 
 
 DATASET_RELATIVE = Path("Foundation Model") / "vendor" / "pfdelta_task1.1"
 WINDOWS_DRIVE = Path(r"K:\My Drive")
 COLAB_DRIVE = Path("/content/drive/MyDrive")
+# Fast split-cache mirror on Colab runtime disk (not synced across disconnects).
+COLAB_LOCAL_CACHE = Path("/content/tpgt_task11_cache")
 
 
 def dataset_request() -> Path:
@@ -789,12 +866,29 @@ def ensure_dataset(work: Path, drive: Path | None = None) -> Path:
 
 
 def move_to(network: Network, device: torch.device) -> Network:
+    pair_embed = network.pair_embed.to(device) if network.pair_embed is not None else None
     return Network(
         ybus=network.ybus.to(device),
         rpe=network.rpe.to(device),
         component=network.component.to(device),
         types=network.types.to(device),
+        pair_embed=pair_embed,
     )
+
+
+def clear_pair_embed_cache(networks: list[Network]) -> None:
+    for network in networks:
+        network.pair_embed = None
+
+
+def pair_features(model: TPGT, network: Network) -> torch.Tensor:
+    """Edge embeddings for this topology; cached in eval, fresh each step in train."""
+    if not model.training:
+        if network.pair_embed is not None:
+            return network.pair_embed
+        network.pair_embed = model.pair_encoder(network.rpe)
+        return network.pair_embed
+    return model.pair_encoder(network.rpe)
 
 
 def run_batch(
@@ -810,7 +904,15 @@ def run_batch(
     voltage = split.voltage[chosen].to(device)
     angle = split.angle[chosen].to(device)
     specified, target = pack_case(power_p, power_q, voltage, angle, network.types)
-    prediction, residuals = model(specified, network.types, network.rpe, network.component, network.ybus)
+    pair = pair_features(model, network)
+    prediction, residuals = model(
+        specified,
+        network.types,
+        network.rpe,
+        network.component,
+        network.ybus,
+        pair=pair,
+    )
     loss = task_loss(prediction, target, residuals, network.types)
     return loss, mean_pbl(residuals[-1])
 
@@ -1011,11 +1113,26 @@ def train_seed(
     if not finished:
         for epoch in range(start_epoch, EPOCHS):
             model.train()
+            clear_pair_embed_cache(train_networks)
+            clear_pair_embed_cache(val_networks)
             running = 0.0
             batches = 0
+            first_batch_started: float | None = None
             for network_id, index in iterate_indexes(train_split, seed, epoch, shuffle=True):
                 optimizer.zero_grad(set_to_none=True)
+                if first_batch_started is None:
+                    first_batch_started = time.perf_counter()
                 loss, _score = run_batch(model, train_split, train_networks[network_id], index, device)
+                if first_batch_started is not None:
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+                    elapsed = time.perf_counter() - first_batch_started
+                    print(
+                        f"  seed {seed} epoch {epoch + 1} first batch ({len(index)} cases) "
+                        f"forward+backward {elapsed:.2f}s",
+                        flush=True,
+                    )
+                    first_batch_started = None
                 loss.backward()
                 optimizer.step()
                 running += float(loss.detach())
@@ -1193,12 +1310,23 @@ def plot_comparison(results: Path, summary: list[dict]) -> None:
         pass
 
 
-def test_model(model: TPGT, data_root: Path, device: torch.device, cache: Path) -> tuple[dict[str, float], dict[str, int]]:
+def test_model(
+    model: TPGT,
+    data_root: Path,
+    device: torch.device,
+    active_cache: Path,
+    persistent_cache: Path,
+) -> tuple[dict[str, float], dict[str, int]]:
     scores = {}
     counts = {}
     model.eval()
     for label, topology, condition in TEST_PARTS:
-        split = cached_split(cache, raw_dir(data_root, "test", topology, condition), f"test_{topology}_{condition}")
+        split = cached_split(
+            active_cache,
+            persistent_cache,
+            raw_dir(data_root, "test", topology, condition),
+            f"test_{topology}_{condition}",
+        )
         networks = [move_to(network, device) for network in split.networks]
         scores[label] = evaluate_pbl(model, split, networks, device)
         counts[label] = split.count
@@ -1232,11 +1360,30 @@ def main() -> None:
     print(f"Checkpoints: {checkpoints}", flush=True)
     print(f"Results directory: {results}", flush=True)
     log_counts(data, results)
-    cache = checkpoints / "cache"
+    active_cache, persistent_cache = split_cache_dirs(checkpoints)
+    print(f"Split cache (active): {active_cache}", flush=True)
+    if persistent_cache != active_cache:
+        print(f"Split cache (Drive): {persistent_cache}", flush=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training device: {device}", flush=True)
-    train_split = cached_split(cache, raw_dir(data, "train", "n", "feasible"), "train_n_feasible")
-    val_split = cached_split(cache, raw_dir(data, "valid", "n", "feasible"), "valid_n_feasible")
+    load_started = time.perf_counter()
+    train_split = cached_split(
+        active_cache,
+        persistent_cache,
+        raw_dir(data, "train", "n", "feasible"),
+        "train_n_feasible",
+    )
+    val_split = cached_split(
+        active_cache,
+        persistent_cache,
+        raw_dir(data, "valid", "n", "feasible"),
+        "valid_n_feasible",
+    )
+    print(
+        f"Train+valid splits ready in {time.perf_counter() - load_started:.1f}s "
+        f"({train_split.count} train, {val_split.count} valid cases)",
+        flush=True,
+    )
     for seed in SEEDS:
         seed_dir = checkpoints / f"seed_{seed}"
         if (seed_dir / "complete.json").exists() and read_completed_epochs(seed_dir / "complete.json") >= EPOCHS:
@@ -1244,7 +1391,7 @@ def main() -> None:
             continue
 
         def publish_checkpoint(model: TPGT, checkpoint: Path, epoch_number: int, seed: int = seed) -> None:
-            scores, counts = test_model(model, data, device, cache)
+            scores, counts = test_model(model, data, device, active_cache, persistent_cache)
             c2i_counts = {
                 "C2I-N": counts["C2I-N"],
                 "C2I-N-1": counts["C2I-N-1"],
