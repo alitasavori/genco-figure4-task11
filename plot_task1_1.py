@@ -1,9 +1,7 @@
-"""Task 1.1 panel of GENCO Figure 4.
+"""Task 1.1 panel of GENCO Figure 4, drawn from this run's test scores.
 
 Colors, category order, and axis text follow
-gridfm-graphkit scripts/pfdelta/make_pbl_barplots.py. The published figure
-uses the authors' rounded table. The retrained figure uses only rows whose
-measured_source is an independent training run with three finite seeds.
+gridfm-graphkit scripts/pfdelta/make_pbl_barplots.py.
 """
 
 from __future__ import annotations
@@ -19,7 +17,6 @@ from matplotlib import font_manager
 import numpy as np
 
 from common import CATEGORIES, MODELS, RESULTS, read_csv
-from published import PUBLISHED_SOURCE
 
 PALETTE = {
     "CANOS-PF": "#D9A6D9",
@@ -27,8 +24,7 @@ PALETTE = {
     "PFNet": "#8FD694",
     "GENCO Base": "#69D8FF",
 }
-RETRAINED_SOURCES = {"independent_training"}
-PUBLISHED_YLIM = (0.0, 1.8)
+PAPER_YLIM = (0.0, 1.8)
 PUBLISHED_YTICKS = [0.0, 0.45, 0.9, 1.35, 1.8]
 
 
@@ -38,16 +34,14 @@ def _font(size: float) -> font_manager.FontProperties:
     return font_manager.FontProperties(family=family, size=size)
 
 
-def _rows_for(summary: list[dict], source: str) -> dict[str, dict[str, tuple[float, float]]]:
-    selected = [row for row in summary if row.get("measured_source") == source]
+def _rows_for(summary: list[dict]) -> dict[str, dict[str, tuple[float, float]]]:
     grouped: dict[str, dict[str, tuple[float, float]]] = {}
-    for row in selected:
+    for row in summary:
         model = row["model"]
         category = row["test_category"]
         if model not in MODELS or category not in CATEGORIES:
             continue
-        n_seeds = row.get("n_seeds", "")
-        if source in RETRAINED_SOURCES and str(n_seeds) != "3":
+        if str(row.get("n_seeds", "")) != "3":
             continue
         grouped.setdefault(model, {})[category] = (
             float(row["mean_across_seeds"]),
@@ -125,10 +119,10 @@ def _draw(grouped: dict, output: Path, ylim: tuple[float, float], yticks: list[f
     print(f"wrote {png}")
 
 
-def _ylim_for(grouped: dict, published_scale: bool) -> tuple[tuple[float, float], list[float]]:
+def _ylim_for(grouped: dict) -> tuple[tuple[float, float], list[float]]:
     ymax = max(mean + std for model in grouped.values() for mean, std in model.values())
-    if published_scale and ymax <= PUBLISHED_YLIM[1]:
-        return PUBLISHED_YLIM, list(PUBLISHED_YTICKS)
+    if ymax <= PAPER_YLIM[1]:
+        return PAPER_YLIM, list(PUBLISHED_YTICKS)
     ymax = max(ymax * 1.1, 1e-6)
     magnitude = 10 ** np.floor(np.log10(ymax))
     ymax = float(np.ceil(ymax / magnitude * 4) / 4 * magnitude)
@@ -138,43 +132,28 @@ def _ylim_for(grouped: dict, published_scale: bool) -> tuple[tuple[float, float]
 def plot_task11(results_dir: Path | None = None) -> list[Path]:
     results_dir = results_dir or RESULTS
     summary = read_csv(results_dir / "task1_1_summary.csv")
-    written: list[Path] = []
-    published = _rows_for(summary, PUBLISHED_SOURCE)
-    if len(published) != len(MODELS):
-        raise FileNotFoundError(
-            "Published Task 1.1 rows are incomplete. Run reproduce_genco.py --mode published first."
-        )
-    published_pdf = results_dir / "figure4_task1.1_published.pdf"
-    ylim, yticks = _ylim_for(published, published_scale=True)
-    _draw(published, published_pdf, ylim, yticks)
-    written.append(published_pdf)
-
-    retrained = {}
-    for source in RETRAINED_SOURCES:
-        retrained.update(_rows_for(summary, source))
-    retrained_pdf = results_dir / "figure4_task1.1_retrained.pdf"
-    note = results_dir / "figure4_task1.1_retrained_NOT_RUN.txt"
-    if len(retrained) != len(MODELS):
-        if retrained_pdf.exists():
-            retrained_pdf.unlink()
-        png = retrained_pdf.with_suffix(".png")
+    measured = _rows_for(summary)
+    pdf = results_dir / "figure4_task1.1.pdf"
+    note = results_dir / "figure4_task1.1_NOT_READY.txt"
+    if len(measured) != len(MODELS):
+        if pdf.exists():
+            pdf.unlink()
+        png = pdf.with_suffix(".png")
         if png.exists():
             png.unlink()
-        missing = [model for model in MODELS if model not in retrained]
+        missing = [model for model in MODELS if model not in measured]
         note.write_text(
-            "No retrained Figure 4 panel was written.\n"
-            f"Models without three finite independent seeds: {missing}.\n"
-            "Published table values were not copied into this figure.\n",
+            "Figure 4 Task 1.1 was not written.\n"
+            f"Models without three finite test seeds: {missing}.\n",
             encoding="utf-8",
         )
-        print(f"retrained figure not written; see {note}")
-    else:
-        if note.exists():
-            note.unlink()
-        ylim, yticks = _ylim_for(retrained, published_scale=False)
-        _draw(retrained, retrained_pdf, ylim, yticks)
-        written.append(retrained_pdf)
-    return written
+        print(f"figure not written; see {note}")
+        return []
+    if note.exists():
+        note.unlink()
+    ylim, yticks = _ylim_for(measured)
+    _draw(measured, pdf, ylim, yticks)
+    return [pdf]
 
 
 def main() -> None:

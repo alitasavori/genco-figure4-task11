@@ -1,14 +1,7 @@
-"""Train and evaluate PFNet, CANOS-PF, and GNS-S on PFDelta Task 1.1.
-
-The published Figure 4 bars for these three models are the PFDelta paper
-numbers. This script does not write those numbers into the retrained figure.
-quick mode checks the pinned repository and writes no new model metrics.
-full mode trains three seeds and evaluates them with scripts/test_error.py.
-"""
+"""Train and test PFNet, CANOS-PF, and GNS-S on PFDelta Task 1.1."""
 
 from __future__ import annotations
 
-import argparse
 import json
 import shutil
 import sys
@@ -26,11 +19,9 @@ from common import (
     run_command,
     upsert_csv,
     work_root,
-    write_provenance,
 )
 from metrics import sample_mean, sample_std
 from plot_task1_1 import plot_task11
-from published import published_stats, write_published_tables
 
 MODELS = {
     "PFNet": {
@@ -214,28 +205,17 @@ def write_rows(display: str, by_seed: dict[int, dict[str, float]], checkpoints: 
         ["model", "task", "test_category", "seed", "source"],
     )
     if len(by_seed) != 3:
-        print(f"{display} has {len(by_seed)} completed seeds. It will not be added to the retrained figure.")
+        print(f"{display} has {len(by_seed)} completed seeds. The figure needs three.")
         return
-    published = published_stats()[display]
     summary_rows = []
     for category in ("N", "N-1", "N-2", "C2I"):
         values = [by_seed[seed][category] for seed in sorted(by_seed)]
-        mean = sample_mean(values)
-        std = sample_std(values)
-        published_mean, published_std = published[category]
-        absolute = abs(mean - published_mean)
-        relative = absolute / abs(published_mean) if published_mean else ""
         summary_rows.append(
             {
                 "model": display,
                 "test_category": category,
-                "mean_across_seeds": f"{mean:.12g}",
-                "std_across_seeds": f"{std:.12g}",
-                "published_mean": f"{published_mean:.12g}",
-                "published_std": f"{published_std:.12g}",
-                "abs_diff": f"{absolute:.12g}",
-                "rel_diff": f"{relative:.12g}" if relative != "" else "",
-                "measured_source": "independent_training",
+                "mean_across_seeds": f"{sample_mean(values):.12g}",
+                "std_across_seeds": f"{sample_std(values):.12g}",
                 "n_seeds": "3",
             }
         )
@@ -243,7 +223,7 @@ def write_rows(display: str, by_seed: dict[int, dict[str, float]], checkpoints: 
         RESULTS / "task1_1_summary.csv",
         SUMMARY_COLUMNS,
         summary_rows,
-        ["model", "test_category", "measured_source"],
+        ["model", "test_category"],
     )
 
 
@@ -267,25 +247,12 @@ def verify_release(repo: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train PFDelta Task 1.1 baselines.")
-    parser.add_argument("--mode", choices=("published", "quick", "full"), default="quick")
-    args = parser.parse_args()
     ensure_dirs()
     report_environment()
-    write_provenance({"pfdelta_mode": args.mode, "pfdelta_seeds": list(SEEDS)})
-    write_published_tables(RESULTS)
-    plot_task11(RESULTS)
     repo = work_root() / "pfdelta"
-    if args.mode == "published":
-        print("Published figure refreshed from the author table. PFDelta was not trained.")
-        return
     if not (repo / "main.py").is_file():
-        raise SystemExit(f"Missing {repo}. Run the PFDelta install cell first.")
+        raise SystemExit(f"Missing {repo}. Run the install cell first.")
     verify_release(repo)
-    if args.mode == "quick":
-        print("Quick mode stops before training. Set MODE = \"full\" to train three seeds of each baseline.")
-        print("Figure 4 baseline bars in the published figure are the PFDelta paper values.")
-        return
     count_probe(repo)
     for spec in MODELS.values():
         metrics = {}
@@ -296,8 +263,7 @@ def main() -> None:
             checkpoints[seed] = run_dir
         write_rows(spec["display"], metrics, checkpoints)
     plot_task11(RESULTS)
-    print("Independent baseline rows use source=independent_training.")
-    print(f"Summary: {RESULTS / 'task1_1_summary.csv'}")
+    print(f"Baseline test scores: {RESULTS / 'task1_1_summary.csv'}")
 
 
 if __name__ == "__main__":

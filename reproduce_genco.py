@@ -1,18 +1,7 @@
-"""Reproduce GENCO Task 1.1: published Figure 4 panel, released checkpoints, or training.
-
-Modes
------
-published
-    Write the published table and its figure. No downloads and no training.
-quick
-    Published figure, then evaluate the three released checkpoints.
-full
-    Published figure, then train seeds 1, 2, and 3 and evaluate those weights.
-"""
+"""Train GENCO Base on Task 1.1 and test the three seeds."""
 
 from __future__ import annotations
 
-import argparse
 import json
 import re
 import sys
@@ -32,11 +21,9 @@ from common import (
     run_command,
     upsert_csv,
     work_root,
-    write_provenance,
 )
 from metrics import aggregate_c2i, sample_mean, sample_std
 from plot_task1_1 import plot_task11
-from published import PUBLISHED_SOURCE, published_stats, write_published_tables
 
 GENCO_SEEDS = (1, 2, 3)
 CATEGORY_FROM_SUFFIX = {
@@ -49,18 +36,12 @@ CATEGORY_FROM_SUFFIX = {
 }
 
 
-def download_inputs(root: Path) -> tuple[Path, Path]:
+def download_data(root: Path) -> Path:
     from huggingface_hub import snapshot_download
 
     data = root / "pfdelta_task1.1"
-    checkpoints = root / "genco-pfdelta"
     snapshot_download(repo_id="gridfm/pfdelta_task1.1", repo_type="dataset", local_dir=str(data))
-    snapshot_download(
-        repo_id="gridfm/genco-pfdelta",
-        allow_patterns="task_1.1/**",
-        local_dir=str(checkpoints),
-    )
-    return data, checkpoints
+    return data
 
 
 def case_dir(data_root: Path) -> Path:
@@ -237,10 +218,9 @@ def resume_train(config: Path, data_path: Path, seed: int, log_dir: Path, ckpt: 
     trainer.fit(model=model, datamodule=datamodule, ckpt_path=str(ckpt))
 
 
-def write_measurement_rows(metrics_by_seed: dict[int, dict[str, float]], paths: dict[int, str], source: str) -> None:
+def write_measurement_rows(metrics_by_seed: dict[int, dict[str, float]], paths: dict[int, str]) -> None:
     seed_rows = []
     summary_rows = []
-    published = published_stats()
     for seed, metrics in metrics_by_seed.items():
         for category in ("N", "N-1", "N-2", "C2I"):
             seed_rows.append(
@@ -251,7 +231,7 @@ def write_measurement_rows(metrics_by_seed: dict[int, dict[str, float]], paths: 
                     "seed": str(seed),
                     "mean_pbl_pu": f"{metrics[category]:.12g}",
                     "checkpoint_path": paths[seed],
-                    "source": source,
+                    "source": "independent_training",
                 }
             )
     upsert_csv(
@@ -261,27 +241,16 @@ def write_measurement_rows(metrics_by_seed: dict[int, dict[str, float]], paths: 
         ["model", "task", "test_category", "seed", "source"],
     )
     if len(metrics_by_seed) != 3:
-        print(f"{source} has {len(metrics_by_seed)} GENCO seeds. Summary and error bars need three.")
+        print(f"GENCO has {len(metrics_by_seed)} tested seeds. The figure needs three.")
         return
-    model_name = "GENCO Base"
     for category in ("N", "N-1", "N-2", "C2I"):
         values = [metrics_by_seed[seed][category] for seed in sorted(metrics_by_seed)]
-        mean = sample_mean(values)
-        std = sample_std(values)
-        published_mean, published_std = published[model_name][category]
-        absolute = abs(mean - published_mean)
-        relative = absolute / abs(published_mean) if published_mean else ""
         summary_rows.append(
             {
-                "model": model_name,
+                "model": "GENCO Base",
                 "test_category": category,
-                "mean_across_seeds": f"{mean:.12g}",
-                "std_across_seeds": f"{std:.12g}",
-                "published_mean": f"{published_mean:.12g}",
-                "published_std": f"{published_std:.12g}",
-                "abs_diff": f"{absolute:.12g}",
-                "rel_diff": f"{relative:.12g}" if relative != "" else "",
-                "measured_source": source,
+                "mean_across_seeds": f"{sample_mean(values):.12g}",
+                "std_across_seeds": f"{sample_std(values):.12g}",
                 "n_seeds": "3",
             }
         )
@@ -289,7 +258,7 @@ def write_measurement_rows(metrics_by_seed: dict[int, dict[str, float]], paths: 
         RESULTS / "task1_1_summary.csv",
         SUMMARY_COLUMNS,
         summary_rows,
-        ["model", "test_category", "measured_source"],
+        ["model", "test_category"],
     )
 
 
@@ -311,7 +280,7 @@ def evaluate_seeds(repo: Path, data_path: Path, checkpoints: dict[int, Path], so
         print(f"seed {seed} {source}: {metrics_by_seed[seed]}")
     detail = RESULTS / f"genco_{source}_detail.json"
     detail.write_text(json.dumps({str(seed): metrics for seed, metrics in metrics_by_seed.items()}, indent=2), encoding="utf-8")
-    write_measurement_rows(metrics_by_seed, paths, source)
+    write_measurement_rows(metrics_by_seed, paths)
 
 
 def train_one(repo: Path, data_path: Path, seed: int) -> Path:
@@ -335,35 +304,19 @@ def train_one(repo: Path, data_path: Path, seed: int) -> Path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Reproduce GENCO Figure 4 Task 1.1.")
-    parser.add_argument("--mode", choices=("published", "quick", "full"), default="quick")
-    args = parser.parse_args()
     ensure_dirs()
     report_environment()
-    write_provenance({"genco_mode": args.mode, "genco_yaml_seeds": {"1": 0, "2": 42, "3": 1234}})
-    write_published_tables(RESULTS)
-    plot_task11(RESULTS)
-    if args.mode == "published":
-        print("Published Task 1.1 figure written. Checkpoints were not evaluated.")
-        return
     root = work_root()
     repo = root / "gridfm-graphkit"
     if not (repo / "gridfm_graphkit").is_dir():
         raise SystemExit(f"Missing {repo}. Run the install cell first.")
-    data_root, checkpoint_root = download_inputs(root)
+    data_root = download_data(root)
     data_path = case_dir(data_root)
     write_layout_report(data_root if (data_root / "case118").is_dir() else data_path, LOGS / "genco_layout.json")
-    if args.mode == "quick":
-        released = {seed: checkpoint_root / "task_1.1" / f"seed{seed}" / "last.pt" for seed in GENCO_SEEDS}
-        evaluate_seeds(repo, data_path, released, "released_checkpoint")
-        print("Released checkpoints evaluated. This is not an independent training result.")
-        print("Published bars were left unchanged.")
-        return
     trained = {seed: train_one(repo, data_path, seed) for seed in GENCO_SEEDS}
     evaluate_seeds(repo, data_path, trained, "independent_training")
     plot_task11(RESULTS)
-    print("Independent GENCO training results are in the seed CSV with source=independent_training.")
-    print("PFDelta baselines are not trained by this script.")
+    print(f"GENCO test scores: {RESULTS / 'task1_1_summary.csv'}")
 
 
 if __name__ == "__main__":

@@ -34,11 +34,6 @@ def use_selected_results() -> None:
 # Recorded from the GitHub API on 2026-10-29. Install scripts check these SHAs
 # out explicitly so a later branch move does not change the reproduction.
 PINNED_COMMITS = {
-    "gridfm-paper-genco": {
-        "url": "https://github.com/gridfm/gridfm-paper-genco.git",
-        "branch": "main",
-        "sha": "107ae0be34660fb7de5e629fa74c60ee63afad2e",
-    },
     "gridfm-graphkit": {
         "url": "https://github.com/gridfm/gridfm-graphkit.git",
         "branch": "genco-paper-repro-pfdelta",
@@ -68,11 +63,6 @@ SUMMARY_COLUMNS = [
     "test_category",
     "mean_across_seeds",
     "std_across_seeds",
-    "published_mean",
-    "published_std",
-    "abs_diff",
-    "rel_diff",
-    "measured_source",
     "n_seeds",
 ]
 
@@ -133,7 +123,7 @@ def report_environment() -> dict:
         else:
             info["gpu_count"] = 0
             info["gpu_name"] = None
-    except Exception as exc:  # torch is absent in the published-only path
+    except Exception as exc:
         info["torch"] = None
         info["torch_error"] = str(exc)
     print("Environment")
@@ -206,38 +196,6 @@ def clone_repo(name: str, dest: Path) -> str:
         raise SystemExit(f"{name} HEAD {sha} does not match pinned {spec['sha']}")
     print(f"{name} at {sha}")
     return sha
-
-
-def write_provenance(extra: dict | None = None) -> None:
-    ensure_dirs()
-    payload = {
-        "task": TASK,
-        "system": "IEEE 118-bus",
-        "pinned_commits": PINNED_COMMITS,
-        "canos_pf_loss_correction": {
-            "date": "2026-03-26",
-            "status": "fixed_in_pinned_pfdelta_commit",
-            "detail": (
-                "The PFDelta README at 0fb3aeda states that constraint_violations_loss_pf "
-                "incorrectly calculated reactive-power mismatch and line-branch-flow mismatch, "
-                "and that the bug has been fixed. Full reproduction uses that corrected "
-                "implementation. Figure 4 reused the previously published PFDelta baseline "
-                "numbers, so retrained CANOS-PF can differ from those bars. The correction "
-                "is not reverted."
-            ),
-        },
-        "std_convention": (
-            "Sample standard deviation with Bessel correction (numpy.std ddof=1), "
-            "matching torch.Tensor.std in scripts/test_error.py."
-        ),
-        "metric": (
-            "Mean over samples of the mean over buses of sqrt(dP^2 + dQ^2), "
-            "in per unit on a 100 MVA base."
-        ),
-    }
-    if extra:
-        payload.update(extra)
-    (RESULTS / "provenance.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def upsert_csv(path: Path, columns: list[str], rows: list[dict], key_fields: list[str]) -> None:
