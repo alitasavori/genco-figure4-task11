@@ -82,7 +82,9 @@ CACHE_VERSION = "tpgt-cache-2"
 RPE_WALK_STEPS = 5
 RPE_DIM = RPE_WALK_STEPS + 5
 # Bumped when pair-encoder input size or architecture changes; old Drive checkpoints are ignored.
-CHECKPOINT_VERSION = "meshed-rpe-10-v3"
+CHECKPOINT_VERSION = "meshed-rpe-10-v4"
+# Off-diagonal |Y_pq| below this are treated as disconnected for admittance scaling.
+Y_ADMITTANCE_EPS = 1e-10
 # PQ voltage unknown is clamped to this band when evaluating Ybus injections (p.u.).
 V_MIN_PU = 0.05
 V_MAX_PU = 2.0
@@ -447,6 +449,9 @@ def meshed_rpe(
     (P^k)_ij for k = 1..RPE_WALK_STEPS. Branch r and x build W; Y comes
     from the case Ybus used in the power-flow residual.
 
+    s_Y(c) is the mean of off-diagonal |Y_pq| with p != q and |Y_pq| > eps
+    (zeros from non-adjacent pairs are excluded).
+
     For a non-adjacent pair, Y_ij is zero but hop and effective resistance
     are positive. That is expected: direct admittance is local, while hop
     and resistance summarize the full meshed graph. They are not contradictory.
@@ -519,9 +524,7 @@ def meshed_rpe(
         buses = np.flatnonzero(component == comp)
         if buses.size == 0:
             continue
-        off_diagonal = y_abs[np.ix_(buses, buses)]
-        mean_admittance = float(off_diagonal.mean()) if off_diagonal.size else 0.0
-        scale_y[comp] = mean_admittance if mean_admittance > 0 else 1.0
+        scale_y[comp] = component_admittance_scale(y_abs, component, comp)
         finite_hop = hop[np.ix_(buses, buses)]
         max_hop = float(finite_hop.max()) if buses.size else 0.0
         hop_scale[comp] = max_hop if max_hop > 0 else 1.0
@@ -576,6 +579,25 @@ def meshed_rpe(
     if not np.isfinite(features).all():
         raise RuntimeError("Meshed RPE contains non-finite values.")
     return features, component
+
+
+def component_admittance_scale(
+    y_abs: np.ndarray,
+    component: np.ndarray,
+    comp: int,
+    epsilon: float = Y_ADMITTANCE_EPS,
+) -> float:
+    """Mean off-diagonal |Y_pq| in component ``comp``, excluding entries <= ``epsilon``."""
+    buses = np.flatnonzero(component == comp)
+    if buses.size == 0:
+        return 1.0
+    block = y_abs[np.ix_(buses, buses)]
+    off_mask = ~np.eye(buses.size, dtype=bool)
+    magnitudes = block[off_mask]
+    nonzero = magnitudes > epsilon
+    if not np.any(nonzero):
+        return 1.0
+    return float(magnitudes[nonzero].mean())
 
 
 def _blocks(values: np.ndarray, width: int) -> np.ndarray:
@@ -824,6 +846,7 @@ def cached_split(active: Path, persistent: Path, raw: Path, name: str, limit: in
         limit = scenario_limit(raw)
     stamp = {
         "version": CACHE_VERSION,
+        "checkpoint_version": CHECKPOINT_VERSION,
         "bytes": raw.joinpath("bus_data.parquet").stat().st_size,
         "scenario_limit": limit,
     }
@@ -833,6 +856,7 @@ def cached_split(active: Path, persistent: Path, raw: Path, name: str, limit: in
         saved = json.loads(stamp_path.read_text(encoding="utf-8"))
         if (
             saved.get("version") == stamp["version"]
+            and saved.get("checkpoint_version") == stamp["checkpoint_version"]
             and saved.get("bytes") == stamp["bytes"]
             and saved.get("scenario_limit") == limit
         ):
