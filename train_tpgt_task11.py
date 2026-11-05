@@ -25,8 +25,10 @@ Performance notes (Colab / large train split)
   ``118×118`` (one kernel graph per stage instead of eighteen Python loops).
   Optional ``GENCO_TPGT_COMPILE=1`` or ``--compile`` wraps the model in
   ``torch.compile`` (may differ slightly in numerics).
-* **Batch 64 vs 16**: Four times more cases per step increases matmul work
-  roughly linearly; per-case time should be similar if the GPU is saturated.
+* **Batch 64**: Optimizer steps use 64 cases per batch. On memory-limited GPUs,
+  forward/backward run in smaller **micro-batches** (default 16) with weighted
+  gradient accumulation so the effective batch stays 64. Override with
+  ``GENCO_TPGT_MICRO_BATCH`` or ``--micro-batch``. CUDA training uses AMP (fp16).
 """
 
 from __future__ import annotations
@@ -111,6 +113,8 @@ EXPECTED_COUNTS = {
 }
 # Fraction of each split folder to load (first scenarios). 1.0 = full PFΔ split.
 DATA_FRACTION = 1.0
+# Forward/backward chunk size during training (gradient accumulation to BATCH_SIZE).
+MICRO_BATCH_SIZE = 16
 
 
 def ensure_runtime_packages() -> None:
@@ -631,6 +635,18 @@ def parse_data_fraction() -> float:
     return 1.0
 
 
+def parse_micro_batch_size() -> int:
+    for index, arg in enumerate(sys.argv):
+        if arg == "--micro-batch" and index + 1 < len(sys.argv):
+            return int(sys.argv[index + 1])
+        if arg.startswith("--micro-batch="):
+            return int(arg.split("=", 1)[1])
+    env = os.environ.get("GENCO_TPGT_MICRO_BATCH", "").strip()
+    if env:
+        return int(env)
+    return MICRO_BATCH_SIZE
+
+
 def scenario_limit(raw: Path) -> int | None:
     if DATA_FRACTION >= 1.0:
         return None
@@ -1027,6 +1043,64 @@ def run_batch(
     return breakdown, mean_pbl(residuals[-1])
 
 
+def _weighted_loss_breakdown(
+    parts: list[tuple[TaskLossBreakdown, float]],
+) -> TaskLossBreakdown:
+    weight = sum(weight for _breakdown, weight in parts)
+    if weight <= 0:
+        raise RuntimeError("empty training batch")
+    state = sum(float(b.state_mse) * w for b, w in parts) / weight
+    phys = sum(float(b.physics_sum) * w for b, w in parts) / weight
+    stages = tuple(
+        sum(float(b.physics_stages[stage_idx]) * w for b, w in parts) / weight
+        for stage_idx in range(DEPTH)
+    )
+    total = sum(float(b.total) * w for b, w in parts) / weight
+    return TaskLossBreakdown(
+        torch.tensor(state),
+        torch.tensor(phys),
+        tuple(torch.tensor(value) for value in stages),
+        torch.tensor(total),
+    )
+
+
+def train_batch(
+    model: TPGT,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.cuda.amp.GradScaler | None,
+    split: Split,
+    network: Network,
+    index: np.ndarray,
+    device: torch.device,
+) -> TaskLossBreakdown:
+    """One optimizer step over ``index`` (up to BATCH_SIZE cases), using micro-batches on CUDA."""
+    cases = np.asarray(index)
+    n = len(cases)
+    micro = min(MICRO_BATCH_SIZE, n)
+    use_amp = device.type == "cuda"
+    optimizer.zero_grad(set_to_none=True)
+    logged_parts: list[tuple[TaskLossBreakdown, float]] = []
+    for start in range(0, n, micro):
+        chunk = cases[start : start + micro]
+        weight = len(chunk) / n
+        with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
+            breakdown, _score = run_batch(model, split, network, chunk, device)
+        scaled = breakdown.total * weight
+        if scaler is not None:
+            scaler.scale(scaled).backward()
+        else:
+            scaled.backward()
+        logged_parts.append((breakdown, weight))
+        if device.type == "cuda":
+            del breakdown, scaled
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    return _weighted_loss_breakdown(logged_parts)
+
+
 def iterate_indexes(split: Split, seed: int, epoch: int, shuffle: bool):
     generator = torch.Generator()
     generator.manual_seed(seed * 1000 + epoch)
@@ -1248,6 +1322,7 @@ def train_seed(
         )
         model = torch.compile(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    grad_scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
     train_networks = [move_to(network, device) for network in train_split.networks]
     val_networks = [move_to(network, device) for network in val_split.networks]
     start_epoch = 0
@@ -1353,13 +1428,18 @@ def train_seed(
             logged_first_batch = False
             batch_durations: list[float] = []
             for network_id, index in iterate_indexes(train_split, seed, epoch, shuffle=True):
-                optimizer.zero_grad(set_to_none=True)
                 if not logged_first_batch:
                     first_batch_started = time.perf_counter()
                 step_started = time.perf_counter()
-                breakdown, _score = run_batch(model, train_split, train_networks[network_id], index, device)
-                breakdown.total.backward()
-                optimizer.step()
+                breakdown = train_batch(
+                    model,
+                    optimizer,
+                    grad_scaler if device.type == "cuda" else None,
+                    train_split,
+                    train_networks[network_id],
+                    index,
+                    device,
+                )
                 if not logged_first_batch:
                     if device.type == "cuda":
                         torch.cuda.synchronize()
@@ -1591,17 +1671,26 @@ def test_model(
 
 
 def main() -> None:
-    global DATA_FRACTION
+    global DATA_FRACTION, MICRO_BATCH_SIZE
     ensure_runtime_packages()
     DATA_FRACTION = parse_data_fraction()
+    MICRO_BATCH_SIZE = parse_micro_batch_size()
+    if MICRO_BATCH_SIZE < 1 or MICRO_BATCH_SIZE > BATCH_SIZE:
+        raise ValueError(f"micro-batch must be in [1, {BATCH_SIZE}], got {MICRO_BATCH_SIZE}")
+    batch_note = (
+        f"Training batch size {BATCH_SIZE} "
+        f"(micro-batch {MICRO_BATCH_SIZE}, AMP on CUDA)."
+    )
     if DATA_FRACTION < 1.0:
         print(
             f"Data fraction {DATA_FRACTION}: first scenarios in each train/valid/test folder "
-            f"(keeps PFΔ split boundaries). Training batch size {BATCH_SIZE}.",
+            f"(keeps PFΔ split boundaries). {batch_note}",
             flush=True,
         )
     elif DATA_FRACTION > 1.0:
         raise ValueError(f"data fraction must be <= 1.0, got {DATA_FRACTION}")
+    else:
+        print(batch_note, flush=True)
     drive = google_drive_root()
     outputs = drive_output_dirs(drive)
     work, legacy_results = legacy_locations(drive)
