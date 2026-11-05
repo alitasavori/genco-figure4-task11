@@ -379,13 +379,30 @@ def nodal_residual(
     return torch.stack((power_p - flow.real, power_q - flow.imag), dim=-1)
 
 
-def task_loss(prediction: torch.Tensor, target: torch.Tensor, residuals: list[torch.Tensor], types: torch.Tensor) -> torch.Tensor:
+@dataclass
+class TaskLossBreakdown:
+    state_mse: torch.Tensor
+    physics_sum: torch.Tensor
+    physics_stages: tuple[torch.Tensor, ...]
+    total: torch.Tensor
+
+
+def task_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    residuals: list[torch.Tensor],
+    types: torch.Tensor,
+) -> TaskLossBreakdown:
     error = prediction - target
     angle_unknown = (types == 0) | (types == 1)
     error[:, angle_unknown, 1] = wrap_angle(error[:, angle_unknown, 1])
-    state = torch.mean(torch.sum(error * error, dim=-1))
-    physics = torch.stack([torch.mean(torch.sum(residual * residual, dim=-1)) for residual in residuals]).sum()
-    return LAMBDA_STATE * state + LAMBDA_PHYS * physics
+    state_mse = torch.mean(torch.sum(error * error, dim=-1))
+    physics_stages = tuple(
+        torch.mean(torch.sum(residual * residual, dim=-1)) for residual in residuals
+    )
+    physics_sum = torch.stack(physics_stages).sum()
+    total = LAMBDA_STATE * state_mse + LAMBDA_PHYS * physics_sum
+    return TaskLossBreakdown(state_mse, physics_sum, physics_stages, total)
 
 
 def mean_pbl(residual: torch.Tensor) -> torch.Tensor:
@@ -920,7 +937,7 @@ def run_batch(
     network: Network,
     index: np.ndarray,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[TaskLossBreakdown, torch.Tensor]:
     chosen = torch.as_tensor(index, dtype=torch.long)
     power_p = split.power_p[chosen].to(device)
     power_q = split.power_q[chosen].to(device)
@@ -936,8 +953,8 @@ def run_batch(
         network.ybus,
         pair=pair,
     )
-    loss = task_loss(prediction, target, residuals, network.types)
-    return loss, mean_pbl(residuals[-1])
+    breakdown = task_loss(prediction, target, residuals, network.types)
+    return breakdown, mean_pbl(residuals[-1])
 
 
 def iterate_indexes(split: Split, seed: int, epoch: int, shuffle: bool):
@@ -961,7 +978,7 @@ def evaluate_pbl(model: TPGT, split: Split, networks: list[Network], device: tor
     seen = 0
     with torch.no_grad():
         for network_id, index in iterate_indexes(split, seed=0, epoch=0, shuffle=False):
-            _loss, score = run_batch(model, split, networks[network_id], index, device)
+            _breakdown, score = run_batch(model, split, networks[network_id], index, device)
             total += float(score) * len(index)
             seen += len(index)
     if seen != split.count:
@@ -1042,6 +1059,25 @@ def test_pbl_line(seed: int, epoch_number: int, scores: dict[str, float]) -> str
         f"seed {seed} epoch {epoch_number} test PBL  "
         f"N {scores['N']:.6f}  N-1 {scores['N-1']:.6f}  "
         f"N-2 {scores['N-2']:.6f}  C2I {scores['C2I']:.6f}"
+    )
+
+
+def train_epoch_loss_line(
+    seed: int,
+    epoch_number: int,
+    batches: int,
+    state_mse: float,
+    physics_sum: float,
+    physics_stages: list[float],
+    train_total: float,
+    val_pbl: float,
+) -> str:
+    n = max(batches, 1)
+    stage_text = "  ".join(f"phys_s{i + 1} {value / n:.4f}" for i, value in enumerate(physics_stages))
+    return (
+        f"seed {seed} epoch {epoch_number}/{EPOCHS}  "
+        f"state {state_mse / n:.4f}  phys {physics_sum / n:.4f}  {stage_text}  "
+        f"train {train_total / n:.4f}  val_pbl {val_pbl:.6f}"
     )
 
 
@@ -1167,7 +1203,10 @@ def train_seed(
             model.train()
             clear_pair_embed_cache(train_networks)
             clear_pair_embed_cache(val_networks)
-            running = 0.0
+            running_total = 0.0
+            running_state = 0.0
+            running_phys = 0.0
+            running_phys_stages = [0.0] * DEPTH
             batches = 0
             first_batch_started: float | None = None
             batch_durations: list[float] = []
@@ -1176,8 +1215,8 @@ def train_seed(
                 if first_batch_started is None:
                     first_batch_started = time.perf_counter()
                 step_started = time.perf_counter()
-                loss, _score = run_batch(model, train_split, train_networks[network_id], index, device)
-                loss.backward()
+                breakdown, _score = run_batch(model, train_split, train_networks[network_id], index, device)
+                breakdown.total.backward()
                 optimizer.step()
                 if first_batch_started is not None:
                     if device.type == "cuda":
@@ -1192,19 +1231,32 @@ def train_seed(
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 batch_durations.append(time.perf_counter() - step_started)
-                running += float(loss.detach())
+                running_total += float(breakdown.total.detach())
+                running_state += float(breakdown.state_mse.detach())
+                running_phys += float(breakdown.physics_sum.detach())
+                for stage_idx, stage_mse in enumerate(breakdown.physics_stages):
+                    running_phys_stages[stage_idx] += float(stage_mse.detach())
                 batches += 1
                 if batches % 250 == 0:
                     window = batch_durations[-250:]
                     avg_sec = sum(window) / len(window)
                     print(
-                        f"  seed {seed} epoch {epoch + 1} batch {batches} loss {running / batches:.4f} "
+                        f"  seed {seed} epoch {epoch + 1} batch {batches} train {running_total / batches:.4f} "
                         f"avg {avg_sec:.3f}s/batch (last {len(window)})",
                         flush=True,
                     )
             val_score = evaluate_pbl(model, val_split, val_networks, device)
             print(
-                f"seed {seed} epoch {epoch + 1}/{EPOCHS} train loss {running / max(batches, 1):.4f} val PBL {val_score:.6f}",
+                train_epoch_loss_line(
+                    seed,
+                    epoch + 1,
+                    batches,
+                    running_state,
+                    running_phys,
+                    running_phys_stages,
+                    running_total,
+                    val_score,
+                ),
                 flush=True,
             )
             if val_score < best_val:
