@@ -579,7 +579,6 @@ def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
         types = type_code[local].astype(np.int64)
         if int(np.sum(types == 2)) != 1:
             raise RuntimeError(f"{name} scenario {int(wanted[local])} has {int(np.sum(types == 2))} slack buses.")
-        slack = int(np.flatnonzero(types == 2)[0])
         scenario_id = int(wanted[local])
         chosen = y_scenario == scenario_id
         rows_i = y_rows["index1"][chosen].astype(np.int64)
