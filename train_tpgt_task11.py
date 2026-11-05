@@ -25,10 +25,19 @@ Performance notes (Colab / large train split)
   ``118×118`` (one kernel graph per stage instead of eighteen Python loops).
   Optional ``GENCO_TPGT_COMPILE=1`` or ``--compile`` wraps the model in
   ``torch.compile`` (may differ slightly in numerics).
-* **Batch 32**: Optimizer steps use 32 cases per batch. On memory-limited GPUs,
-  forward/backward run in smaller **micro-batches** (default 16) with weighted
-  gradient accumulation so the effective batch stays 32. Override with
-  ``GENCO_TPGT_MICRO_BATCH`` or ``--micro-batch``. CUDA training uses AMP (fp16).
+* **Batch 32**: Optimizer steps use 32 cases per batch. Default **micro-batch 32**
+  (one forward/backward per step when memory allows). Override with
+  ``GENCO_TPGT_MICRO_BATCH`` or ``--micro-batch``.
+* **Eval batch 64**: Validation and test use forward-only batches up to 64
+  (``GENCO_TPGT_EVAL_BATCH`` / ``--eval-batch``) — no backward, usually safe
+  on the same GPU.
+* **CUDA**: ``cudnn.benchmark``, TF32, and high matmul precision when training
+  on GPU. Optional ``torch.compile`` via ``--fast``, ``GENCO_TPGT_FAST=1``, or
+  ``--compile``.
+* **Less sync**: GPU ``synchronize`` only for timed log lines and validation,
+  not after every training batch.
+* **Optional**: ``GENCO_TPGT_VAL_EVERY=3`` or ``--val-every 3`` skips most
+  validation passes (faster; coarser early stopping).
 """
 
 from __future__ import annotations
@@ -117,7 +126,11 @@ EXPECTED_COUNTS = {
 # Fraction of each split folder to load (first scenarios). 1.0 = full PFΔ split.
 DATA_FRACTION = 1.0
 # Forward/backward chunk size during training (gradient accumulation to BATCH_SIZE).
-MICRO_BATCH_SIZE = 16
+MICRO_BATCH_SIZE = 32
+# Validation/test forward-only batches (no backward); can exceed BATCH_SIZE when memory allows.
+EVAL_BATCH_SIZE = 64
+# Run validation PBL every N epochs (1 = each epoch, used for best checkpoint).
+VAL_EVERY = 1
 
 
 def ensure_runtime_packages() -> None:
@@ -174,6 +187,18 @@ def wants_torch_compile() -> bool:
         return True
     flag = os.environ.get("GENCO_TPGT_COMPILE", os.environ.get("GENCO_TPGT_FAST", ""))
     return flag.lower() in ("1", "true", "yes")
+
+
+def configure_cuda_training(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except AttributeError:
+        pass
 
 
 class MLP(nn.Module):
@@ -674,6 +699,30 @@ def parse_micro_batch_size() -> int:
     return MICRO_BATCH_SIZE
 
 
+def parse_eval_batch_size() -> int:
+    for index, arg in enumerate(sys.argv):
+        if arg == "--eval-batch" and index + 1 < len(sys.argv):
+            return int(sys.argv[index + 1])
+        if arg.startswith("--eval-batch="):
+            return int(arg.split("=", 1)[1])
+    env = os.environ.get("GENCO_TPGT_EVAL_BATCH", "").strip()
+    if env:
+        return int(env)
+    return EVAL_BATCH_SIZE
+
+
+def parse_val_every() -> int:
+    for index, arg in enumerate(sys.argv):
+        if arg == "--val-every" and index + 1 < len(sys.argv):
+            return int(sys.argv[index + 1])
+        if arg.startswith("--val-every="):
+            return int(arg.split("=", 1)[1])
+    env = os.environ.get("GENCO_TPGT_VAL_EVERY", "").strip()
+    if env:
+        return int(env)
+    return VAL_EVERY
+
+
 def scenario_limit(raw: Path) -> int | None:
     if DATA_FRACTION >= 1.0:
         return None
@@ -1128,14 +1177,16 @@ def run_batch(
     network: Network,
     index: np.ndarray,
     device: torch.device,
+    pair: torch.Tensor | None = None,
 ) -> tuple[TaskLossBreakdown, torch.Tensor]:
     chosen = torch.as_tensor(index, dtype=torch.long)
-    power_p = split.power_p[chosen].to(device)
-    power_q = split.power_q[chosen].to(device)
-    voltage = split.voltage[chosen].to(device)
-    angle = split.angle[chosen].to(device)
+    power_p = split.power_p[chosen].to(device, non_blocking=True)
+    power_q = split.power_q[chosen].to(device, non_blocking=True)
+    voltage = split.voltage[chosen].to(device, non_blocking=True)
+    angle = split.angle[chosen].to(device, non_blocking=True)
     specified, target = pack_case(power_p, power_q, voltage, angle, network.types)
-    pair = pair_features(model, network)
+    if pair is None:
+        pair = pair_features(model, network)
     prediction, residuals = model(
         specified,
         network.types,
@@ -1185,11 +1236,13 @@ def train_batch(
     use_amp = device.type == "cuda"
     optimizer.zero_grad(set_to_none=True)
     logged_parts: list[tuple[TaskLossBreakdown, float]] = []
+    with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
+        pair_embed = model.pair_encoder(network.rpe)
     for start in range(0, n, micro):
         chunk = cases[start : start + micro]
         weight = len(chunk) / n
         with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
-            breakdown, _score = run_batch(model, split, network, chunk, device)
+            breakdown, _score = run_batch(model, split, network, chunk, device, pair=pair_embed)
         scaled = breakdown.total * weight
         if scaler is not None:
             scaler.scale(scaled).backward()
@@ -1206,7 +1259,13 @@ def train_batch(
     return _weighted_loss_breakdown(logged_parts)
 
 
-def iterate_indexes(split: Split, seed: int, epoch: int, shuffle: bool):
+def iterate_indexes(
+    split: Split,
+    seed: int,
+    epoch: int,
+    shuffle: bool,
+    batch_size: int = BATCH_SIZE,
+):
     generator = torch.Generator()
     generator.manual_seed(seed * 1000 + epoch)
     groups = []
@@ -1217,17 +1276,23 @@ def iterate_indexes(split: Split, seed: int, epoch: int, shuffle: bool):
             index = index[order]
         groups.append((network_id, index.numpy()))
     for network_id, index in groups:
-        for start in range(0, len(index), BATCH_SIZE):
-            yield network_id, index[start : start + BATCH_SIZE]
+        for start in range(0, len(index), batch_size):
+            yield network_id, index[start : start + batch_size]
 
 
-def evaluate_pbl(model: TPGT, split: Split, networks: list[Network], device: torch.device) -> float:
+def evaluate_pbl(
+    model: TPGT,
+    split: Split,
+    networks: list[Network],
+    device: torch.device,
+    batch_size: int = EVAL_BATCH_SIZE,
+) -> float:
     model.eval()
     clear_pair_embed_cache(networks)
     total = 0.0
     seen = 0
     with torch.no_grad():
-        for network_id, index in iterate_indexes(split, seed=0, epoch=0, shuffle=False):
+        for network_id, index in iterate_indexes(split, seed=0, epoch=0, shuffle=False, batch_size=batch_size):
             _breakdown, score = run_batch(model, split, networks[network_id], index, device)
             total += float(score) * len(index)
             seen += len(index)
@@ -1390,14 +1455,14 @@ def train_epoch_loss_line(
     physics_sum: float,
     physics_stages: list[float],
     train_total: float,
-    val_pbl: float,
+    val_display: str,
 ) -> str:
     n = max(batches, 1)
     stage_text = "  ".join(f"phys_s{i + 1} {value / n:.4f}" for i, value in enumerate(physics_stages))
     return (
         f"seed {seed} epoch {epoch_number}/{EPOCHS}  "
         f"state {state_mse / n:.4f}  phys {physics_sum / n:.4f}  {stage_text}  "
-        f"train {train_total / n:.4f}  val_pbl {val_pbl:.6f}"
+        f"train {train_total / n:.4f}  val_pbl {val_display}"
     )
 
 
@@ -1407,6 +1472,8 @@ def train_seed(
     train_split: Split,
     val_split: Split,
     device: torch.device,
+    eval_batch_size: int = EVAL_BATCH_SIZE,
+    val_every: int = VAL_EVERY,
     on_epoch_end: Callable[[TPGT, int], tuple[dict[str, float], dict[str, int]]] | None = None,
     after_periodic_checkpoint: Callable[
         [TPGT, Path, int, dict[str, float], dict[str, int]], None
@@ -1417,6 +1484,7 @@ def train_seed(
     checkpoint_path = model_dir / "last.pt"
     done_path = model_dir / "complete.json"
     seed_all(seed)
+    configure_cuda_training(device)
     if device.type == "cuda":
         gc.collect()
         torch.cuda.empty_cache()
@@ -1556,8 +1624,6 @@ def train_seed(
                         flush=True,
                     )
                     logged_first_batch = True
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
                 batch_durations.append(time.perf_counter() - step_started)
                 running_total += float(breakdown.total.detach())
                 running_state += float(breakdown.state_mse.detach())
@@ -1566,6 +1632,8 @@ def train_seed(
                     running_phys_stages[stage_idx] += float(stage_mse.detach())
                 batches += 1
                 if batches % 250 == 0:
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
                     window = batch_durations[-250:]
                     avg_sec = sum(window) / len(window)
                     print(
@@ -1573,7 +1641,26 @@ def train_seed(
                         f"avg {avg_sec:.3f}s/batch (last {len(window)})",
                         flush=True,
                     )
-            val_score = evaluate_pbl(model, val_split, val_networks, device)
+            run_validation = val_every <= 1 or (epoch + 1) % val_every == 0 or (epoch + 1) == EPOCHS
+            if run_validation:
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                val_score = evaluate_pbl(
+                    model,
+                    val_split,
+                    val_networks,
+                    device,
+                    batch_size=eval_batch_size,
+                )
+                val_display = f"{val_score:.6f}"
+                if val_score < best_val:
+                    best_val = val_score
+                    wait = 0
+                    best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+                else:
+                    wait += 1
+            else:
+                val_display = "skipped"
             print(
                 train_epoch_loss_line(
                     seed,
@@ -1583,16 +1670,10 @@ def train_seed(
                     running_phys,
                     running_phys_stages,
                     running_total,
-                    val_score,
+                    val_display,
                 ),
                 flush=True,
             )
-            if val_score < best_val:
-                best_val = val_score
-                wait = 0
-                best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-            else:
-                wait += 1
             start_epoch = epoch + 1
             finish_checkpoint_epoch(start_epoch)
     if best_state is None:
@@ -1758,6 +1839,7 @@ def test_model(
     device: torch.device,
     active_cache: Path,
     persistent_cache: Path,
+    eval_batch_size: int = EVAL_BATCH_SIZE,
 ) -> tuple[dict[str, float], dict[str, int]]:
     scores = {}
     counts = {}
@@ -1771,22 +1853,28 @@ def test_model(
         )
         networks = [move_to(network, device) for network in split.networks]
         clear_pair_embed_cache(networks)
-        scores[label] = evaluate_pbl(model, split, networks, device)
+        scores[label] = evaluate_pbl(model, split, networks, device, batch_size=eval_batch_size)
         counts[label] = split.count
         print(f"test {label}: PBL {scores[label]:.6g} on {split.count} scenarios", flush=True)
     return scores, counts
 
 
 def main() -> None:
-    global DATA_FRACTION, MICRO_BATCH_SIZE
+    global DATA_FRACTION, MICRO_BATCH_SIZE, EVAL_BATCH_SIZE, VAL_EVERY
     ensure_runtime_packages()
     DATA_FRACTION = parse_data_fraction()
     MICRO_BATCH_SIZE = parse_micro_batch_size()
+    EVAL_BATCH_SIZE = parse_eval_batch_size()
+    VAL_EVERY = parse_val_every()
     if MICRO_BATCH_SIZE < 1 or MICRO_BATCH_SIZE > BATCH_SIZE:
         raise ValueError(f"micro-batch must be in [1, {BATCH_SIZE}], got {MICRO_BATCH_SIZE}")
+    if EVAL_BATCH_SIZE < 1:
+        raise ValueError(f"eval-batch must be >= 1, got {EVAL_BATCH_SIZE}")
+    if VAL_EVERY < 1:
+        raise ValueError(f"val-every must be >= 1, got {VAL_EVERY}")
     batch_note = (
-        f"Training batch size {BATCH_SIZE} "
-        f"(micro-batch {MICRO_BATCH_SIZE}, AMP on CUDA)."
+        f"Training batch {BATCH_SIZE}, micro {MICRO_BATCH_SIZE}, eval batch {EVAL_BATCH_SIZE}, "
+        f"val every {VAL_EVERY} epoch(s), AMP on CUDA."
     )
     if DATA_FRACTION < 1.0:
         print(
@@ -1856,7 +1944,14 @@ def main() -> None:
             continue
 
         def on_epoch_end(model: TPGT, epoch_number: int, seed: int = seed) -> tuple[dict[str, float], dict[str, int]]:
-            scores, counts = test_model(model, data, device, active_cache, persistent_cache)
+            scores, counts = test_model(
+                model,
+                data,
+                device,
+                active_cache,
+                persistent_cache,
+                eval_batch_size=EVAL_BATCH_SIZE,
+            )
             c2i_counts = {
                 "C2I-N": counts["C2I-N"],
                 "C2I-N-1": counts["C2I-N-1"],
@@ -1887,6 +1982,8 @@ def main() -> None:
             train_split,
             val_split,
             device,
+            eval_batch_size=EVAL_BATCH_SIZE,
+            val_every=VAL_EVERY,
             on_epoch_end=on_epoch_end,
             after_periodic_checkpoint=publish_checkpoint,
         )
