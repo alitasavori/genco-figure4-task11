@@ -46,6 +46,7 @@ BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
 EPOCHS = 5
 PATIENCE = 2
+# Earliest epoch where patience may stop. Checkpoints themselves are written every epoch.
 CHECKPOINT_EVERY = 3
 SEEDS = (0, 1, 2)
 BASE_MVA = 100.0
@@ -747,6 +748,50 @@ def evaluate_pbl(model: TPGT, split: Split, networks: list[Network], device: tor
     return total / seen
 
 
+def numbered_epoch_checkpoints(model_dir: Path) -> list[tuple[int, Path]]:
+    found: list[tuple[int, Path]] = []
+    for path in model_dir.glob("epoch_*.pt"):
+        suffix = path.stem.removeprefix("epoch_")
+        if suffix.isdigit():
+            found.append((int(suffix), path))
+    found.sort()
+    return found
+
+
+def load_resume_checkpoint(model_dir: Path, device: torch.device) -> tuple[dict | None, Path | None]:
+    """Load last.pt, or a newer epoch_k.pt if that file finished later."""
+    last_path = model_dir / "last.pt"
+    numbered = numbered_epoch_checkpoints(model_dir)
+    saved = None
+    chosen: Path | None = None
+    if last_path.is_file():
+        saved = torch.load(last_path, map_location=device, weights_only=False)
+        chosen = last_path
+    if numbered:
+        epoch_number, epoch_path = numbered[-1]
+        saved_epoch = int(saved["epoch"]) if saved is not None else -1
+        if epoch_number > saved_epoch:
+            saved = torch.load(epoch_path, map_location=device, weights_only=False)
+            chosen = epoch_path
+    return saved, chosen
+
+
+def read_completed_epochs(done_path: Path) -> int:
+    try:
+        payload = json.loads(done_path.read_text(encoding="utf-8"))
+        return int(payload.get("epochs_completed", 0))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+
+
+def test_pbl_line(seed: int, epoch_number: int, scores: dict[str, float]) -> str:
+    return (
+        f"seed {seed} epoch {epoch_number} test PBL  "
+        f"N {scores['N']:.6f}  N-1 {scores['N-1']:.6f}  "
+        f"N-2 {scores['N-2']:.6f}  C2I {scores['C2I']:.6f}"
+    )
+
+
 def train_seed(
     seed: int,
     model_dir: Path,
@@ -767,83 +812,104 @@ def train_seed(
     best_val = float("inf")
     wait = 0
     best_state = None
-    if checkpoint_path.exists():
-        saved = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    saved, resumed_from = load_resume_checkpoint(model_dir, device)
+    if saved is not None:
         model.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
         start_epoch = int(saved["epoch"])
         best_val = float(saved["best_val"])
         wait = int(saved["wait"])
         best_state = saved["best_state"]
-        print(f"Resuming seed {seed} at epoch {start_epoch}", flush=True)
     if done_path.exists():
-        print(f"Seed {seed} already finished.", flush=True)
-        model.load_state_dict(best_state if best_state is not None else torch.load(checkpoint_path, map_location=device, weights_only=False)["best_state"])
+        completed = read_completed_epochs(done_path)
+        if completed >= EPOCHS:
+            print(f"Seed {seed} already completed {EPOCHS} epochs. Skipping.", flush=True)
+        else:
+            print(f"Seed {seed} already finished. Skipping.", flush=True)
+        state = best_state
+        if state is None:
+            fallback, _path = load_resume_checkpoint(model_dir, device)
+            if fallback is not None:
+                state = fallback.get("best_state")
+        if state is None:
+            raise RuntimeError(f"Seed {seed} finished without a checkpoint.")
+        model.load_state_dict(state)
         return model
 
-    def save_periodic(epoch_number: int) -> None:
-        periodic_path = model_dir / f"epoch_{epoch_number}.pt"
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": epoch_number,
-                "best_val": best_val,
-                "wait": wait,
-                "best_state": best_state,
-            },
-            periodic_path,
+    def save_epoch(epoch_number: int) -> None:
+        epoch_path = model_dir / f"epoch_{epoch_number}.pt"
+        payload = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch_number,
+            "best_val": best_val,
+            "wait": wait,
+            "best_state": best_state,
+        }
+        torch.save(payload, epoch_path)
+        torch.save(payload, checkpoint_path)
+        print(
+            f"Saved seed {seed} epoch {epoch_number} checkpoint to {epoch_path} and {checkpoint_path}",
+            flush=True,
         )
-        print(f"Saved seed {seed} epoch {epoch_number} checkpoint to {periodic_path}", flush=True)
         if after_periodic_checkpoint is not None:
-            after_periodic_checkpoint(model, periodic_path, epoch_number)
+            after_periodic_checkpoint(model, epoch_path, epoch_number)
         (model_dir / f"epoch_{epoch_number}.compared").write_text(
             json.dumps({"epoch": epoch_number}),
             encoding="utf-8",
         )
 
-    compared_path = model_dir / f"epoch_{start_epoch}.compared"
-    if start_epoch > 0 and start_epoch % CHECKPOINT_EVERY == 0 and not compared_path.exists():
-        save_periodic(start_epoch)
-    for epoch in range(start_epoch, EPOCHS):
-        model.train()
-        running = 0.0
-        batches = 0
-        for network_id, index in iterate_indexes(train_split, seed, epoch, shuffle=True):
-            optimizer.zero_grad(set_to_none=True)
-            loss, _score = run_batch(model, train_split, train_networks[network_id], index, device)
-            loss.backward()
-            optimizer.step()
-            running += float(loss.detach())
-            batches += 1
-            if batches % 250 == 0:
-                print(f"  seed {seed} epoch {epoch + 1} batch {batches} loss {running / batches:.4f}", flush=True)
-        val_score = evaluate_pbl(model, val_split, val_networks, device)
+    pending_test = start_epoch > 0 and not (model_dir / f"epoch_{start_epoch}.compared").exists()
+    stopped_early = start_epoch > 0 and wait >= PATIENCE and start_epoch >= CHECKPOINT_EVERY
+    finished = start_epoch >= EPOCHS or stopped_early
+    if finished and pending_test:
         print(
-            f"seed {seed} epoch {epoch + 1}/{EPOCHS} train loss {running / max(batches, 1):.4f} val PBL {val_score:.6f}",
+            f"Seed {seed} epoch {start_epoch} checkpoint exists; running the missing test scores.",
             flush=True,
         )
-        if val_score < best_val:
-            best_val = val_score
-            wait = 0
-            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-        else:
-            wait += 1
-        start_epoch = epoch + 1
-        payload = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "epoch": start_epoch,
-            "best_val": best_val,
-            "wait": wait,
-            "best_state": best_state,
-        }
-        torch.save(payload, checkpoint_path)
-        if start_epoch % CHECKPOINT_EVERY == 0:
-            save_periodic(start_epoch)
-        if wait >= PATIENCE and start_epoch >= CHECKPOINT_EVERY:
-            print(f"Early stop seed {seed} after {start_epoch} epochs.", flush=True)
-            break
+        save_epoch(start_epoch)
+    elif finished and start_epoch >= EPOCHS:
+        print(f"Seed {seed} already completed {EPOCHS} epochs. Skipping.", flush=True)
+    elif finished:
+        print(f"Seed {seed} already finished early after {start_epoch} epochs. Skipping.", flush=True)
+    elif saved is not None:
+        print(
+            f"Resuming seed {seed} from {resumed_from} after finished epoch {start_epoch}",
+            flush=True,
+        )
+        if pending_test:
+            save_epoch(start_epoch)
+
+    if not finished:
+        for epoch in range(start_epoch, EPOCHS):
+            model.train()
+            running = 0.0
+            batches = 0
+            for network_id, index in iterate_indexes(train_split, seed, epoch, shuffle=True):
+                optimizer.zero_grad(set_to_none=True)
+                loss, _score = run_batch(model, train_split, train_networks[network_id], index, device)
+                loss.backward()
+                optimizer.step()
+                running += float(loss.detach())
+                batches += 1
+                if batches % 250 == 0:
+                    print(f"  seed {seed} epoch {epoch + 1} batch {batches} loss {running / batches:.4f}", flush=True)
+            val_score = evaluate_pbl(model, val_split, val_networks, device)
+            print(
+                f"seed {seed} epoch {epoch + 1}/{EPOCHS} train loss {running / max(batches, 1):.4f} val PBL {val_score:.6f}",
+                flush=True,
+            )
+            if val_score < best_val:
+                best_val = val_score
+                wait = 0
+                best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            else:
+                wait += 1
+            start_epoch = epoch + 1
+            save_epoch(start_epoch)
+            if wait >= PATIENCE and start_epoch >= CHECKPOINT_EVERY:
+                print(f"Early stop seed {seed} after {start_epoch} epochs.", flush=True)
+                break
     if best_state is None:
         raise RuntimeError(f"Seed {seed} produced no checkpoint.")
     model.load_state_dict(best_state)
@@ -854,10 +920,18 @@ def train_seed(
     return model
 
 
-def record_seed(results: Path, seed: int, scores: dict[str, float], counts: dict[str, int], checkpoint: Path) -> None:
+def record_seed(
+    results: Path,
+    seed: int,
+    scores: dict[str, float],
+    counts: dict[str, int],
+    checkpoint: Path,
+    epoch: int,
+) -> None:
     c2i_counts = {"C2I-N": counts["C2I-N"], "C2I-N-1": counts["C2I-N-1"], "C2I-N-2": counts["C2I-N-2"]}
     scores = dict(scores)
     scores["C2I"] = aggregate_c2i(scores, c2i_counts)
+    columns = [*SEED_COLUMNS, "epoch"]
     rows = []
     for category in (*CATEGORIES,):
         rows.append(
@@ -869,17 +943,35 @@ def record_seed(results: Path, seed: int, scores: dict[str, float], counts: dict
                 "mean_pbl_pu": f"{scores[category]:.8g}",
                 "checkpoint_path": str(checkpoint),
                 "source": "independent_training",
+                "epoch": str(epoch),
             }
         )
-    upsert_csv(results / "task1_1_tpgt_seed_metrics.csv", SEED_COLUMNS, rows, ["model", "task", "test_category", "seed"])
+    upsert_csv(
+        results / "task1_1_tpgt_seed_metrics.csv",
+        columns,
+        rows,
+        ["model", "task", "test_category", "seed", "epoch"],
+    )
 
 
 def write_summary(results: Path) -> list[dict]:
-    grouped: dict[str, list[float]] = {}
+    latest: dict[tuple[str, str], tuple[int, float]] = {}
     for row in read_csv(results / "task1_1_tpgt_seed_metrics.csv"):
         if row.get("model") != MODEL_NAME:
             continue
-        grouped.setdefault(row["test_category"], []).append(float(row["mean_pbl_pu"]))
+        raw_epoch = (row.get("epoch") or "").strip()
+        try:
+            epoch_number = int(raw_epoch) if raw_epoch else 0
+        except ValueError:
+            epoch_number = 0
+        key = (row.get("seed", ""), row.get("test_category", ""))
+        value = float(row["mean_pbl_pu"])
+        previous = latest.get(key)
+        if previous is None or epoch_number >= previous[0]:
+            latest[key] = (epoch_number, value)
+    grouped: dict[str, list[float]] = {}
+    for (_seed, category), (_epoch_number, value) in latest.items():
+        grouped.setdefault(category, []).append(value)
     summary = []
     for category in CATEGORIES:
         values = grouped.get(category, [])
@@ -898,15 +990,6 @@ def write_summary(results: Path) -> list[dict]:
     if summary:
         upsert_csv(path, SUMMARY_COLUMNS, summary, ["model", "test_category"])
     return summary
-
-
-def seed_recorded(results: Path, seed: int) -> bool:
-    found = {
-        row["test_category"]
-        for row in read_csv(results / "task1_1_tpgt_seed_metrics.csv")
-        if row.get("model") == MODEL_NAME and row.get("seed") == str(seed)
-    }
-    return set(CATEGORIES) <= found
 
 
 def print_comparison(summary: list[dict]) -> None:
@@ -1023,17 +1106,25 @@ def main() -> None:
     val_split = cached_split(cache, raw_dir(data, "valid", "n", "feasible"), "valid_n_feasible")
     for seed in SEEDS:
         seed_dir = checkpoints / f"seed_{seed}"
-        finished = (seed_dir / "complete.json").exists()
-        if finished and seed_recorded(results, seed):
-            print(f"Seed {seed} already has N, N-1, N-2, and C2I scores. Skipping.", flush=True)
-            continue
-        if finished:
-            print(f"Seed {seed} already finished.", flush=True)
+        if (seed_dir / "complete.json").exists():
+            completed = read_completed_epochs(seed_dir / "complete.json")
+            if completed >= EPOCHS:
+                print(f"Seed {seed} already completed {EPOCHS} epochs. Skipping.", flush=True)
+            else:
+                print(f"Seed {seed} already finished. Skipping.", flush=True)
             continue
 
         def publish_checkpoint(model: TPGT, checkpoint: Path, epoch_number: int, seed: int = seed) -> None:
             scores, counts = test_model(model, data, device, cache)
-            record_seed(results, seed, scores, counts, checkpoint)
+            c2i_counts = {
+                "C2I-N": counts["C2I-N"],
+                "C2I-N-1": counts["C2I-N-1"],
+                "C2I-N-2": counts["C2I-N-2"],
+            }
+            reported = dict(scores)
+            reported["C2I"] = aggregate_c2i(reported, c2i_counts)
+            print(test_pbl_line(seed, epoch_number, reported), flush=True)
+            record_seed(results, seed, scores, counts, checkpoint, epoch_number)
             summary = write_summary(results)
             print_comparison(summary)
             plot_comparison(results, summary)
