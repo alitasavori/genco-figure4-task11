@@ -60,9 +60,9 @@ from plot_task1_1 import PALETTE, PUBLISHED_TASK11
 from storage import ROOT, in_colab, mount_drive
 
 # Implementation choices, not values from the draft.
-D = 32
-D_E = 16
-D_A = 16
+D = 48
+D_E = 24
+D_A = 24
 HEADS = 2
 DEPTH = 2
 ETA = 1.0
@@ -82,7 +82,7 @@ CACHE_VERSION = "tpgt-cache-2"
 RPE_WALK_STEPS = 5
 RPE_DIM = RPE_WALK_STEPS + 5
 # Bumped when pair-encoder input size or architecture changes; old Drive checkpoints are ignored.
-CHECKPOINT_VERSION = "meshed-rpe-10-v5-depth2"
+CHECKPOINT_VERSION = "meshed-rpe-10-v6-capacity"
 # Off-diagonal |Y_pq| below this are treated as disconnected for admittance scaling.
 Y_ADMITTANCE_EPS = 1e-10
 # PQ voltage unknown is clamped to this band when evaluating Ybus injections (p.u.).
@@ -162,11 +162,17 @@ def wants_torch_compile() -> bool:
 
 
 class MLP(nn.Module):
-    """Two-layer map. The hidden width `D` is an implementation choice."""
+    """Three-layer map (in → D → D → out). Width `D` is an implementation choice."""
 
     def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(in_features, D), nn.ReLU(), nn.Linear(D, out_features))
+        self.net = nn.Sequential(
+            nn.Linear(in_features, D),
+            nn.ReLU(),
+            nn.Linear(D, D),
+            nn.ReLU(),
+            nn.Linear(D, out_features),
+        )
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         return self.net(values)

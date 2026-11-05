@@ -12,9 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from train_tpgt_task11 import (  # noqa: E402
+    D,
+    D_E,
     HEADS,
     CorrectionStage,
-    RPE_DIM,
     type_pair_masks,
 )
 
@@ -66,8 +67,8 @@ def test_batched_messages_match_reference() -> None:
     batch = 4
     types = torch.tensor([0, 0, 0, 1, 1, 2, 0, 0, 1, 1, 0, 0], dtype=torch.long)
     component = torch.zeros(buses, dtype=torch.long)
-    hidden = torch.randn(batch, buses, 32)
-    pair = torch.randn(buses, buses, 16)
+    hidden = torch.randn(batch, buses, D)
+    pair = torch.randn(buses, buses, D_E)
     stage = CorrectionStage()
     stage.eval()
     masks = type_pair_masks(types, component)
