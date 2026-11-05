@@ -50,7 +50,7 @@ def show_results() -> None:
 
     results = resolve_results()
     summary_path = results / "task1_1_summary.csv"
-    figure = results / "figure4_task1.1.png"
+    figure = results / "figure4_task1.1.svg"
     note = results / "figure4_task1.1_NOT_READY.txt"
     print(f"Summary file: {summary_path}")
     if summary_path.exists():
@@ -61,7 +61,7 @@ def show_results() -> None:
         print(note.read_text(encoding="utf-8"))
     try:
         from IPython import get_ipython
-        from IPython.display import Image, Markdown, display
+        from IPython.display import Markdown, SVG, display
         import pandas as pd
     except Exception:
         return
@@ -71,7 +71,7 @@ def show_results() -> None:
     if figure.exists():
         display(Markdown("**Task 1.1 test results.** Each bar is the mean power-balance loss of three trained seeds."))
         display(frame)
-        display(Image(filename=str(figure)))
+        display(SVG(filename=str(figure)))
         return
     display(Markdown("**The four-model figure is not ready.** The table is the test scores written so far."))
     display(frame)

@@ -1,0 +1,1010 @@
+"""Train the unshared type-pair graph Transformer on IEEE 118-bus Task 1.1.
+
+Option II from the draft: each correction stage has its own weights.
+The hidden sizes, depth, batch, and epoch cap below are implementation
+choices so a Colab GPU can finish a run. They are not paper hyperparameters.
+
+IEEE 118 is meshed, so the six electrical pair features are computed on a
+BFS spanning tree rooted at the slack bus. See `electrical_rpe`.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch import nn
+
+from common import (
+    CATEGORIES,
+    SEED_COLUMNS,
+    SUMMARY_COLUMNS,
+    ensure_dirs,
+    read_csv,
+    upsert_csv,
+)
+from metrics import aggregate_c2i, sample_mean, sample_std
+from plot_task1_1 import PALETTE, PUBLISHED_TASK11
+from storage import ROOT, in_colab, mount_drive
+
+# Implementation choices, not values from the draft.
+D = 32
+D_E = 16
+D_A = 16
+HEADS = 2
+DEPTH = 3
+ETA = 1.0
+BATCH_SIZE = 16
+LEARNING_RATE = 1e-4
+EPOCHS = 5
+PATIENCE = 2
+SEEDS = (0, 1, 2)
+BASE_MVA = 100.0
+LAMBDA_STATE = 1.0
+LAMBDA_PHYS = 0.1
+MODEL_NAME = "TPGT"
+TYPE_NAMES = ("PQ", "PV", "Slack")
+CACHE_VERSION = "tpgt-cache-1"
+
+TEST_PARTS = (
+    ("N", "n", "feasible"),
+    ("N-1", "n-1", "feasible"),
+    ("N-2", "n-2", "feasible"),
+    ("C2I-N", "n", "nose"),
+    ("C2I-N-1", "n-1", "nose"),
+    ("C2I-N-2", "n-2", "nose"),
+)
+EXPECTED_COUNTS = {
+    ("train", "n", "feasible"): 48600,
+    ("valid", "n", "feasible"): 5400,
+    ("test", "n", "feasible"): 2000,
+    ("test", "n-1", "feasible"): 2000,
+    ("test", "n-2", "feasible"): 2000,
+    ("test", "n", "nose"): 200,
+    ("test", "n-1", "nose"): 200,
+    ("test", "n-2", "nose"): 200,
+}
+
+
+def ensure_runtime_packages() -> None:
+    missing = []
+    for name in ("pyarrow", "huggingface_hub", "matplotlib"):
+        try:
+            __import__(name)
+        except ImportError:
+            missing.append(name)
+    if missing:
+        print("Installing", " ".join(missing), flush=True)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+
+
+def seed_all(seed: int) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def wrap_angle(delta: torch.Tensor) -> torch.Tensor:
+    return torch.remainder(delta + math.pi, 2 * math.pi) - math.pi
+
+
+def rho_nonlinearity(values: torch.Tensor) -> torch.Tensor:
+    return torch.sqrt(torch.relu(values)) - torch.sqrt(torch.relu(-values))
+
+
+class MLP(nn.Module):
+    """Two-layer map. The hidden width `D` is an implementation choice."""
+
+    def __init__(self, in_features: int, out_features: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(in_features, D), nn.ReLU(), nn.Linear(D, out_features))
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return self.net(values)
+
+
+def _init_matrices(weight: torch.Tensor) -> None:
+    if weight.dim() < 2:
+        nn.init.zeros_(weight)
+        return
+    view = weight.view(-1, weight.shape[-2], weight.shape[-1])
+    for matrix in view:
+        nn.init.xavier_uniform_(matrix)
+
+
+class CorrectionStage(nn.Module):
+    """One unshared GRIT correction. Nine type pairs, each with its own head weights."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        shape = (9, HEADS)
+        self.w_q = nn.Parameter(torch.empty(*shape, D_A, D))
+        self.w_k = nn.Parameter(torch.empty(*shape, D_A, D))
+        self.w_v = nn.Parameter(torch.empty(*shape, D_A, D))
+        self.w_ew = nn.Parameter(torch.empty(*shape, D_A, D_E))
+        self.w_eb = nn.Parameter(torch.empty(*shape, D_A, D_E))
+        self.w_a = nn.Parameter(torch.empty(*shape, 1, D_A))
+        self.w_ev = nn.Parameter(torch.empty(*shape, D_A, D_A))
+        self.w_o = nn.Parameter(torch.empty(HEADS, D, D_A))
+        for parameter in (self.w_q, self.w_k, self.w_v, self.w_ew, self.w_eb, self.w_a, self.w_ev, self.w_o):
+            _init_matrices(parameter)
+        self.update = nn.ModuleList(MLP(D + D + 2, D) for _ in range(3))
+        self.decode = nn.ModuleList(MLP(D, 2) for _ in range(3))
+        self.norm = nn.LayerNorm(D)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        unknown: torch.Tensor,
+        specified: torch.Tensor,
+        pair: torch.Tensor,
+        types: torch.Tensor,
+        component: torch.Tensor,
+        ybus: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        residual_in = nodal_residual(specified, unknown, types, ybus)
+        message = self._messages(hidden, pair, types, component)
+        updated = torch.zeros_like(hidden)
+        for type_id, update in enumerate(self.update):
+            mask = types == type_id
+            if not bool(mask.any()):
+                continue
+            features = torch.cat((hidden[:, mask], message[:, mask], residual_in[:, mask]), dim=-1)
+            updated[:, mask] = update(features)
+        hidden_next = self.norm(hidden + updated)
+        delta = torch.zeros_like(unknown)
+        for type_id, decoder in enumerate(self.decode):
+            mask = types == type_id
+            if not bool(mask.any()):
+                continue
+            delta[:, mask] = decoder(hidden_next[:, mask])
+        unknown_next = unknown + ETA * delta
+        residual_out = nodal_residual(specified, unknown_next, types, ybus)
+        return hidden_next, unknown_next, residual_out
+
+    def _messages(
+        self,
+        hidden: torch.Tensor,
+        pair: torch.Tensor,
+        types: torch.Tensor,
+        component: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, buses, _ = hidden.shape
+        scores = hidden.new_full((batch, HEADS, buses, buses), float("-inf"))
+        values = hidden.new_zeros((batch, HEADS, buses, buses, D_A))
+        same_component = component.view(buses, 1) == component.view(1, buses)
+        for pair_id in range(9):
+            receiver, sender = divmod(pair_id, 3)
+            type_mask = (types.view(buses, 1) == receiver) & (types.view(1, buses) == sender)
+            mask = type_mask & same_component
+            if not bool(mask.any()):
+                continue
+            for head in range(HEADS):
+                query = hidden @ self.w_q[pair_id, head].T
+                key = hidden @ self.w_k[pair_id, head].T
+                mixed = rho_nonlinearity(query[:, :, None, :] + key[:, None, :, :])
+                projected = pair @ self.w_ew[pair_id, head].T
+                bias = pair @ self.w_eb[pair_id, head].T
+                interaction = torch.relu(mixed * projected.unsqueeze(0) + bias.unsqueeze(0))
+                score = (interaction * self.w_a[pair_id, head]).sum(dim=-1)
+                scores[:, head] = torch.where(mask, score, scores[:, head])
+                value = hidden @ self.w_v[pair_id, head].T
+                content = value[:, None, :, :] + interaction @ self.w_ev[pair_id, head].T
+                values[:, head] = torch.where(mask.unsqueeze(-1), content, values[:, head])
+        weights = torch.softmax(scores, dim=-1)
+        weights = torch.nan_to_num(weights, nan=0.0)
+        mixed_heads = (weights.unsqueeze(-1) * values).sum(dim=3)
+        return torch.einsum("bhnd,hod->bno", mixed_heads, self.w_o)
+
+
+class TPGT(nn.Module):
+    """Fixed-depth type-pair graph Transformer with independently learned stages."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoders = nn.ModuleList(MLP(2, D) for _ in range(3))
+        self.pair_encoder = MLP(6, D_E)
+        self.stages = nn.ModuleList(CorrectionStage() for _ in range(DEPTH))
+
+    def forward(
+        self,
+        specified: torch.Tensor,
+        types: torch.Tensor,
+        rpe: torch.Tensor,
+        component: torch.Tensor,
+        ybus: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        pair = self.pair_encoder(rpe)
+        hidden = specified.new_zeros(specified.shape[0], specified.shape[1], D)
+        unknown = flat_start(specified, types)
+        for type_id, encoder in enumerate(self.encoders):
+            mask = types == type_id
+            if bool(mask.any()):
+                hidden[:, mask] = encoder(specified[:, mask])
+        residuals = []
+        for stage in self.stages:
+            hidden, unknown, residual = stage(hidden, unknown, specified, pair, types, component, ybus)
+            residuals.append(residual)
+        return unknown, residuals
+
+
+def flat_start(specified: torch.Tensor, types: torch.Tensor) -> torch.Tensor:
+    unknown = torch.zeros_like(specified)
+    unknown[:, types == 0, 0] = 1.0
+    return unknown
+
+
+def pack_case(
+    power_p: torch.Tensor,
+    power_q: torch.Tensor,
+    voltage: torch.Tensor,
+    angle: torch.Tensor,
+    types: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Specified quantities stay fixed. The target is the unknown part of the solution."""
+    specified = torch.zeros(*power_p.shape, 2, device=power_p.device, dtype=power_p.dtype)
+    target = torch.zeros_like(specified)
+    pq = types == 0
+    pv = types == 1
+    slack = types == 2
+    specified[:, pq, 0] = power_p[:, pq]
+    specified[:, pq, 1] = power_q[:, pq]
+    target[:, pq, 0] = voltage[:, pq]
+    target[:, pq, 1] = angle[:, pq]
+    specified[:, pv, 0] = power_p[:, pv]
+    specified[:, pv, 1] = voltage[:, pv]
+    target[:, pv, 0] = power_q[:, pv]
+    target[:, pv, 1] = angle[:, pv]
+    specified[:, slack, 0] = voltage[:, slack]
+    specified[:, slack, 1] = angle[:, slack]
+    target[:, slack, 0] = power_p[:, slack]
+    target[:, slack, 1] = power_q[:, slack]
+    return specified, target
+
+
+def assemble(
+    specified: torch.Tensor,
+    unknown: torch.Tensor,
+    types: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    power_p = torch.empty(specified.shape[:2], device=specified.device, dtype=specified.dtype)
+    power_q = torch.empty_like(power_p)
+    voltage = torch.empty_like(power_p)
+    angle = torch.empty_like(power_p)
+    pq = types == 0
+    pv = types == 1
+    slack = types == 2
+    power_p[:, pq] = specified[:, pq, 0]
+    power_q[:, pq] = specified[:, pq, 1]
+    voltage[:, pq] = unknown[:, pq, 0]
+    angle[:, pq] = unknown[:, pq, 1]
+    power_p[:, pv] = specified[:, pv, 0]
+    voltage[:, pv] = specified[:, pv, 1]
+    power_q[:, pv] = unknown[:, pv, 0]
+    angle[:, pv] = unknown[:, pv, 1]
+    voltage[:, slack] = specified[:, slack, 0]
+    angle[:, slack] = specified[:, slack, 1]
+    power_p[:, slack] = unknown[:, slack, 0]
+    power_q[:, slack] = unknown[:, slack, 1]
+    return power_p, power_q, voltage, angle
+
+
+def nodal_residual(
+    specified: torch.Tensor,
+    unknown: torch.Tensor,
+    types: torch.Tensor,
+    ybus: torch.Tensor,
+) -> torch.Tensor:
+    """AC mismatch in per unit. Ybus is already per unit, so this does not divide by baseMVA again."""
+    power_p, power_q, voltage, angle = assemble(specified, unknown, types)
+    voltage_complex = voltage.to(torch.complex64) * torch.exp(1j * angle.to(torch.complex64))
+    current = torch.matmul(ybus, voltage_complex.transpose(0, 1)).transpose(0, 1)
+    flow = voltage_complex * torch.conj(current)
+    return torch.stack((power_p - flow.real, power_q - flow.imag), dim=-1)
+
+
+def task_loss(prediction: torch.Tensor, target: torch.Tensor, residuals: list[torch.Tensor], types: torch.Tensor) -> torch.Tensor:
+    error = prediction - target
+    angle_unknown = (types == 0) | (types == 1)
+    error[:, angle_unknown, 1] = wrap_angle(error[:, angle_unknown, 1])
+    state = torch.mean(torch.sum(error * error, dim=-1))
+    physics = torch.stack([torch.mean(torch.sum(residual * residual, dim=-1)) for residual in residuals]).sum()
+    return LAMBDA_STATE * state + LAMBDA_PHYS * physics
+
+
+def mean_pbl(residual: torch.Tensor) -> torch.Tensor:
+    return torch.mean(torch.sqrt(residual[..., 0] ** 2 + residual[..., 1] ** 2))
+
+
+@dataclass
+class Network:
+    ybus: torch.Tensor
+    rpe: torch.Tensor
+    component: torch.Tensor
+    types: torch.Tensor
+
+
+@dataclass
+class Split:
+    name: str
+    count: int
+    power_p: torch.Tensor
+    power_q: torch.Tensor
+    voltage: torch.Tensor
+    angle: torch.Tensor
+    network_index: torch.Tensor
+    networks: list[Network]
+
+
+def electrical_rpe(bus_count: int, edges: list[tuple[int, int, float, float]], root: int) -> tuple[np.ndarray, np.ndarray]:
+    """Six pair features on a slack-rooted BFS spanning tree.
+
+    The draft defines path and common-path impedance on a radial feeder.
+    IEEE 118 is meshed, so those paths are the unique paths of a spanning
+    tree: breadth-first from the slack bus, with neighbors taken in bus-index
+    order. A bus left in another island by an outage is rooted at the
+    smallest bus index of that island. Parallel in-service branches contribute
+    one series impedance, the branch with the smallest index.
+    """
+    adjacency: list[list[tuple[int, float, float]]] = [[] for _ in range(bus_count)]
+    for origin, destination, resistance, reactance in edges:
+        adjacency[origin].append((destination, resistance, reactance))
+        adjacency[destination].append((origin, resistance, reactance))
+    for neighbors in adjacency:
+        neighbors.sort(key=lambda item: item[0])
+    parent = np.full(bus_count, -1, dtype=np.int64)
+    depth = np.zeros(bus_count, dtype=np.int64)
+    prefix_r = np.zeros(bus_count, dtype=np.float64)
+    prefix_x = np.zeros(bus_count, dtype=np.float64)
+    seen = np.zeros(bus_count, dtype=bool)
+    component = np.full(bus_count, -1, dtype=np.int64)
+    component_id = 0
+    starts = [root] + [bus for bus in range(bus_count) if bus != root]
+    for start in starts:
+        if seen[start]:
+            continue
+        queue = [start]
+        seen[start] = True
+        component[start] = component_id
+        head = 0
+        while head < len(queue):
+            bus = queue[head]
+            head += 1
+            for neighbor, resistance, reactance in adjacency[bus]:
+                if seen[neighbor]:
+                    continue
+                seen[neighbor] = True
+                parent[neighbor] = bus
+                depth[neighbor] = depth[bus] + 1
+                prefix_r[neighbor] = prefix_r[bus] + resistance
+                prefix_x[neighbor] = prefix_x[bus] + reactance
+                component[neighbor] = component_id
+                queue.append(neighbor)
+        component_id += 1
+
+    def ancestor(origin: int, destination: int) -> int:
+        while depth[origin] > depth[destination]:
+            origin = int(parent[origin])
+        while depth[destination] > depth[origin]:
+            destination = int(parent[destination])
+        while origin != destination:
+            origin = int(parent[origin])
+            destination = int(parent[destination])
+        return origin
+
+    features = np.zeros((bus_count, bus_count, 6), dtype=np.float32)
+    for origin in range(bus_count):
+        for destination in range(bus_count):
+            if component[origin] != component[destination]:
+                continue
+            shared = ancestor(origin, destination)
+            features[origin, destination, 0] = prefix_r[origin] + prefix_r[destination] - 2 * prefix_r[shared]
+            features[origin, destination, 1] = prefix_x[origin] + prefix_x[destination] - 2 * prefix_x[shared]
+            features[origin, destination, 2] = prefix_r[shared]
+            features[origin, destination, 3] = prefix_x[shared]
+            features[origin, destination, 4] = float(shared == origin and origin != destination)
+            features[origin, destination, 5] = float(shared == destination and origin != destination)
+    symmetric = np.max(np.abs(features[:, :, 0] - features[:, :, 0].T))
+    if symmetric > 1e-5:
+        raise RuntimeError("Path resistance on the spanning tree is not symmetric.")
+    return features, component
+
+
+def _blocks(values: np.ndarray, width: int) -> np.ndarray:
+    if values.shape[0] % width != 0:
+        raise RuntimeError(f"{values.shape[0]} rows do not divide into blocks of {width}.")
+    return values.reshape(-1, width)
+
+
+def scenario_count(raw: Path) -> int:
+    import pyarrow.parquet as pq
+
+    rows = pq.ParquetFile(raw / "bus_data.parquet").metadata.num_rows
+    if rows % 118 != 0:
+        raise RuntimeError(f"{raw} bus rows {rows} are not a multiple of 118.")
+    return rows // 118
+
+
+def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
+    import pyarrow.compute as pc
+    import pyarrow.dataset as ds
+    import pyarrow.parquet as pq
+
+    full = scenario_count(raw)
+    count = full if limit is None else min(limit, full)
+    branch_rows = pq.ParquetFile(raw / "branch_data.parquet").metadata.num_rows
+    if branch_rows % full != 0:
+        raise RuntimeError(f"{raw} branch rows are not one block per scenario.")
+    branch_count = branch_rows // full
+    bus = pq.read_table(
+        raw / "bus_data.parquet",
+        columns=["scenario", "bus", "Pd", "Qd", "Pg", "Qg", "Vm", "Va", "PQ", "PV", "REF"],
+    ).slice(0, count * 118)
+    buses = _blocks(bus.column("bus").to_numpy(), 118)
+    scenario_blocks = _blocks(bus.column("scenario").to_numpy(), 118)
+    if not np.all(scenario_blocks[:, :1] == scenario_blocks):
+        raise RuntimeError(f"{raw} bus rows are not grouped by scenario.")
+    if not np.all(buses == np.arange(118)):
+        raise RuntimeError(f"{raw} buses are not ordered 0..117 within each scenario.")
+    pq_flag = _blocks(bus.column("PQ").to_numpy(), 118)
+    pv_flag = _blocks(bus.column("PV").to_numpy(), 118)
+    ref_flag = _blocks(bus.column("REF").to_numpy(), 118)
+    type_code = np.zeros((count, 118), dtype=np.float32)
+    type_code[pv_flag > 0.5] = 1
+    type_code[ref_flag > 0.5] = 2
+    if np.any((pq_flag > 0.5) & (pv_flag > 0.5)) or np.any((type_code == 0) & (pq_flag <= 0.5)):
+        raise RuntimeError(f"{name} has a bus that is not exactly one of PQ, PV, or slack.")
+    power_p = (_blocks(bus.column("Pg").to_numpy(), 118) - _blocks(bus.column("Pd").to_numpy(), 118)) / BASE_MVA
+    power_q = (_blocks(bus.column("Qg").to_numpy(), 118) - _blocks(bus.column("Qd").to_numpy(), 118)) / BASE_MVA
+    voltage = _blocks(bus.column("Vm").to_numpy(), 118)
+    angle = np.deg2rad(_blocks(bus.column("Va").to_numpy(), 118))
+
+    branch = pq.read_table(
+        raw / "branch_data.parquet",
+        columns=["scenario", "idx", "from_bus", "to_bus", "r", "x", "br_status"],
+    ).slice(0, count * branch_count)
+    branch_scenario = _blocks(branch.column("scenario").to_numpy(), branch_count)
+    bus_scenario = _blocks(bus.column("scenario").to_numpy(), 118)
+    if not np.array_equal(branch_scenario[:, 0], bus_scenario[:, 0]):
+        raise RuntimeError(f"{raw} bus and branch scenarios are not in the same order.")
+    status = _blocks(branch.column("br_status").to_numpy(), branch_count)
+    resistance = _blocks(branch.column("r").to_numpy(), branch_count)
+    reactance = _blocks(branch.column("x").to_numpy(), branch_count)
+    origin = _blocks(branch.column("from_bus").to_numpy(), branch_count)
+    destination = _blocks(branch.column("to_bus").to_numpy(), branch_count)
+    signature = np.concatenate(
+        [status, np.round(resistance, 6), np.round(reactance, 6), type_code],
+        axis=1,
+    ).astype(np.float32)
+    _, network_ids = np.unique(signature, axis=0, return_inverse=True)
+    print(
+        f"{name}: {count} scenarios loaded"
+        f"{'' if limit is None else f' of {full}'} across {int(network_ids.max()) + 1} network(s).",
+        flush=True,
+    )
+
+    wanted = bus_scenario[:, 0]
+    representatives = [int(np.flatnonzero(network_ids == net)[0]) for net in range(int(network_ids.max()) + 1)]
+    y_table = ds.dataset(raw / "y_bus_data.parquet").to_table(
+        filter=pc.field("scenario").isin([int(wanted[local]) for local in representatives]),
+        columns=["scenario", "index1", "index2", "G", "B"],
+    )
+    y_scenario = y_table.column("scenario").to_numpy()
+    y_rows = {
+        "index1": y_table.column("index1").to_numpy(),
+        "index2": y_table.column("index2").to_numpy(),
+        "G": y_table.column("G").to_numpy(),
+        "B": y_table.column("B").to_numpy(),
+    }
+    networks: list[Network] = []
+    for local in representatives:
+        types = type_code[local].astype(np.int64)
+        if int(np.sum(types == 2)) != 1:
+            raise RuntimeError(f"{name} scenario {int(wanted[local])} has {int(np.sum(types == 2))} slack buses.")
+        slack = int(np.flatnonzero(types == 2)[0])
+        scenario_id = int(wanted[local])
+        chosen = y_scenario == scenario_id
+        rows_i = y_rows["index1"][chosen].astype(np.int64)
+        rows_j = y_rows["index2"][chosen].astype(np.int64)
+        ybus = np.zeros((118, 118), dtype=np.complex64)
+        ybus[rows_i, rows_j] = y_rows["G"][chosen] + 1j * y_rows["B"][chosen]
+        edges = []
+        seen_pairs: dict[tuple[int, int], tuple[int, float, float]] = {}
+        for branch_id in range(branch_count):
+            if status[local, branch_id] < 0.5:
+                continue
+            first = int(origin[local, branch_id])
+            second = int(destination[local, branch_id])
+            key = (first, second) if first < second else (second, first)
+            previous = seen_pairs.get(key)
+            if previous is None or branch_id < previous[0]:
+                seen_pairs[key] = (branch_id, float(resistance[local, branch_id]), float(reactance[local, branch_id]))
+        for _key, (branch_id, resistance_value, reactance_value) in seen_pairs.items():
+            first = int(origin[local, branch_id])
+            second = int(destination[local, branch_id])
+            edges.append((first, second, resistance_value, reactance_value))
+        features, component = electrical_rpe(118, edges, slack)
+        solved = np.exp(1j * angle[local]) * voltage[local]
+        injection = solved * np.conj(ybus.astype(np.complex128) @ solved)
+        mismatch = np.sqrt((power_p[local] - injection.real) ** 2 + (power_q[local] - injection.imag) ** 2)
+        print(f"  reference PBL for {name} network {len(networks)}: {float(mismatch.mean()):.3e}", flush=True)
+        if float(mismatch.mean()) > 1e-2:
+            raise RuntimeError(f"Solved cases in {name} do not satisfy per-unit power balance.")
+        networks.append(
+            Network(
+                ybus=torch.from_numpy(ybus),
+                rpe=torch.from_numpy(features),
+                component=torch.from_numpy(component.astype(np.int64)),
+                types=torch.from_numpy(types),
+            )
+        )
+    return Split(
+        name=name,
+        count=count,
+        power_p=torch.from_numpy(power_p.astype(np.float32)),
+        power_q=torch.from_numpy(power_q.astype(np.float32)),
+        voltage=torch.from_numpy(voltage.astype(np.float32)),
+        angle=torch.from_numpy(angle.astype(np.float32)),
+        network_index=torch.from_numpy(network_ids.astype(np.int64)),
+        networks=networks,
+    )
+
+
+def log_counts(data_root: Path, results: Path) -> dict:
+    report = {}
+    folders = [("train", "n", "feasible"), ("valid", "n", "feasible")]
+    folders.extend(("test", topology, condition) for _label, topology, condition in TEST_PARTS)
+    for split, topology, condition in folders:
+        raw = data_root / "case118" / split / "case118" / topology / condition / "raw"
+        count = scenario_count(raw)
+        expected = EXPECTED_COUNTS[(split, topology, condition)]
+        key = f"{split}/{topology}/{condition}"
+        report[key] = {"loaded": count, "expected": expected}
+        print(f"count {key}: {count} (expected {expected})", flush=True)
+        if count != expected:
+            print(f"  count differs from the PFΔ Task 1.1 split. Using the {count} loaded scenarios.", flush=True)
+    path = results / "task1_1_tpgt_counts.json"
+    path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
+def raw_dir(data_root: Path, split: str, topology: str, condition: str) -> Path:
+    return data_root / "case118" / split / "case118" / topology / condition / "raw"
+
+
+def cached_split(cache: Path, raw: Path, name: str) -> Split:
+    stamp = {
+        "version": CACHE_VERSION,
+        "bytes": raw.joinpath("bus_data.parquet").stat().st_size,
+    }
+    stamp_path = cache / f"{name}.json"
+    tensor_path = cache / f"{name}.pt"
+    if stamp_path.exists() and tensor_path.exists():
+        saved = json.loads(stamp_path.read_text(encoding="utf-8"))
+        if saved == stamp:
+            print(f"Loading cached {name} split from {tensor_path}", flush=True)
+            payload = torch.load(tensor_path, map_location="cpu", weights_only=False)
+            return payload
+    cache.mkdir(parents=True, exist_ok=True)
+    split = read_split(raw, name)
+    torch.save(split, tensor_path)
+    stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
+    return split
+
+
+DATASET_RELATIVE = Path("Foundation Model") / "vendor" / "pfdelta_task1.1"
+WINDOWS_DRIVE = Path(r"K:\My Drive")
+COLAB_DRIVE = Path("/content/drive/MyDrive")
+
+
+def dataset_request() -> Path:
+    return Path(os.environ.get("GENCO_PFDELTA_TASK11", str(DATASET_RELATIVE)))
+
+
+def google_drive_root() -> Path | None:
+    """Colab MyDrive after mount, or the Windows Google Drive client root."""
+    if in_colab():
+        return mount_drive()
+    if WINDOWS_DRIVE.is_dir():
+        return WINDOWS_DRIVE
+    return None
+
+
+def drive_dataset(drive: Path | None) -> Path | None:
+    """Return the saved Task 1.1 root when case118 is already on Drive.
+
+    This only checks directory names. It does not copy the dataset.
+    """
+    requested = dataset_request()
+    candidates: list[Path] = []
+    if requested.is_absolute():
+        candidates.append(requested)
+    elif drive is not None:
+        candidates.append(drive / requested)
+    for extra in (WINDOWS_DRIVE / DATASET_RELATIVE, COLAB_DRIVE / DATASET_RELATIVE):
+        if extra not in candidates:
+            candidates.append(extra)
+    for candidate in candidates:
+        if (candidate / "case118").is_dir():
+            return candidate
+    return None
+
+
+def legacy_locations(drive: Path | None) -> tuple[Path, Path]:
+    """Old download and results directories, used only when the Drive copy is absent."""
+    if in_colab():
+        if drive is not None:
+            work = drive / "genco_figure4_task11"
+        else:
+            work = Path("/content/genco_figure4_task11")
+        return work, work / "results"
+    work = Path(os.environ.get("GENCO_WORK_ROOT", str(ROOT / "vendor")))
+    results = Path(os.environ.get("GENCO_RESULTS_DIR", str(ROOT / "results")))
+    return work, results
+
+
+def drive_output_dirs(drive: Path | None) -> tuple[Path, Path] | None:
+    """Checkpoint directory and TPGT result directory on Drive.
+
+    Colab writes under MyDrive/Foundation Model once Drive is mounted.
+    Windows writes under K:\\My Drive\\Foundation Model when that folder exists.
+    """
+    if drive is None:
+        return None
+    foundation = drive / "Foundation Model"
+    if not in_colab() and not foundation.is_dir():
+        return None
+    checkpoints = foundation / "tpgt_task11"
+    results = foundation / "results"
+    checkpoints.mkdir(parents=True, exist_ok=True)
+    results.mkdir(parents=True, exist_ok=True)
+    return checkpoints, results
+
+
+def ensure_dataset(work: Path, drive: Path | None = None) -> Path:
+    saved = drive_dataset(drive)
+    if saved is not None:
+        print(f"Dataset already present: {saved}", flush=True)
+        print("case118 is already on Drive; skipping download.", flush=True)
+        return saved
+    data = work / "pfdelta_task1.1"
+    marker = data / "case118" / "train" / "case118" / "n" / "feasible" / "raw" / "bus_data.parquet"
+    if marker.exists():
+        print(f"Dataset already present: {data}", flush=True)
+        return data
+    from huggingface_hub import snapshot_download
+
+    print("Downloading gridfm/pfdelta_task1.1", flush=True)
+    snapshot_download(repo_id="gridfm/pfdelta_task1.1", repo_type="dataset", local_dir=str(data))
+    if not marker.exists():
+        raise FileNotFoundError(f"Download finished without {marker}")
+    return data
+
+
+def move_to(network: Network, device: torch.device) -> Network:
+    return Network(
+        ybus=network.ybus.to(device),
+        rpe=network.rpe.to(device),
+        component=network.component.to(device),
+        types=network.types.to(device),
+    )
+
+
+def run_batch(
+    model: TPGT,
+    split: Split,
+    network: Network,
+    index: np.ndarray,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    chosen = torch.as_tensor(index, dtype=torch.long)
+    power_p = split.power_p[chosen].to(device)
+    power_q = split.power_q[chosen].to(device)
+    voltage = split.voltage[chosen].to(device)
+    angle = split.angle[chosen].to(device)
+    specified, target = pack_case(power_p, power_q, voltage, angle, network.types)
+    prediction, residuals = model(specified, network.types, network.rpe, network.component, network.ybus)
+    loss = task_loss(prediction, target, residuals, network.types)
+    return loss, mean_pbl(residuals[-1])
+
+
+def iterate_indexes(split: Split, seed: int, epoch: int, shuffle: bool):
+    generator = torch.Generator()
+    generator.manual_seed(seed * 1000 + epoch)
+    groups = []
+    for network_id in range(len(split.networks)):
+        index = torch.nonzero(split.network_index == network_id, as_tuple=False).flatten()
+        if shuffle and index.numel() > 1:
+            order = torch.randperm(index.numel(), generator=generator)
+            index = index[order]
+        groups.append((network_id, index.numpy()))
+    for network_id, index in groups:
+        for start in range(0, len(index), BATCH_SIZE):
+            yield network_id, index[start : start + BATCH_SIZE]
+
+
+def evaluate_pbl(model: TPGT, split: Split, networks: list[Network], device: torch.device) -> float:
+    model.eval()
+    total = 0.0
+    seen = 0
+    with torch.no_grad():
+        for network_id, index in iterate_indexes(split, seed=0, epoch=0, shuffle=False):
+            _loss, score = run_batch(model, split, networks[network_id], index, device)
+            total += float(score) * len(index)
+            seen += len(index)
+    if seen != split.count:
+        raise RuntimeError(f"Evaluated {seen} of {split.count} scenarios in {split.name}.")
+    return total / seen
+
+
+def train_seed(
+    seed: int,
+    model_dir: Path,
+    train_split: Split,
+    val_split: Split,
+    device: torch.device,
+) -> TPGT:
+    model_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = model_dir / "last.pt"
+    done_path = model_dir / "complete.json"
+    seed_all(seed)
+    model = TPGT().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    train_networks = [move_to(network, device) for network in train_split.networks]
+    val_networks = [move_to(network, device) for network in val_split.networks]
+    start_epoch = 0
+    best_val = float("inf")
+    wait = 0
+    best_state = None
+    if checkpoint_path.exists():
+        saved = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model.load_state_dict(saved["model"])
+        optimizer.load_state_dict(saved["optimizer"])
+        start_epoch = int(saved["epoch"])
+        best_val = float(saved["best_val"])
+        wait = int(saved["wait"])
+        best_state = saved["best_state"]
+        print(f"Resuming seed {seed} at epoch {start_epoch}", flush=True)
+    if done_path.exists():
+        print(f"Seed {seed} already finished.", flush=True)
+        model.load_state_dict(best_state if best_state is not None else torch.load(checkpoint_path, map_location=device, weights_only=False)["best_state"])
+        return model
+    for epoch in range(start_epoch, EPOCHS):
+        model.train()
+        running = 0.0
+        batches = 0
+        for network_id, index in iterate_indexes(train_split, seed, epoch, shuffle=True):
+            optimizer.zero_grad(set_to_none=True)
+            loss, _score = run_batch(model, train_split, train_networks[network_id], index, device)
+            loss.backward()
+            optimizer.step()
+            running += float(loss.detach())
+            batches += 1
+            if batches % 250 == 0:
+                print(f"  seed {seed} epoch {epoch + 1} batch {batches} loss {running / batches:.4f}", flush=True)
+        val_score = evaluate_pbl(model, val_split, val_networks, device)
+        print(
+            f"seed {seed} epoch {epoch + 1}/{EPOCHS} train loss {running / max(batches, 1):.4f} val PBL {val_score:.6f}",
+            flush=True,
+        )
+        if val_score < best_val:
+            best_val = val_score
+            wait = 0
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+        else:
+            wait += 1
+        start_epoch = epoch + 1
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": start_epoch,
+                "best_val": best_val,
+                "wait": wait,
+                "best_state": best_state,
+            },
+            checkpoint_path,
+        )
+        if wait >= PATIENCE:
+            print(f"Early stop seed {seed} after {start_epoch} epochs.", flush=True)
+            break
+    if best_state is None:
+        raise RuntimeError(f"Seed {seed} produced no checkpoint.")
+    model.load_state_dict(best_state)
+    done_path.write_text(
+        json.dumps({"seed": seed, "epochs_completed": start_epoch, "best_val_pbl": best_val}),
+        encoding="utf-8",
+    )
+    return model
+
+
+def record_seed(results: Path, seed: int, scores: dict[str, float], counts: dict[str, int], checkpoint: Path) -> None:
+    c2i_counts = {"C2I-N": counts["C2I-N"], "C2I-N-1": counts["C2I-N-1"], "C2I-N-2": counts["C2I-N-2"]}
+    scores = dict(scores)
+    scores["C2I"] = aggregate_c2i(scores, c2i_counts)
+    rows = []
+    for category in (*CATEGORIES,):
+        rows.append(
+            {
+                "model": MODEL_NAME,
+                "task": "1.1",
+                "test_category": category,
+                "seed": str(seed),
+                "mean_pbl_pu": f"{scores[category]:.8g}",
+                "checkpoint_path": str(checkpoint),
+                "source": "independent_training",
+            }
+        )
+    upsert_csv(results / "task1_1_tpgt_seed_metrics.csv", SEED_COLUMNS, rows, ["model", "task", "test_category", "seed"])
+
+
+def write_summary(results: Path) -> list[dict]:
+    grouped: dict[str, list[float]] = {}
+    for row in read_csv(results / "task1_1_tpgt_seed_metrics.csv"):
+        if row.get("model") != MODEL_NAME:
+            continue
+        grouped.setdefault(row["test_category"], []).append(float(row["mean_pbl_pu"]))
+    summary = []
+    for category in CATEGORIES:
+        values = grouped.get(category, [])
+        if not values:
+            continue
+        summary.append(
+            {
+                "model": MODEL_NAME,
+                "test_category": category,
+                "mean_across_seeds": f"{sample_mean(values):.8g}",
+                "std_across_seeds": f"{sample_std(values):.8g}" if len(values) >= 2 else "0",
+                "n_seeds": str(len(values)),
+            }
+        )
+    path = results / "task1_1_tpgt_summary.csv"
+    if summary:
+        upsert_csv(path, SUMMARY_COLUMNS, summary, ["model", "test_category"])
+    return summary
+
+
+def seed_recorded(results: Path, seed: int) -> bool:
+    found = {
+        row["test_category"]
+        for row in read_csv(results / "task1_1_tpgt_seed_metrics.csv")
+        if row.get("model") == MODEL_NAME and row.get("seed") == str(seed)
+    }
+    return set(CATEGORIES) <= found
+
+
+def print_comparison(summary: list[dict]) -> None:
+    print("\nTask 1.1 mean power-balance loss (per unit)", flush=True)
+    print("PUBLISHED", flush=True)
+    for model, scores in PUBLISHED_TASK11.items():
+        parts = [f"{category} {scores[category][0]:.4g} ± {scores[category][1]:.4g}" for category in CATEGORIES]
+        print(f"  {model}: " + "; ".join(parts), flush=True)
+    print("TPGT this run", flush=True)
+    by_category = {row["test_category"]: row for row in summary}
+    if any(category not in by_category for category in CATEGORIES):
+        print("  TPGT has no finished four-category seed yet.", flush=True)
+        return
+    parts = []
+    for category in CATEGORIES:
+        row = by_category[category]
+        parts.append(
+            f"{category} {float(row['mean_across_seeds']):.4g} ± {float(row['std_across_seeds']):.4g} (n={row['n_seeds']})"
+        )
+    print("  TPGT: " + "; ".join(parts), flush=True)
+
+
+def plot_comparison(results: Path, summary: list[dict]) -> None:
+    by_category = {row["test_category"]: row for row in summary}
+    if any(category not in by_category for category in CATEGORIES):
+        return
+    if any(int(by_category[category]["n_seeds"]) < 1 for category in CATEGORIES):
+        return
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams["svg.fonttype"] = "path"
+
+    labels = [f"{model} (published)" for model in ("GENCO Base", "CANOS-PF", "GNS-S", "PFNet")] + ["TPGT (this run)"]
+    colors = [PALETTE[model] for model in ("GENCO Base", "CANOS-PF", "GNS-S", "PFNet")] + ["#1F4B99"]
+    means = []
+    stds = []
+    for model in ("GENCO Base", "CANOS-PF", "GNS-S", "PFNet"):
+        means.append([PUBLISHED_TASK11[model][category][0] for category in CATEGORIES])
+        stds.append([PUBLISHED_TASK11[model][category][1] for category in CATEGORIES])
+    means.append([float(by_category[category]["mean_across_seeds"]) for category in CATEGORIES])
+    stds.append([float(by_category[category]["std_across_seeds"]) for category in CATEGORIES])
+    figure, axis = plt.subplots(figsize=(10, 8))
+    positions = np.arange(len(CATEGORIES))
+    width = 0.15
+    for index, label in enumerate(labels):
+        offset = (index - (len(labels) - 1) / 2) * width
+        axis.bar(positions + offset, means[index], width, yerr=stds[index], label=label, color=colors[index], capsize=2)
+    axis.set_xticks(positions)
+    axis.set_xticklabels(list(CATEGORIES))
+    axis.set_ylabel("Power Balance Loss (Mean) [p.u.]")
+    axis.set_ylim(0, 1.8)
+    axis.yaxis.grid(True)
+    axis.legend(frameon=False, fontsize=9)
+    axis.set_title("Task 1.1")
+    figure.tight_layout()
+    output = results / "figure4_task1.1_tpgt.svg"
+    figure.savefig(output, format="svg", bbox_inches="tight")
+    plt.close(figure)
+    print(f"wrote {output}", flush=True)
+    try:
+        from IPython.display import SVG, display
+
+        display(SVG(filename=str(output)))
+    except Exception:
+        pass
+
+
+def test_model(model: TPGT, data_root: Path, device: torch.device, cache: Path) -> tuple[dict[str, float], dict[str, int]]:
+    scores = {}
+    counts = {}
+    model.eval()
+    for label, topology, condition in TEST_PARTS:
+        split = cached_split(cache, raw_dir(data_root, "test", topology, condition), f"test_{topology}_{condition}")
+        networks = [move_to(network, device) for network in split.networks]
+        scores[label] = evaluate_pbl(model, split, networks, device)
+        counts[label] = split.count
+        print(f"test {label}: PBL {scores[label]:.6g} on {split.count} scenarios", flush=True)
+    return scores, counts
+
+
+def main() -> None:
+    ensure_runtime_packages()
+    drive = google_drive_root()
+    outputs = drive_output_dirs(drive)
+    work, legacy_results = legacy_locations(drive)
+    if outputs is not None:
+        checkpoints, results = outputs
+    else:
+        work.mkdir(parents=True, exist_ok=True)
+        legacy_results.mkdir(parents=True, exist_ok=True)
+        checkpoints = work / "tpgt_task11"
+        checkpoints.mkdir(parents=True, exist_ok=True)
+        results = legacy_results
+    os.environ["GENCO_RESULTS_DIR"] = str(results)
+    os.environ["GENCO_WORK_ROOT"] = str(checkpoints.parent)
+    os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
+    from common import use_selected_results
+
+    use_selected_results()
+    ensure_dirs()
+    results.mkdir(parents=True, exist_ok=True)
+    data = ensure_dataset(work, drive)
+    print(f"Dataset: {data}", flush=True)
+    print(f"Checkpoints: {checkpoints}", flush=True)
+    print(f"Results directory: {results}", flush=True)
+    log_counts(data, results)
+    cache = checkpoints / "cache"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training device: {device}", flush=True)
+    train_split = cached_split(cache, raw_dir(data, "train", "n", "feasible"), "train_n_feasible")
+    val_split = cached_split(cache, raw_dir(data, "valid", "n", "feasible"), "valid_n_feasible")
+    print_comparison(write_summary(results))
+    for seed in SEEDS:
+        if seed_recorded(results, seed):
+            print(f"Seed {seed} already has N, N-1, N-2, and C2I scores. Skipping.", flush=True)
+            continue
+        model = train_seed(seed, checkpoints / f"seed_{seed}", train_split, val_split, device)
+        scores, counts = test_model(model, data, device, cache)
+        record_seed(results, seed, scores, counts, checkpoints / f"seed_{seed}" / "last.pt")
+        summary = write_summary(results)
+        print_comparison(summary)
+        plot_comparison(results, summary)
+
+
+if __name__ == "__main__":
+    main()

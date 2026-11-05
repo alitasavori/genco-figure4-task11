@@ -1,7 +1,8 @@
-"""Task 1.1 panel of GENCO Figure 4, drawn from this run's test scores.
+"""Task 1.1 panel of GENCO Figure 4.
 
 Colors, category order, and axis text follow
 gridfm-graphkit scripts/pfdelta/make_pbl_barplots.py.
+The published table is table_a_8_genco_exponent_fixed.tex, Task 1.1.
 """
 
 from __future__ import annotations
@@ -26,6 +27,35 @@ PALETTE = {
 }
 PAPER_YLIM = (0.0, 1.8)
 PUBLISHED_YTICKS = [0.0, 0.45, 0.9, 1.35, 1.8]
+
+# Mean ± std from the Task 1.1 rows of the table the authors plot.
+# GNS is labeled GNS-S on the figure.
+PUBLISHED_TASK11 = {
+    "GENCO Base": {
+        "N": (1.4e-3, 0.4e-3),
+        "N-1": (4.2e-2, 2.2e-2),
+        "N-2": (5.0e-2, 2.6e-2),
+        "C2I": (3.0e-1, 0.8e-1),
+    },
+    "CANOS-PF": {
+        "N": (2.7e-2, 0.03e-2),
+        "N-1": (7.0e-1, 0.8e-1),
+        "N-2": (5.6e-1, 0.7e-1),
+        "C2I": (1.1, 0.1),
+    },
+    "GNS-S": {
+        "N": (5.3e-1, 2.7e-1),
+        "N-1": (6.8e-1, 2.6e-1),
+        "N-2": (7.1e-1, 2.5e-1),
+        "C2I": (1.0, 0.2),
+    },
+    "PFNet": {
+        "N": (3.2e-1, 0.2e-1),
+        "N-1": (5.2e-1, 0.2e-1),
+        "N-2": (5.3e-1, 0.3e-1),
+        "C2I": (1.4, 0.1),
+    },
+}
 
 
 def _font(size: float) -> font_manager.FontProperties:
@@ -63,6 +93,7 @@ def _draw(grouped: dict, output: Path, ylim: tuple[float, float], yticks: list[f
             "mathtext.fontset": "stix",
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
+            "svg.fonttype": "path",
         }
     )
     models = [model for model in MODELS if model in grouped]
@@ -111,12 +142,25 @@ def _draw(grouped: dict, output: Path, ylim: tuple[float, float], yticks: list[f
     legend.get_title().set_fontproperties(_font(14))
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, bbox_inches="tight")
-    png = output.with_suffix(".png")
-    fig.savefig(png, bbox_inches="tight", dpi=200)
+    fig.savefig(
+        output,
+        format="svg",
+        bbox_inches="tight",
+        facecolor="white",
+        edgecolor="none",
+        metadata={"Title": "GENCO Figure 4, Task 1.1"},
+    )
     plt.close(fig)
+    for stale in (output.with_suffix(".pdf"), output.with_suffix(".png")):
+        if stale.exists():
+            stale.unlink()
     print(f"wrote {output}")
-    print(f"wrote {png}")
+    try:
+        from IPython.display import SVG, display
+
+        display(SVG(filename=str(output)))
+    except Exception:
+        pass
 
 
 def _ylim_for(grouped: dict) -> tuple[tuple[float, float], list[float]]:
@@ -133,14 +177,12 @@ def plot_task11(results_dir: Path | None = None) -> list[Path]:
     results_dir = results_dir or RESULTS
     summary = read_csv(results_dir / "task1_1_summary.csv")
     measured = _rows_for(summary)
-    pdf = results_dir / "figure4_task1.1.pdf"
+    figure = results_dir / "figure4_task1.1.svg"
     note = results_dir / "figure4_task1.1_NOT_READY.txt"
     if len(measured) != len(MODELS):
-        if pdf.exists():
-            pdf.unlink()
-        png = pdf.with_suffix(".png")
-        if png.exists():
-            png.unlink()
+        for path in (figure, figure.with_suffix(".pdf"), figure.with_suffix(".png")):
+            if path.exists():
+                path.unlink()
         missing = [model for model in MODELS if model not in measured]
         note.write_text(
             "Figure 4 Task 1.1 was not written.\n"
@@ -152,15 +194,42 @@ def plot_task11(results_dir: Path | None = None) -> list[Path]:
     if note.exists():
         note.unlink()
     ylim, yticks = _ylim_for(measured)
-    _draw(measured, pdf, ylim, yticks)
-    return [pdf]
+    _draw(measured, figure, ylim, yticks)
+    return [figure]
+
+
+def plot_published(results_dir: Path | None = None) -> list[Path]:
+    """Draw Task 1.1 from the published table. This does not train or test."""
+    results_dir = results_dir or RESULTS
+    note = results_dir / "figure4_task1.1_NOT_READY.txt"
+    if note.exists():
+        note.unlink()
+    print("Task 1.1 published power-balance loss (mean ± std).")
+    for model in MODELS:
+        parts = [
+            f"{category} {mean:.6g} ± {std:.6g}"
+            for category, (mean, std) in PUBLISHED_TASK11[model].items()
+        ]
+        print(f"{model}: " + "; ".join(parts))
+    figure = results_dir / "figure4_task1.1.svg"
+    ylim, yticks = _ylim_for(PUBLISHED_TASK11)
+    _draw(PUBLISHED_TASK11, figure, ylim, yticks)
+    return [figure]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plot the Task 1.1 panel of GENCO Figure 4.")
     parser.add_argument("--results", type=Path, default=RESULTS)
+    parser.add_argument(
+        "--published",
+        action="store_true",
+        help="Draw Task 1.1 from the published table, without training.",
+    )
     args = parser.parse_args()
-    plot_task11(args.results)
+    if args.published:
+        plot_published(args.results)
+    else:
+        plot_task11(args.results)
 
 
 if __name__ == "__main__":
