@@ -80,7 +80,7 @@ CACHE_VERSION = "tpgt-cache-2"
 RPE_WALK_STEPS = 5
 RPE_DIM = RPE_WALK_STEPS + 5
 # Bumped when pair-encoder input size or architecture changes; old Drive checkpoints are ignored.
-CHECKPOINT_VERSION = "meshed-rpe-10-v2"
+CHECKPOINT_VERSION = "meshed-rpe-10-v3"
 # PQ voltage unknown is clamped to this band when evaluating Ybus injections (p.u.).
 V_MIN_PU = 0.05
 V_MAX_PU = 2.0
@@ -237,23 +237,24 @@ class CorrectionStage(nn.Module):
     ) -> torch.Tensor:
         batch, buses, _ = hidden.shape
         mask_view = pair_type_masks.view(1, 9, 1, buses, buses)
-        query = torch.einsum("bnd,phad->bphnd", hidden, self.w_q)
-        key = torch.einsum("bnd,phad->bphnd", hidden, self.w_k)
+        # Contract hidden dim D with w_*; attention lives in D_A (same as the pre-batch matmul loops).
+        query = torch.einsum("bnd,phad->bphna", hidden, self.w_q)
+        key = torch.einsum("bnd,phad->bphna", hidden, self.w_k)
         mixed = rho_nonlinearity(query.unsqueeze(-2) + key.unsqueeze(-3))
-        projected = torch.einsum("nne,phae->phnna", pair, self.w_ew)
-        bias = torch.einsum("nne,phae->phnn", pair, self.w_eb)
-        interaction = torch.relu(mixed * projected.unsqueeze(0) + bias.unsqueeze(0).unsqueeze(-1))
+        projected = torch.einsum("nme,phae->phnma", pair, self.w_ew)
+        bias = torch.einsum("nme,phae->phnma", pair, self.w_eb)
+        interaction = torch.relu(mixed * projected.unsqueeze(0) + bias.unsqueeze(0))
         all_scores = (interaction * self.w_a.unsqueeze(0).unsqueeze(-2)).sum(dim=-1)
         scores = all_scores.masked_fill(~mask_view, float("-inf")).amax(dim=1)
-        value = torch.einsum("bnd,phad->bphnd", hidden, self.w_v)
-        content = value.unsqueeze(-2) + torch.einsum("bphnna,phab->bphnnb", interaction, self.w_ev)
+        value = torch.einsum("bnd,phad->bphna", hidden, self.w_v)
+        content = value.unsqueeze(3) + torch.einsum("bphnma,phxa->bphnmx", interaction, self.w_ev)
         values = (content * mask_view.unsqueeze(-1)).sum(dim=1)
         weights = torch.softmax(scores, dim=-1)
         weights = torch.nan_to_num(weights, nan=0.0)
         row_sum = weights.sum(dim=-1, keepdim=True)
         weights = torch.where(row_sum > 0, weights / row_sum.clamp(min=1e-12), weights)
         mixed_heads = (weights.unsqueeze(-1) * values).sum(dim=3)
-        return torch.einsum("bhnd,hod->bno", mixed_heads, self.w_o)
+        return torch.einsum("bhna,hda->bnd", mixed_heads, self.w_o)
 
 
 class TPGT(nn.Module):
@@ -1152,6 +1153,8 @@ def train_seed(
                     first_batch_started = time.perf_counter()
                 step_started = time.perf_counter()
                 loss, _score = run_batch(model, train_split, train_networks[network_id], index, device)
+                loss.backward()
+                optimizer.step()
                 if first_batch_started is not None:
                     if device.type == "cuda":
                         torch.cuda.synchronize()
@@ -1162,8 +1165,6 @@ def train_seed(
                         flush=True,
                     )
                     first_batch_started = None
-                loss.backward()
-                optimizer.step()
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 batch_durations.append(time.perf_counter() - step_started)
@@ -1489,5 +1490,10 @@ if __name__ == "__main__":
         work, _legacy = legacy_locations(drive)
         data = ensure_dataset(work, drive)
         sanity_check_meshed_rpe(data)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--test-attention":
+        from tests.test_tpgt_attention import test_batched_messages_match_reference
+
+        test_batched_messages_match_reference()
+        print("test_tpgt_attention OK", flush=True)
     else:
         main()
