@@ -57,6 +57,8 @@ TYPE_NAMES = ("PQ", "PV", "Slack")
 CACHE_VERSION = "tpgt-cache-2"
 RPE_WALK_STEPS = 5
 RPE_DIM = RPE_WALK_STEPS + 5
+# Bumped when pair-encoder input size or architecture changes; old Drive checkpoints are ignored.
+CHECKPOINT_VERSION = "meshed-rpe-10"
 
 TEST_PARTS = (
     ("N", "n", "feasible"),
@@ -844,9 +846,34 @@ def load_resume_checkpoint(model_dir: Path, device: torch.device) -> tuple[dict 
 def read_completed_epochs(done_path: Path) -> int:
     try:
         payload = json.loads(done_path.read_text(encoding="utf-8"))
+        if payload.get("checkpoint_version") != CHECKPOINT_VERSION:
+            return 0
         return int(payload.get("epochs_completed", 0))
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return 0
+
+
+def restore_checkpoint_payload(
+    model: TPGT,
+    optimizer: torch.optim.Optimizer,
+    payload: dict | None,
+) -> dict | None:
+    """Load weights if the checkpoint matches the current model; otherwise return None."""
+    if payload is None:
+        return None
+    if payload.get("checkpoint_version") != CHECKPOINT_VERSION:
+        return None
+    try:
+        model.load_state_dict(payload["model"], strict=True)
+        optimizer.load_state_dict(payload["optimizer"])
+    except RuntimeError:
+        return None
+    return {
+        "epoch": int(payload["epoch"]),
+        "best_val": float(payload["best_val"]),
+        "wait": int(payload["wait"]),
+        "best_state": payload["best_state"],
+    }
 
 
 def reports_test_scores(epoch_number: int) -> bool:
@@ -885,28 +912,35 @@ def train_seed(
     wait = 0
     best_state = None
     saved, resumed_from = load_resume_checkpoint(model_dir, device)
-    if saved is not None:
-        model.load_state_dict(saved["model"])
-        optimizer.load_state_dict(saved["optimizer"])
-        start_epoch = int(saved["epoch"])
-        best_val = float(saved["best_val"])
-        wait = int(saved["wait"])
-        best_state = saved["best_state"]
+    restored = restore_checkpoint_payload(model, optimizer, saved)
+    if restored is not None:
+        start_epoch = restored["epoch"]
+        best_val = restored["best_val"]
+        wait = restored["wait"]
+        best_state = restored["best_state"]
+    elif saved is not None:
+        print(
+            f"Seed {seed}: checkpoint on Drive uses the old 6-feature RPE; starting from epoch 0.",
+            flush=True,
+        )
     if done_path.exists() and read_completed_epochs(done_path) >= EPOCHS:
         print(f"Seed {seed} already completed {EPOCHS} epochs. Skipping.", flush=True)
         state = best_state
         if state is None:
             fallback, _path = load_resume_checkpoint(model_dir, device)
             if fallback is not None:
-                state = fallback.get("best_state")
+                restored_done = restore_checkpoint_payload(model, optimizer, fallback)
+                if restored_done is not None:
+                    state = restored_done["best_state"]
         if state is None:
-            raise RuntimeError(f"Seed {seed} finished without a checkpoint.")
-        model.load_state_dict(state)
+            raise RuntimeError(f"Seed {seed} finished without a compatible checkpoint.")
+        model.load_state_dict(state, strict=True)
         return model
 
     def save_epoch(epoch_number: int) -> None:
         epoch_path = model_dir / f"epoch_{epoch_number}.pt"
         payload = {
+            "checkpoint_version": CHECKPOINT_VERSION,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": epoch_number,
@@ -937,7 +971,7 @@ def train_seed(
         save_epoch(start_epoch)
     elif finished:
         print(f"Seed {seed} already completed {EPOCHS} epochs. Skipping.", flush=True)
-    elif saved is not None:
+    elif restored is not None:
         print(
             f"Resuming seed {seed} from {resumed_from} after finished epoch {start_epoch}",
             flush=True,
@@ -977,7 +1011,14 @@ def train_seed(
         raise RuntimeError(f"Seed {seed} produced no checkpoint.")
     model.load_state_dict(best_state)
     done_path.write_text(
-        json.dumps({"seed": seed, "epochs_completed": start_epoch, "best_val_pbl": best_val}),
+        json.dumps(
+            {
+                "seed": seed,
+                "checkpoint_version": CHECKPOINT_VERSION,
+                "epochs_completed": start_epoch,
+                "best_val_pbl": best_val,
+            }
+        ),
         encoding="utf-8",
     )
     return model
