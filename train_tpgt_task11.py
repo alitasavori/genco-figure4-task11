@@ -15,6 +15,7 @@ import math
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,10 +42,11 @@ D_A = 16
 HEADS = 2
 DEPTH = 3
 ETA = 1.0
-BATCH_SIZE = 16
+BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
 EPOCHS = 5
 PATIENCE = 2
+CHECKPOINT_EVERY = 3
 SEEDS = (0, 1, 2)
 BASE_MVA = 100.0
 LAMBDA_STATE = 1.0
@@ -751,6 +753,7 @@ def train_seed(
     train_split: Split,
     val_split: Split,
     device: torch.device,
+    after_periodic_checkpoint: Callable[[TPGT, Path, int], None] | None = None,
 ) -> TPGT:
     model_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = model_dir / "last.pt"
@@ -777,6 +780,31 @@ def train_seed(
         print(f"Seed {seed} already finished.", flush=True)
         model.load_state_dict(best_state if best_state is not None else torch.load(checkpoint_path, map_location=device, weights_only=False)["best_state"])
         return model
+
+    def save_periodic(epoch_number: int) -> None:
+        periodic_path = model_dir / f"epoch_{epoch_number}.pt"
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch_number,
+                "best_val": best_val,
+                "wait": wait,
+                "best_state": best_state,
+            },
+            periodic_path,
+        )
+        print(f"Saved seed {seed} epoch {epoch_number} checkpoint to {periodic_path}", flush=True)
+        if after_periodic_checkpoint is not None:
+            after_periodic_checkpoint(model, periodic_path, epoch_number)
+        (model_dir / f"epoch_{epoch_number}.compared").write_text(
+            json.dumps({"epoch": epoch_number}),
+            encoding="utf-8",
+        )
+
+    compared_path = model_dir / f"epoch_{start_epoch}.compared"
+    if start_epoch > 0 and start_epoch % CHECKPOINT_EVERY == 0 and not compared_path.exists():
+        save_periodic(start_epoch)
     for epoch in range(start_epoch, EPOCHS):
         model.train()
         running = 0.0
@@ -802,18 +830,18 @@ def train_seed(
         else:
             wait += 1
         start_epoch = epoch + 1
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": start_epoch,
-                "best_val": best_val,
-                "wait": wait,
-                "best_state": best_state,
-            },
-            checkpoint_path,
-        )
-        if wait >= PATIENCE:
+        payload = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": start_epoch,
+            "best_val": best_val,
+            "wait": wait,
+            "best_state": best_state,
+        }
+        torch.save(payload, checkpoint_path)
+        if start_epoch % CHECKPOINT_EVERY == 0:
+            save_periodic(start_epoch)
+        if wait >= PATIENCE and start_epoch >= CHECKPOINT_EVERY:
             print(f"Early stop seed {seed} after {start_epoch} epochs.", flush=True)
             break
     if best_state is None:
@@ -993,17 +1021,31 @@ def main() -> None:
     print(f"Training device: {device}", flush=True)
     train_split = cached_split(cache, raw_dir(data, "train", "n", "feasible"), "train_n_feasible")
     val_split = cached_split(cache, raw_dir(data, "valid", "n", "feasible"), "valid_n_feasible")
-    print_comparison(write_summary(results))
     for seed in SEEDS:
-        if seed_recorded(results, seed):
+        seed_dir = checkpoints / f"seed_{seed}"
+        finished = (seed_dir / "complete.json").exists()
+        if finished and seed_recorded(results, seed):
             print(f"Seed {seed} already has N, N-1, N-2, and C2I scores. Skipping.", flush=True)
             continue
-        model = train_seed(seed, checkpoints / f"seed_{seed}", train_split, val_split, device)
-        scores, counts = test_model(model, data, device, cache)
-        record_seed(results, seed, scores, counts, checkpoints / f"seed_{seed}" / "last.pt")
-        summary = write_summary(results)
-        print_comparison(summary)
-        plot_comparison(results, summary)
+        if finished:
+            print(f"Seed {seed} already finished.", flush=True)
+            continue
+
+        def publish_checkpoint(model: TPGT, checkpoint: Path, epoch_number: int, seed: int = seed) -> None:
+            scores, counts = test_model(model, data, device, cache)
+            record_seed(results, seed, scores, counts, checkpoint)
+            summary = write_summary(results)
+            print_comparison(summary)
+            plot_comparison(results, summary)
+
+        train_seed(
+            seed,
+            seed_dir,
+            train_split,
+            val_split,
+            device,
+            after_periodic_checkpoint=publish_checkpoint,
+        )
 
 
 if __name__ == "__main__":
