@@ -33,6 +33,7 @@ Performance notes (Colab / large train split)
 
 from __future__ import annotations
 
+import hashlib
 import json
 import gc
 import math
@@ -72,7 +73,7 @@ BATCH_SIZE = 32
 LEARNING_RATE = 1e-4
 EPOCHS = 100
 # Drive checkpoints (and results CSV / comparison plot) every 3rd epoch and at the final epoch.
-# The four held-out test PBL scores are printed every epoch (see on_epoch_end in train_seed).
+# The four held-out test PBL scores run on checkpoint epochs (3, 6, …) and the final epoch.
 CHECKPOINT_EVERY = 3
 SEEDS = (0, 1, 2)
 BASE_MVA = 100.0
@@ -80,11 +81,13 @@ LAMBDA_STATE = 0.85
 LAMBDA_PHYS = 0.15
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
-CACHE_VERSION = "tpgt-cache-2"
+CACHE_VERSION = "tpgt-cache-3"
 RPE_WALK_STEPS = 5
 RPE_DIM = RPE_WALK_STEPS + 5
 # Bumped when pair-encoder input size or architecture changes; old Drive checkpoints are ignored.
 CHECKPOINT_VERSION = "meshed-rpe-10-v6-capacity"
+# Reference labels must satisfy nodal balance within this mean PBL (p.u.) when checked at load.
+REFERENCE_PBL_TOLERANCE = 1e-2
 # Off-diagonal |Y_pq| below this are treated as disconnected for admittance scaling.
 Y_ADMITTANCE_EPS = 1e-10
 # PQ voltage unknown is clamped to this band when evaluating Ybus injections (p.u.).
@@ -680,6 +683,79 @@ def scenario_limit(raw: Path) -> int | None:
     return max(1, min(full, int(full * DATA_FRACTION)))
 
 
+YBusEntry = tuple[int, int, float, float]
+
+
+def ybus_from_entries(entries: list[YBusEntry], bus_count: int = 118) -> np.ndarray:
+    ybus = np.zeros((bus_count, bus_count), dtype=np.complex64)
+    for row, column, conductance, susceptance in entries:
+        ybus[row, column] = conductance + 1j * susceptance
+    return ybus
+
+
+def ybus_entries_fingerprint(entries: list[YBusEntry]) -> float:
+    """Stable hash of sparse Y-bus entries for network grouping."""
+    if not entries:
+        return 0.0
+    packed = np.array(
+        sorted(
+            (int(row), int(column), round(float(conductance), 6), round(float(susceptance), 6))
+            for row, column, conductance, susceptance in entries
+        ),
+        dtype=np.float64,
+    )
+    digest = hashlib.sha256(packed.tobytes()).digest()
+    return float(np.frombuffer(digest[:8], dtype=np.float64)[0])
+
+
+def load_ybus_entries_by_scenario(
+    raw: Path,
+    scenario_ids: list[int],
+) -> dict[int, list[YBusEntry]]:
+    import pyarrow.compute as pc
+    import pyarrow.dataset as ds
+
+    if not scenario_ids:
+        return {}
+    table = ds.dataset(raw / "y_bus_data.parquet").to_table(
+        filter=pc.field("scenario").isin(scenario_ids),
+        columns=["scenario", "index1", "index2", "G", "B"],
+    )
+    grouped: dict[int, list[YBusEntry]] = {}
+    scenarios = table.column("scenario").to_numpy()
+    rows_i = table.column("index1").to_numpy()
+    rows_j = table.column("index2").to_numpy()
+    conductance = table.column("G").to_numpy()
+    susceptance = table.column("B").to_numpy()
+    for index in range(len(scenarios)):
+        scenario_id = int(scenarios[index])
+        grouped.setdefault(scenario_id, []).append(
+            (
+                int(rows_i[index]),
+                int(rows_j[index]),
+                float(conductance[index]),
+                float(susceptance[index]),
+            )
+        )
+    missing = [scenario_id for scenario_id in scenario_ids if scenario_id not in grouped]
+    if missing:
+        raise RuntimeError(f"{raw} y_bus_data missing {len(missing)} scenario(s), e.g. {missing[:3]}.")
+    return grouped
+
+
+def reference_mean_pbl(
+    power_p: np.ndarray,
+    power_q: np.ndarray,
+    voltage: np.ndarray,
+    angle: np.ndarray,
+    ybus: np.ndarray,
+) -> float:
+    solved = np.exp(1j * angle) * voltage
+    injection = solved * np.conj(ybus.astype(np.complex128) @ solved)
+    mismatch = np.sqrt((power_p - injection.real) ** 2 + (power_q - injection.imag) ** 2)
+    return float(mismatch.mean())
+
+
 def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
@@ -731,6 +807,15 @@ def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
         [status, np.round(resistance, 6), np.round(reactance, 6), type_code],
         axis=1,
     ).astype(np.float32)
+
+    wanted = bus_scenario[:, 0].astype(np.int64)
+    scenario_ids = [int(wanted[local]) for local in range(count)]
+    y_by_scenario = load_ybus_entries_by_scenario(raw, scenario_ids)
+    y_fingerprint = np.array(
+        [ybus_entries_fingerprint(y_by_scenario[scenario_ids[local]]) for local in range(count)],
+        dtype=np.float64,
+    ).reshape(count, 1)
+    signature = np.concatenate([signature, y_fingerprint], axis=1)
     _, network_ids = np.unique(signature, axis=0, return_inverse=True)
     print(
         f"{name}: {count} scenarios loaded"
@@ -738,31 +823,40 @@ def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
         flush=True,
     )
 
-    wanted = bus_scenario[:, 0]
-    representatives = [int(np.flatnonzero(network_ids == net)[0]) for net in range(int(network_ids.max()) + 1)]
-    y_table = ds.dataset(raw / "y_bus_data.parquet").to_table(
-        filter=pc.field("scenario").isin([int(wanted[local]) for local in representatives]),
-        columns=["scenario", "index1", "index2", "G", "B"],
+    max_reference_pbl = 0.0
+    worst_local = 0
+    for local in range(count):
+        scenario_id = scenario_ids[local]
+        ybus = ybus_from_entries(y_by_scenario[scenario_id])
+        pbl_mean = reference_mean_pbl(
+            power_p[local],
+            power_q[local],
+            voltage[local],
+            angle[local],
+            ybus,
+        )
+        if pbl_mean > max_reference_pbl:
+            max_reference_pbl = pbl_mean
+            worst_local = local
+        if pbl_mean > REFERENCE_PBL_TOLERANCE:
+            raise RuntimeError(
+                f"{name} scenario {scenario_id} reference PBL {pbl_mean:.6g} "
+                f"exceeds tolerance {REFERENCE_PBL_TOLERANCE}."
+            )
+    print(
+        f"  reference PBL for {name}: max {max_reference_pbl:.3e} over {count} scenario(s)"
+        f" (worst local index {worst_local})",
+        flush=True,
     )
-    y_scenario = y_table.column("scenario").to_numpy()
-    y_rows = {
-        "index1": y_table.column("index1").to_numpy(),
-        "index2": y_table.column("index2").to_numpy(),
-        "G": y_table.column("G").to_numpy(),
-        "B": y_table.column("B").to_numpy(),
-    }
+
+    representatives = [int(np.flatnonzero(network_ids == net)[0]) for net in range(int(network_ids.max()) + 1)]
     networks: list[Network] = []
-    reference_pbl: list[float] = []
     for local in representatives:
         types = type_code[local].astype(np.int64)
         if int(np.sum(types == 2)) != 1:
-            raise RuntimeError(f"{name} scenario {int(wanted[local])} has {int(np.sum(types == 2))} slack buses.")
-        scenario_id = int(wanted[local])
-        chosen = y_scenario == scenario_id
-        rows_i = y_rows["index1"][chosen].astype(np.int64)
-        rows_j = y_rows["index2"][chosen].astype(np.int64)
-        ybus = np.zeros((118, 118), dtype=np.complex64)
-        ybus[rows_i, rows_j] = y_rows["G"][chosen] + 1j * y_rows["B"][chosen]
+            raise RuntimeError(f"{name} scenario {scenario_ids[local]} has {int(np.sum(types == 2))} slack buses.")
+        scenario_id = scenario_ids[local]
+        ybus = ybus_from_entries(y_by_scenario[scenario_id])
         branches = []
         for branch_id in range(branch_count):
             if status[local, branch_id] < 0.5:
@@ -780,13 +874,6 @@ def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
         features, component = meshed_rpe(118, branches, ybus)
         if len(networks) == 0:
             print(f"  meshed_rpe computed once for {name} topology (not per scenario)", flush=True)
-        solved = np.exp(1j * angle[local]) * voltage[local]
-        injection = solved * np.conj(ybus.astype(np.complex128) @ solved)
-        mismatch = np.sqrt((power_p[local] - injection.real) ** 2 + (power_q[local] - injection.imag) ** 2)
-        pbl_mean = float(mismatch.mean())
-        reference_pbl.append(pbl_mean)
-        if pbl_mean > 1e-2:
-            raise RuntimeError(f"Solved cases in {name} do not satisfy per-unit power balance.")
         networks.append(
             Network(
                 ybus=torch.from_numpy(ybus),
@@ -795,12 +882,6 @@ def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
                 types=torch.from_numpy(types),
             )
         )
-    n_networks = len(reference_pbl)
-    max_pbl = max(reference_pbl) if reference_pbl else 0.0
-    print(f"  reference PBL for {name}: max {max_pbl:.3e} over {n_networks} network(s)", flush=True)
-    if max_pbl > 1e-2:
-        for net_idx, pbl in enumerate(reference_pbl):
-            print(f"  reference PBL for {name} network {net_idx}: {pbl:.3e}", flush=True)
     return Split(
         name=name,
         count=count,
@@ -1032,13 +1113,13 @@ def clear_pair_embed_cache(networks: list[Network]) -> None:
 
 
 def pair_features(model: TPGT, network: Network) -> torch.Tensor:
-    """Edge embeddings for this topology; cached in eval, fresh each step in train."""
-    if not model.training:
-        if network.pair_embed is not None:
-            return network.pair_embed
-        network.pair_embed = model.pair_encoder(network.rpe)
+    """Edge embeddings for this topology; cached in eval on that Network object only."""
+    if not model.training and network.pair_embed is not None:
         return network.pair_embed
-    return model.pair_encoder(network.rpe)
+    encoded = model.pair_encoder(network.rpe)
+    if not model.training:
+        network.pair_embed = encoded
+    return encoded
 
 
 def run_batch(
@@ -1142,6 +1223,7 @@ def iterate_indexes(split: Split, seed: int, epoch: int, shuffle: bool):
 
 def evaluate_pbl(model: TPGT, split: Split, networks: list[Network], device: torch.device) -> float:
     model.eval()
+    clear_pair_embed_cache(networks)
     total = 0.0
     seen = 0
     with torch.no_grad():
@@ -1412,9 +1494,9 @@ def train_seed(
         )
 
     def finish_checkpoint_epoch(epoch_number: int) -> None:
-        """Run held-out test (print every epoch) then save Drive checkpoint when due."""
+        """Run held-out test on checkpoint epochs, then save Drive checkpoint when due."""
         test_scores: tuple[dict[str, float], dict[str, int]] | None = None
-        if on_epoch_end is not None:
+        if on_epoch_end is not None and saves_checkpoint_epoch(epoch_number):
             test_scores = on_epoch_end(model, epoch_number)
         if saves_checkpoint_epoch(epoch_number):
             save_epoch(epoch_number, test_scores)
@@ -1688,6 +1770,7 @@ def test_model(
             f"test_{topology}_{condition}",
         )
         networks = [move_to(network, device) for network in split.networks]
+        clear_pair_embed_cache(networks)
         scores[label] = evaluate_pbl(model, split, networks, device)
         counts[label] = split.count
         print(f"test {label}: PBL {scores[label]:.6g} on {split.count} scenarios", flush=True)
@@ -1809,6 +1892,36 @@ def main() -> None:
         )
 
 
+def verify_task11_splits(data_root: Path) -> None:
+    """Load every Task 1.1 split; checks reference PBL and Y-aware network grouping."""
+    checks = [
+        ("train_n_feasible", ("train", "n", "feasible")),
+        ("valid_n_feasible", ("valid", "n", "feasible")),
+        ("test_n_feasible", ("test", "n", "feasible")),
+        ("test_n-1_feasible", ("test", "n-1", "feasible")),
+        ("test_n-2_feasible", ("test", "n-2", "feasible")),
+        ("test_n_nose", ("test", "n", "nose")),
+        ("test_n-1_nose", ("test", "n-1", "nose")),
+        ("test_n-2_nose", ("test", "n-2", "nose")),
+    ]
+    for name, parts in checks:
+        raw = data_root.joinpath(*parts)
+        read_split(raw, name, limit=scenario_limit(raw))
+    print(f"verify_task11_splits OK ({len(checks)} folders)", flush=True)
+
+
+def cli_verify_splits() -> None:
+    global DATA_FRACTION
+    ensure_runtime_packages()
+    DATA_FRACTION = parse_data_fraction()
+    drive = google_drive_root()
+    work, _legacy = legacy_locations(drive)
+    data = ensure_dataset(work, drive)
+    if DATA_FRACTION < 1.0:
+        print(f"verify-splits with DATA_FRACTION={DATA_FRACTION} (scenario cap per folder)", flush=True)
+    verify_task11_splits(data)
+
+
 def sanity_check_meshed_rpe(data_root: Path) -> None:
     """Load one 118-bus case and verify meshed RPE shape and invariants."""
     split = read_split(raw_dir(data_root, "train", "n", "feasible"), "sanity", limit=1)
@@ -1839,7 +1952,9 @@ def sanity_check_meshed_rpe(data_root: Path) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--sanity-rpe":
+    if len(sys.argv) > 1 and sys.argv[1] == "--verify-splits":
+        cli_verify_splits()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--sanity-rpe":
         ensure_runtime_packages()
         drive = google_drive_root()
         work, _legacy = legacy_locations(drive)
