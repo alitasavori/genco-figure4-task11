@@ -20,10 +20,13 @@ Performance notes (Colab / large train split)
 * **``pair_encoder``**: Runs once per forward on the static ``118×118`` RPE for
   the batch's topology. Weights train, so training must re-encode every step;
   in ``eval`` mode encoded pairs are cached on ``Network.pair_embed``.
-* **Nine type-pair loops**: Each ``CorrectionStage`` uses Python loops over
-  nine receiver–sender pairs and two heads (see ``CorrectionStage._messages``).
-  That dominates GPU time versus batch size; larger batches amortize overhead
-  but do not remove the per-pair loop cost.
+* **Type-pair attention**: ``CorrectionStage._messages`` fuses all nine
+  receiver–sender masks and both heads into batched ``einsum`` ops over
+  ``118×118`` (one kernel graph per stage instead of eighteen Python loops).
+  Optional ``GENCO_TPGT_COMPILE=1`` or ``--compile`` wraps the model in
+  ``torch.compile`` (may differ slightly in numerics).
+* **Batch 64 vs 16**: Four times more cases per step increases matmul work
+  roughly linearly; per-case time should be similar if the GPU is saturated.
 """
 
 from __future__ import annotations
@@ -131,6 +134,25 @@ def rho_nonlinearity(values: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(torch.relu(values)) - torch.sqrt(torch.relu(-values))
 
 
+def type_pair_masks(types: torch.Tensor, component: torch.Tensor) -> torch.Tensor:
+    """Boolean masks (9, buses, buses) for each receiver–sender type pair within a component."""
+    buses = types.shape[0]
+    same_component = component.view(buses, 1) == component.view(1, buses)
+    masks = []
+    for pair_id in range(9):
+        receiver, sender = divmod(pair_id, 3)
+        type_mask = (types.view(buses, 1) == receiver) & (types.view(1, buses) == sender)
+        masks.append(type_mask & same_component)
+    return torch.stack(masks, dim=0)
+
+
+def wants_torch_compile() -> bool:
+    if "--compile" in sys.argv or "--fast" in sys.argv:
+        return True
+    flag = os.environ.get("GENCO_TPGT_COMPILE", os.environ.get("GENCO_TPGT_FAST", ""))
+    return flag.lower() in ("1", "true", "yes")
+
+
 class MLP(nn.Module):
     """Two-layer map. The hidden width `D` is an implementation choice."""
 
@@ -178,11 +200,11 @@ class CorrectionStage(nn.Module):
         specified: torch.Tensor,
         pair: torch.Tensor,
         types: torch.Tensor,
-        component: torch.Tensor,
+        pair_type_masks: torch.Tensor,
         ybus: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         residual_in = nodal_residual(specified, unknown, types, ybus)
-        message = self._messages(hidden, pair, types, component)
+        message = self._messages(hidden, pair, pair_type_masks)
         updated = torch.zeros_like(hidden)
         for type_id, update in enumerate(self.update):
             mask = types == type_id
@@ -211,31 +233,21 @@ class CorrectionStage(nn.Module):
         self,
         hidden: torch.Tensor,
         pair: torch.Tensor,
-        types: torch.Tensor,
-        component: torch.Tensor,
+        pair_type_masks: torch.Tensor,
     ) -> torch.Tensor:
         batch, buses, _ = hidden.shape
-        scores = hidden.new_full((batch, HEADS, buses, buses), float("-inf"))
-        values = hidden.new_zeros((batch, HEADS, buses, buses, D_A))
-        same_component = component.view(buses, 1) == component.view(1, buses)
-        for pair_id in range(9):
-            receiver, sender = divmod(pair_id, 3)
-            type_mask = (types.view(buses, 1) == receiver) & (types.view(1, buses) == sender)
-            mask = type_mask & same_component
-            if not bool(mask.any()):
-                continue
-            for head in range(HEADS):
-                query = hidden @ self.w_q[pair_id, head].T
-                key = hidden @ self.w_k[pair_id, head].T
-                mixed = rho_nonlinearity(query[:, :, None, :] + key[:, None, :, :])
-                projected = pair @ self.w_ew[pair_id, head].T
-                bias = pair @ self.w_eb[pair_id, head].T
-                interaction = torch.relu(mixed * projected.unsqueeze(0) + bias.unsqueeze(0))
-                score = (interaction * self.w_a[pair_id, head]).sum(dim=-1)
-                scores[:, head] = torch.where(mask, score, scores[:, head])
-                value = hidden @ self.w_v[pair_id, head].T
-                content = value[:, None, :, :] + interaction @ self.w_ev[pair_id, head].T
-                values[:, head] = torch.where(mask.unsqueeze(-1), content, values[:, head])
+        mask_view = pair_type_masks.view(1, 9, 1, buses, buses)
+        query = torch.einsum("bnd,phad->bphnd", hidden, self.w_q)
+        key = torch.einsum("bnd,phad->bphnd", hidden, self.w_k)
+        mixed = rho_nonlinearity(query.unsqueeze(-2) + key.unsqueeze(-3))
+        projected = torch.einsum("nne,phae->phnna", pair, self.w_ew)
+        bias = torch.einsum("nne,phae->phnn", pair, self.w_eb)
+        interaction = torch.relu(mixed * projected.unsqueeze(0) + bias.unsqueeze(0).unsqueeze(-1))
+        all_scores = (interaction * self.w_a.unsqueeze(0).unsqueeze(-2)).sum(dim=-1)
+        scores = all_scores.masked_fill(~mask_view, float("-inf")).amax(dim=1)
+        value = torch.einsum("bnd,phad->bphnd", hidden, self.w_v)
+        content = value.unsqueeze(-2) + torch.einsum("bphnna,phab->bphnnb", interaction, self.w_ev)
+        values = (content * mask_view.unsqueeze(-1)).sum(dim=1)
         weights = torch.softmax(scores, dim=-1)
         weights = torch.nan_to_num(weights, nan=0.0)
         row_sum = weights.sum(dim=-1, keepdim=True)
@@ -258,7 +270,7 @@ class TPGT(nn.Module):
         specified: torch.Tensor,
         types: torch.Tensor,
         rpe: torch.Tensor,
-        component: torch.Tensor,
+        pair_type_masks: torch.Tensor,
         ybus: torch.Tensor,
         pair: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
@@ -272,7 +284,7 @@ class TPGT(nn.Module):
                 hidden[:, mask] = encoder(specified[:, mask])
         residuals = []
         for stage in self.stages:
-            hidden, unknown, residual = stage(hidden, unknown, specified, pair, types, component, ybus)
+            hidden, unknown, residual = stage(hidden, unknown, specified, pair, types, pair_type_masks, ybus)
             residuals.append(residual)
         return unknown, residuals
 
@@ -384,6 +396,7 @@ class Network:
     rpe: torch.Tensor
     component: torch.Tensor
     types: torch.Tensor
+    pair_type_masks: torch.Tensor | None = field(default=None, repr=False)
     pair_embed: torch.Tensor | None = field(default=None, repr=False)
 
 
@@ -866,12 +879,20 @@ def ensure_dataset(work: Path, drive: Path | None = None) -> Path:
 
 
 def move_to(network: Network, device: torch.device) -> Network:
+    types = network.types.to(device)
+    component = network.component.to(device)
     pair_embed = network.pair_embed.to(device) if network.pair_embed is not None else None
+    masks = network.pair_type_masks
+    if masks is None:
+        masks = type_pair_masks(types, component)
+    else:
+        masks = masks.to(device)
     return Network(
         ybus=network.ybus.to(device),
         rpe=network.rpe.to(device),
-        component=network.component.to(device),
-        types=network.types.to(device),
+        component=component,
+        types=types,
+        pair_type_masks=masks,
         pair_embed=pair_embed,
     )
 
@@ -909,7 +930,7 @@ def run_batch(
         specified,
         network.types,
         network.rpe,
-        network.component,
+        network.pair_type_masks,
         network.ybus,
         pair=pair,
     )
@@ -1035,6 +1056,12 @@ def train_seed(
     done_path = model_dir / "complete.json"
     seed_all(seed)
     model = TPGT().to(device)
+    if wants_torch_compile():
+        print(
+            "torch.compile enabled (GENCO_TPGT_COMPILE=1, GENCO_TPGT_FAST=1, or --compile / --fast)",
+            flush=True,
+        )
+        model = torch.compile(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     train_networks = [move_to(network, device) for network in train_split.networks]
     val_networks = [move_to(network, device) for network in val_split.networks]
@@ -1118,10 +1145,12 @@ def train_seed(
             running = 0.0
             batches = 0
             first_batch_started: float | None = None
+            batch_durations: list[float] = []
             for network_id, index in iterate_indexes(train_split, seed, epoch, shuffle=True):
                 optimizer.zero_grad(set_to_none=True)
                 if first_batch_started is None:
                     first_batch_started = time.perf_counter()
+                step_started = time.perf_counter()
                 loss, _score = run_batch(model, train_split, train_networks[network_id], index, device)
                 if first_batch_started is not None:
                     if device.type == "cuda":
@@ -1135,10 +1164,19 @@ def train_seed(
                     first_batch_started = None
                 loss.backward()
                 optimizer.step()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                batch_durations.append(time.perf_counter() - step_started)
                 running += float(loss.detach())
                 batches += 1
                 if batches % 250 == 0:
-                    print(f"  seed {seed} epoch {epoch + 1} batch {batches} loss {running / batches:.4f}", flush=True)
+                    window = batch_durations[-250:]
+                    avg_sec = sum(window) / len(window)
+                    print(
+                        f"  seed {seed} epoch {epoch + 1} batch {batches} loss {running / batches:.4f} "
+                        f"avg {avg_sec:.3f}s/batch (last {len(window)})",
+                        flush=True,
+                    )
             val_score = evaluate_pbl(model, val_split, val_networks, device)
             print(
                 f"seed {seed} epoch {epoch + 1}/{EPOCHS} train loss {running / max(batches, 1):.4f} val PBL {val_score:.6f}",
