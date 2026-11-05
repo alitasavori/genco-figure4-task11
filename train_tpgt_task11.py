@@ -140,6 +140,16 @@ def wrap_angle(delta: torch.Tensor) -> torch.Tensor:
     return torch.remainder(delta + math.pi, 2 * math.pi) - math.pi
 
 
+def autocast_activation_dtype(reference: torch.Tensor) -> torch.dtype:
+    if reference.is_cuda and torch.is_autocast_enabled():
+        return torch.get_autocast_gpu_dtype()
+    return reference.dtype
+
+
+def masked_write(base: torch.Tensor, mask: torch.Tensor, values: torch.Tensor) -> None:
+    base[:, mask] = values.to(dtype=base.dtype)
+
+
 def rho_nonlinearity(values: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(torch.relu(values)) - torch.sqrt(torch.relu(-values))
 
@@ -226,15 +236,22 @@ class CorrectionStage(nn.Module):
             mask = types == type_id
             if not bool(mask.any()):
                 continue
-            features = torch.cat((hidden[:, mask], message[:, mask], residual_in[:, mask]), dim=-1)
-            updated[:, mask] = update(features)
+            features = torch.cat(
+                (
+                    hidden[:, mask],
+                    message[:, mask],
+                    residual_in[:, mask].to(hidden.dtype),
+                ),
+                dim=-1,
+            )
+            masked_write(updated, mask, update(features))
         hidden_next = self.norm(hidden + updated)
         delta = torch.zeros_like(unknown)
         for type_id, decoder in enumerate(self.decode):
             mask = types == type_id
             if not bool(mask.any()):
                 continue
-            delta[:, mask] = decoder(hidden_next[:, mask])
+            masked_write(delta, mask, decoder(hidden_next[:, mask]))
         pq = types == 0
         pv = types == 1
         if bool(pq.any()):
@@ -293,12 +310,19 @@ class TPGT(nn.Module):
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         if pair is None:
             pair = self.pair_encoder(rpe)
-        hidden = specified.new_zeros(specified.shape[0], specified.shape[1], D)
+        act_dtype = autocast_activation_dtype(specified)
+        hidden = torch.zeros(
+            specified.shape[0],
+            specified.shape[1],
+            D,
+            device=specified.device,
+            dtype=act_dtype,
+        )
         unknown = flat_start(specified, types)
         for type_id, encoder in enumerate(self.encoders):
             mask = types == type_id
             if bool(mask.any()):
-                hidden[:, mask] = encoder(specified[:, mask])
+                masked_write(hidden, mask, encoder(specified[:, mask]))
         residuals = []
         for stage in self.stages:
             hidden, unknown, residual = stage(hidden, unknown, specified, pair, types, pair_type_masks, ybus)
@@ -1067,7 +1091,7 @@ def _weighted_loss_breakdown(
 def train_batch(
     model: TPGT,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler | None,
+    scaler: torch.amp.GradScaler | None,
     split: Split,
     network: Network,
     index: np.ndarray,
@@ -1322,7 +1346,7 @@ def train_seed(
         )
         model = torch.compile(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    grad_scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     train_networks = [move_to(network, device) for network in train_split.networks]
     val_networks = [move_to(network, device) for network in val_split.networks]
     start_epoch = 0
