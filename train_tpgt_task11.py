@@ -111,8 +111,6 @@ EXPECTED_COUNTS = {
 }
 # Fraction of each split folder to load (first scenarios). 1.0 = full PFΔ split.
 DATA_FRACTION = 1.0
-# Effective batch size (may be reduced when DATA_FRACTION < 1 to fit GPU memory).
-TRAINING_BATCH_SIZE = BATCH_SIZE
 
 
 def ensure_runtime_packages() -> None:
@@ -642,13 +640,6 @@ def scenario_limit(raw: Path) -> int | None:
     return max(1, min(full, int(full * DATA_FRACTION)))
 
 
-def training_batch_size() -> int:
-    """Scale batch down with DATA_FRACTION; type-pair attention memory scales ~linearly with batch."""
-    if DATA_FRACTION >= 1.0:
-        return BATCH_SIZE
-    return max(8, int(BATCH_SIZE * DATA_FRACTION))
-
-
 def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
@@ -1047,8 +1038,8 @@ def iterate_indexes(split: Split, seed: int, epoch: int, shuffle: bool):
             index = index[order]
         groups.append((network_id, index.numpy()))
     for network_id, index in groups:
-        for start in range(0, len(index), TRAINING_BATCH_SIZE):
-            yield network_id, index[start : start + TRAINING_BATCH_SIZE]
+        for start in range(0, len(index), BATCH_SIZE):
+            yield network_id, index[start : start + BATCH_SIZE]
 
 
 def evaluate_pbl(model: TPGT, split: Split, networks: list[Network], device: torch.device) -> float:
@@ -1600,22 +1591,15 @@ def test_model(
 
 
 def main() -> None:
-    global DATA_FRACTION, TRAINING_BATCH_SIZE
+    global DATA_FRACTION
     ensure_runtime_packages()
     DATA_FRACTION = parse_data_fraction()
-    TRAINING_BATCH_SIZE = training_batch_size()
     if DATA_FRACTION < 1.0:
         print(
             f"Data fraction {DATA_FRACTION}: first scenarios in each train/valid/test folder "
-            f"(keeps PFΔ split boundaries).",
+            f"(keeps PFΔ split boundaries). Training batch size {BATCH_SIZE}.",
             flush=True,
         )
-        if TRAINING_BATCH_SIZE != BATCH_SIZE:
-            print(
-                f"Training batch size {TRAINING_BATCH_SIZE} "
-                f"(scaled from {BATCH_SIZE} for GPU memory at this fraction).",
-                flush=True,
-            )
     elif DATA_FRACTION > 1.0:
         raise ValueError(f"data fraction must be <= 1.0, got {DATA_FRACTION}")
     drive = google_drive_root()
