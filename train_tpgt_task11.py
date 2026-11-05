@@ -106,6 +106,8 @@ EXPECTED_COUNTS = {
     ("test", "n-1", "nose"): 200,
     ("test", "n-2", "nose"): 200,
 }
+# Fraction of each split folder to load (first scenarios). 1.0 = full PFΔ split.
+DATA_FRACTION = 1.0
 
 
 def ensure_runtime_packages() -> None:
@@ -588,6 +590,27 @@ def scenario_count(raw: Path) -> int:
     return rows // 118
 
 
+def parse_data_fraction() -> float:
+    for index, arg in enumerate(sys.argv):
+        if arg == "--data-fraction" and index + 1 < len(sys.argv):
+            return float(sys.argv[index + 1])
+        if arg.startswith("--data-fraction="):
+            return float(arg.split("=", 1)[1])
+    env = os.environ.get("GENCO_TPGT_DATA_FRACTION", "").strip()
+    if env:
+        return float(env)
+    return 1.0
+
+
+def scenario_limit(raw: Path) -> int | None:
+    if DATA_FRACTION >= 1.0:
+        return None
+    if DATA_FRACTION <= 0.0:
+        raise ValueError(f"data fraction must be in (0, 1], got {DATA_FRACTION}")
+    full = scenario_count(raw)
+    return max(1, min(full, int(full * DATA_FRACTION)))
+
+
 def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
@@ -660,6 +683,7 @@ def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
         "B": y_table.column("B").to_numpy(),
     }
     networks: list[Network] = []
+    reference_pbl: list[float] = []
     for local in representatives:
         types = type_code[local].astype(np.int64)
         if int(np.sum(types == 2)) != 1:
@@ -690,8 +714,9 @@ def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
         solved = np.exp(1j * angle[local]) * voltage[local]
         injection = solved * np.conj(ybus.astype(np.complex128) @ solved)
         mismatch = np.sqrt((power_p[local] - injection.real) ** 2 + (power_q[local] - injection.imag) ** 2)
-        print(f"  reference PBL for {name} network {len(networks)}: {float(mismatch.mean()):.3e}", flush=True)
-        if float(mismatch.mean()) > 1e-2:
+        pbl_mean = float(mismatch.mean())
+        reference_pbl.append(pbl_mean)
+        if pbl_mean > 1e-2:
             raise RuntimeError(f"Solved cases in {name} do not satisfy per-unit power balance.")
         networks.append(
             Network(
@@ -701,6 +726,12 @@ def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
                 types=torch.from_numpy(types),
             )
         )
+    n_networks = len(reference_pbl)
+    max_pbl = max(reference_pbl) if reference_pbl else 0.0
+    print(f"  reference PBL for {name}: max {max_pbl:.3e} over {n_networks} network(s)", flush=True)
+    if max_pbl > 1e-2:
+        for net_idx, pbl in enumerate(reference_pbl):
+            print(f"  reference PBL for {name} network {net_idx}: {pbl:.3e}", flush=True)
     return Split(
         name=name,
         count=count,
@@ -777,17 +808,24 @@ def sync_split_cache_to_drive(active: Path, persistent: Path) -> None:
             _mirror_cache_file(path, persistent / path.name)
 
 
-def cached_split(active: Path, persistent: Path, raw: Path, name: str) -> Split:
+def cached_split(active: Path, persistent: Path, raw: Path, name: str, limit: int | None = None) -> Split:
     sync_split_cache_from_drive(persistent, active)
+    if limit is None:
+        limit = scenario_limit(raw)
     stamp = {
         "version": CACHE_VERSION,
         "bytes": raw.joinpath("bus_data.parquet").stat().st_size,
+        "scenario_limit": limit,
     }
     stamp_path = active / f"{name}.json"
     tensor_path = active / f"{name}.pt"
     if stamp_path.exists() and tensor_path.exists():
         saved = json.loads(stamp_path.read_text(encoding="utf-8"))
-        if saved == stamp:
+        if (
+            saved.get("version") == stamp["version"]
+            and saved.get("bytes") == stamp["bytes"]
+            and saved.get("scenario_limit") == limit
+        ):
             load_started = time.perf_counter()
             print(f"Loading cached {name} split from {tensor_path}", flush=True)
             payload = torch.load(tensor_path, map_location="cpu", weights_only=False)
@@ -797,7 +835,7 @@ def cached_split(active: Path, persistent: Path, raw: Path, name: str) -> Split:
             return payload
     active.mkdir(parents=True, exist_ok=True)
     build_started = time.perf_counter()
-    split = read_split(raw, name)
+    split = read_split(raw, name, limit=limit)
     print(f"  built {name} split from parquet in {time.perf_counter() - build_started:.1f}s", flush=True)
     save_started = time.perf_counter()
     torch.save(split, tensor_path)
@@ -1513,7 +1551,17 @@ def test_model(
 
 
 def main() -> None:
+    global DATA_FRACTION
     ensure_runtime_packages()
+    DATA_FRACTION = parse_data_fraction()
+    if DATA_FRACTION < 1.0:
+        print(
+            f"Data fraction {DATA_FRACTION}: first scenarios in each train/valid/test folder "
+            f"(keeps PFΔ split boundaries).",
+            flush=True,
+        )
+    elif DATA_FRACTION > 1.0:
+        raise ValueError(f"data fraction must be <= 1.0, got {DATA_FRACTION}")
     drive = google_drive_root()
     outputs = drive_output_dirs(drive)
     work, legacy_results = legacy_locations(drive)
