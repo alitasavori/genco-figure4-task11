@@ -58,7 +58,12 @@ CACHE_VERSION = "tpgt-cache-2"
 RPE_WALK_STEPS = 5
 RPE_DIM = RPE_WALK_STEPS + 5
 # Bumped when pair-encoder input size or architecture changes; old Drive checkpoints are ignored.
-CHECKPOINT_VERSION = "meshed-rpe-10"
+CHECKPOINT_VERSION = "meshed-rpe-10-v2"
+# PQ voltage unknown is clamped to this band when evaluating Ybus injections (p.u.).
+V_MIN_PU = 0.05
+V_MAX_PU = 2.0
+# Step size on angle unknowns; full ETA on P, Q, and V magnitudes.
+ETA_ANGLE = 0.25
 
 TEST_PARTS = (
     ("N", "n", "feasible"),
@@ -173,7 +178,13 @@ class CorrectionStage(nn.Module):
             if not bool(mask.any()):
                 continue
             delta[:, mask] = decoder(hidden_next[:, mask])
-        unknown_next = unknown + ETA * delta
+        pq = types == 0
+        pv = types == 1
+        if bool(pq.any()):
+            delta[:, pq, 1] = delta[:, pq, 1] * ETA_ANGLE
+        if bool(pv.any()):
+            delta[:, pv, 1] = delta[:, pv, 1] * ETA_ANGLE
+        unknown_next = constrain_unknown(unknown + ETA * delta, types)
         residual_out = nodal_residual(specified, unknown_next, types, ybus)
         return hidden_next, unknown_next, residual_out
 
@@ -208,6 +219,8 @@ class CorrectionStage(nn.Module):
                 values[:, head] = torch.where(mask.unsqueeze(-1), content, values[:, head])
         weights = torch.softmax(scores, dim=-1)
         weights = torch.nan_to_num(weights, nan=0.0)
+        row_sum = weights.sum(dim=-1, keepdim=True)
+        weights = torch.where(row_sum > 0, weights / row_sum.clamp(min=1e-12), weights)
         mixed_heads = (weights.unsqueeze(-1) * values).sum(dim=3)
         return torch.einsum("bhnd,hod->bno", mixed_heads, self.w_o)
 
@@ -241,6 +254,18 @@ class TPGT(nn.Module):
             hidden, unknown, residual = stage(hidden, unknown, specified, pair, types, component, ybus)
             residuals.append(residual)
         return unknown, residuals
+
+
+def constrain_unknown(unknown: torch.Tensor, types: torch.Tensor) -> torch.Tensor:
+    """Keep states in a range where the AC equations are meaningful."""
+    out = unknown.clone()
+    pq = types == 0
+    if bool(pq.any()):
+        out[:, pq, 0] = unknown[:, pq, 0].clamp(min=V_MIN_PU, max=V_MAX_PU)
+    angle_buses = (types == 0) | (types == 1)
+    if bool(angle_buses.any()):
+        out[:, angle_buses, 1] = wrap_angle(unknown[:, angle_buses, 1])
+    return out
 
 
 def flat_start(specified: torch.Tensor, types: torch.Tensor) -> torch.Tensor:
@@ -311,7 +336,8 @@ def nodal_residual(
     ybus: torch.Tensor,
 ) -> torch.Tensor:
     """AC mismatch in per unit. Ybus is already per unit, so this does not divide by baseMVA again."""
-    power_p, power_q, voltage, angle = assemble(specified, unknown, types)
+    physical = constrain_unknown(unknown, types)
+    power_p, power_q, voltage, angle = assemble(specified, physical, types)
     voltage_complex = voltage.to(torch.complex64) * torch.exp(1j * angle.to(torch.complex64))
     current = torch.matmul(ybus, voltage_complex.transpose(0, 1)).transpose(0, 1)
     flow = voltage_complex * torch.conj(current)
@@ -361,6 +387,10 @@ def meshed_rpe(
     Order: Re(Y)/s_Y, Im(Y)/s_Y, A_ij, hop/d_max, eff_res/r_max, then
     (P^k)_ij for k = 1..RPE_WALK_STEPS. Branch r and x build W; Y comes
     from the case Ybus used in the power-flow residual.
+
+    For a non-adjacent pair, Y_ij is zero but hop and effective resistance
+    are positive. That is expected: direct admittance is local, while hop
+    and resistance summarize the full meshed graph. They are not contradictory.
     """
     y = ybus.astype(np.complex128)
     y_abs = np.abs(y)
@@ -431,8 +461,7 @@ def meshed_rpe(
         if buses.size == 0:
             continue
         off_diagonal = y_abs[np.ix_(buses, buses)]
-        mask = ~np.eye(buses.size, dtype=bool)
-        mean_admittance = float(off_diagonal[mask].mean()) if mask.any() else 0.0
+        mean_admittance = float(off_diagonal.mean()) if off_diagonal.size else 0.0
         scale_y[comp] = mean_admittance if mean_admittance > 0 else 1.0
         finite_hop = hop[np.ix_(buses, buses)]
         max_hop = float(finite_hop.max()) if buses.size else 0.0
@@ -920,7 +949,7 @@ def train_seed(
         best_state = restored["best_state"]
     elif saved is not None:
         print(
-            f"Seed {seed}: checkpoint on Drive uses the old 6-feature RPE; starting from epoch 0.",
+            f"Seed {seed}: checkpoint version mismatch; starting from epoch 0.",
             flush=True,
         )
     if done_path.exists() and read_completed_epochs(done_path) >= EPOCHS:
