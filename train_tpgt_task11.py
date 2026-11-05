@@ -44,9 +44,8 @@ DEPTH = 3
 ETA = 1.0
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
-EPOCHS = 5
-PATIENCE = 2
-# Earliest epoch where patience may stop. Checkpoints themselves are written every epoch.
+EPOCHS = 100
+# Drive checkpoints and the four held-out test scores are written every 3rd epoch and at the final epoch.
 CHECKPOINT_EVERY = 3
 SEEDS = (0, 1, 2)
 BASE_MVA = 100.0
@@ -784,6 +783,13 @@ def read_completed_epochs(done_path: Path) -> int:
         return 0
 
 
+def reports_test_scores(epoch_number: int) -> bool:
+    """True on epochs 3, 6, ..., 99 and on the final epoch."""
+    if epoch_number <= 0:
+        return False
+    return epoch_number == EPOCHS or epoch_number % CHECKPOINT_EVERY == 0
+
+
 def test_pbl_line(seed: int, epoch_number: int, scores: dict[str, float]) -> str:
     return (
         f"seed {seed} epoch {epoch_number} test PBL  "
@@ -820,12 +826,8 @@ def train_seed(
         best_val = float(saved["best_val"])
         wait = int(saved["wait"])
         best_state = saved["best_state"]
-    if done_path.exists():
-        completed = read_completed_epochs(done_path)
-        if completed >= EPOCHS:
-            print(f"Seed {seed} already completed {EPOCHS} epochs. Skipping.", flush=True)
-        else:
-            print(f"Seed {seed} already finished. Skipping.", flush=True)
+    if done_path.exists() and read_completed_epochs(done_path) >= EPOCHS:
+        print(f"Seed {seed} already completed {EPOCHS} epochs. Skipping.", flush=True)
         state = best_state
         if state is None:
             fallback, _path = load_resume_checkpoint(model_dir, device)
@@ -859,19 +861,16 @@ def train_seed(
             encoding="utf-8",
         )
 
-    pending_test = start_epoch > 0 and not (model_dir / f"epoch_{start_epoch}.compared").exists()
-    stopped_early = start_epoch > 0 and wait >= PATIENCE and start_epoch >= CHECKPOINT_EVERY
-    finished = start_epoch >= EPOCHS or stopped_early
+    pending_test = reports_test_scores(start_epoch) and not (model_dir / f"epoch_{start_epoch}.compared").exists()
+    finished = start_epoch >= EPOCHS
     if finished and pending_test:
         print(
             f"Seed {seed} epoch {start_epoch} checkpoint exists; running the missing test scores.",
             flush=True,
         )
         save_epoch(start_epoch)
-    elif finished and start_epoch >= EPOCHS:
-        print(f"Seed {seed} already completed {EPOCHS} epochs. Skipping.", flush=True)
     elif finished:
-        print(f"Seed {seed} already finished early after {start_epoch} epochs. Skipping.", flush=True)
+        print(f"Seed {seed} already completed {EPOCHS} epochs. Skipping.", flush=True)
     elif saved is not None:
         print(
             f"Resuming seed {seed} from {resumed_from} after finished epoch {start_epoch}",
@@ -906,10 +905,8 @@ def train_seed(
             else:
                 wait += 1
             start_epoch = epoch + 1
-            save_epoch(start_epoch)
-            if wait >= PATIENCE and start_epoch >= CHECKPOINT_EVERY:
-                print(f"Early stop seed {seed} after {start_epoch} epochs.", flush=True)
-                break
+            if reports_test_scores(start_epoch):
+                save_epoch(start_epoch)
     if best_state is None:
         raise RuntimeError(f"Seed {seed} produced no checkpoint.")
     model.load_state_dict(best_state)
@@ -1106,12 +1103,8 @@ def main() -> None:
     val_split = cached_split(cache, raw_dir(data, "valid", "n", "feasible"), "valid_n_feasible")
     for seed in SEEDS:
         seed_dir = checkpoints / f"seed_{seed}"
-        if (seed_dir / "complete.json").exists():
-            completed = read_completed_epochs(seed_dir / "complete.json")
-            if completed >= EPOCHS:
-                print(f"Seed {seed} already completed {EPOCHS} epochs. Skipping.", flush=True)
-            else:
-                print(f"Seed {seed} already finished. Skipping.", flush=True)
+        if (seed_dir / "complete.json").exists() and read_completed_epochs(seed_dir / "complete.json") >= EPOCHS:
+            print(f"Seed {seed} already completed {EPOCHS} epochs. Skipping.", flush=True)
             continue
 
         def publish_checkpoint(model: TPGT, checkpoint: Path, epoch_number: int, seed: int = seed) -> None:
