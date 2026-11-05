@@ -4,8 +4,9 @@ Option II from the draft: each correction stage has its own weights.
 The hidden sizes, depth, batch, and epoch cap below are implementation
 choices so a Colab GPU can finish a run. They are not paper hyperparameters.
 
-IEEE 118 is meshed, so the six electrical pair features are computed on a
-BFS spanning tree rooted at the slack bus. See `electrical_rpe`.
+IEEE 118 is meshed, so pair features use the full in-service topology:
+admittance, adjacency, hop distance, effective resistance, and weighted
+random walks. See `meshed_rpe`.
 """
 
 from __future__ import annotations
@@ -53,7 +54,9 @@ LAMBDA_STATE = 0.85
 LAMBDA_PHYS = 0.15
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
-CACHE_VERSION = "tpgt-cache-1"
+CACHE_VERSION = "tpgt-cache-2"
+RPE_WALK_STEPS = 5
+RPE_DIM = RPE_WALK_STEPS + 5
 
 TEST_PARTS = (
     ("N", "n", "feasible"),
@@ -213,7 +216,7 @@ class TPGT(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.encoders = nn.ModuleList(MLP(2, D) for _ in range(3))
-        self.pair_encoder = MLP(6, D_E)
+        self.pair_encoder = MLP(RPE_DIM, D_E)
         self.stages = nn.ModuleList(CorrectionStage() for _ in range(DEPTH))
 
     def forward(
@@ -346,77 +349,142 @@ class Split:
     networks: list[Network]
 
 
-def electrical_rpe(bus_count: int, edges: list[tuple[int, int, float, float]], root: int) -> tuple[np.ndarray, np.ndarray]:
-    """Six pair features on a slack-rooted BFS spanning tree.
+def meshed_rpe(
+    bus_count: int,
+    branches: list[tuple[int, int, float, float]],
+    ybus: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Ten pair features on the full in-service meshed graph.
 
-    The draft defines path and common-path impedance on a radial feeder.
-    IEEE 118 is meshed, so those paths are the unique paths of a spanning
-    tree: breadth-first from the slack bus, with neighbors taken in bus-index
-    order. A bus left in another island by an outage is rooted at the
-    smallest bus index of that island. Parallel in-service branches contribute
-    one series impedance, the branch with the smallest index.
+    Order: Re(Y)/s_Y, Im(Y)/s_Y, A_ij, hop/d_max, eff_res/r_max, then
+    (P^k)_ij for k = 1..RPE_WALK_STEPS. Branch r and x build W; Y comes
+    from the case Ybus used in the power-flow residual.
     """
-    adjacency: list[list[tuple[int, float, float]]] = [[] for _ in range(bus_count)]
-    for origin, destination, resistance, reactance in edges:
-        adjacency[origin].append((destination, resistance, reactance))
-        adjacency[destination].append((origin, resistance, reactance))
-    for neighbors in adjacency:
-        neighbors.sort(key=lambda item: item[0])
-    parent = np.full(bus_count, -1, dtype=np.int64)
-    depth = np.zeros(bus_count, dtype=np.int64)
-    prefix_r = np.zeros(bus_count, dtype=np.float64)
-    prefix_x = np.zeros(bus_count, dtype=np.float64)
-    seen = np.zeros(bus_count, dtype=bool)
+    y = ybus.astype(np.complex128)
+    y_abs = np.abs(y)
+    adjacency: list[set[int]] = [set() for _ in range(bus_count)]
+    weight = np.zeros((bus_count, bus_count), dtype=np.float64)
+    for origin, destination, resistance, reactance in branches:
+        magnitude = math.hypot(resistance, reactance)
+        if magnitude <= 0:
+            continue
+        branch_weight = 1.0 / magnitude
+        weight[origin, destination] += branch_weight
+        weight[destination, origin] += branch_weight
+        adjacency[origin].add(destination)
+        adjacency[destination].add(origin)
+
     component = np.full(bus_count, -1, dtype=np.int64)
     component_id = 0
-    starts = [root] + [bus for bus in range(bus_count) if bus != root]
-    for start in starts:
-        if seen[start]:
+    for start in range(bus_count):
+        if component[start] >= 0:
             continue
         queue = [start]
-        seen[start] = True
         component[start] = component_id
         head = 0
         while head < len(queue):
             bus = queue[head]
             head += 1
-            for neighbor, resistance, reactance in adjacency[bus]:
-                if seen[neighbor]:
+            for neighbor in adjacency[bus]:
+                if component[neighbor] >= 0:
                     continue
-                seen[neighbor] = True
-                parent[neighbor] = bus
-                depth[neighbor] = depth[bus] + 1
-                prefix_r[neighbor] = prefix_r[bus] + resistance
-                prefix_x[neighbor] = prefix_x[bus] + reactance
                 component[neighbor] = component_id
                 queue.append(neighbor)
         component_id += 1
 
-    def ancestor(origin: int, destination: int) -> int:
-        while depth[origin] > depth[destination]:
-            origin = int(parent[origin])
-        while depth[destination] > depth[origin]:
-            destination = int(parent[destination])
-        while origin != destination:
-            origin = int(parent[origin])
-            destination = int(parent[destination])
-        return origin
-
-    features = np.zeros((bus_count, bus_count, 6), dtype=np.float32)
-    for origin in range(bus_count):
+    hop = np.zeros((bus_count, bus_count), dtype=np.float64)
+    for start in range(bus_count):
+        if not adjacency[start]:
+            continue
+        distances = np.full(bus_count, -1, dtype=np.int64)
+        distances[start] = 0
+        queue = [start]
+        head = 0
+        while head < len(queue):
+            bus = queue[head]
+            head += 1
+            for neighbor in adjacency[bus]:
+                if distances[neighbor] >= 0:
+                    continue
+                distances[neighbor] = distances[bus] + 1
+                queue.append(neighbor)
         for destination in range(bus_count):
-            if component[origin] != component[destination]:
+            if distances[destination] >= 0:
+                hop[start, destination] = float(distances[destination])
+
+    degree = np.sum(weight, axis=1)
+    transition = np.zeros_like(weight)
+    positive_degree = degree > 0
+    transition[positive_degree] = weight[positive_degree] / degree[positive_degree, None]
+    walk_powers = [transition.copy()]
+    for _ in range(2, RPE_WALK_STEPS + 1):
+        walk_powers.append(walk_powers[-1] @ transition)
+
+    scale_y = np.ones(component_id, dtype=np.float64)
+    hop_scale = np.ones(component_id, dtype=np.float64)
+    resistance_scale = np.ones(component_id, dtype=np.float64)
+    effective = np.zeros((bus_count, bus_count), dtype=np.float64)
+    for comp in range(component_id):
+        buses = np.flatnonzero(component == comp)
+        if buses.size == 0:
+            continue
+        off_diagonal = y_abs[np.ix_(buses, buses)]
+        mask = ~np.eye(buses.size, dtype=bool)
+        mean_admittance = float(off_diagonal[mask].mean()) if mask.any() else 0.0
+        scale_y[comp] = mean_admittance if mean_admittance > 0 else 1.0
+        finite_hop = hop[np.ix_(buses, buses)]
+        max_hop = float(finite_hop.max()) if buses.size else 0.0
+        hop_scale[comp] = max_hop if max_hop > 0 else 1.0
+        sub_weight = weight[np.ix_(buses, buses)]
+        sub_degree = np.sum(sub_weight, axis=1)
+        sub_laplacian = np.diag(sub_degree) - sub_weight
+        if buses.size == 1:
+            continue
+        pseudoinverse = np.linalg.pinv(sub_laplacian)
+        for local_i, bus_i in enumerate(buses):
+            for local_j, bus_j in enumerate(buses):
+                delta = pseudoinverse[local_i, local_i] + pseudoinverse[local_j, local_j]
+                delta -= 2.0 * pseudoinverse[local_i, local_j]
+                effective[bus_i, bus_j] = max(delta, 0.0)
+        max_resistance = float(effective[np.ix_(buses, buses)].max())
+        resistance_scale[comp] = max_resistance if max_resistance > 0 else 1.0
+
+    adjacency_flag = np.zeros((bus_count, bus_count), dtype=np.float32)
+    for origin in range(bus_count):
+        for destination in adjacency[origin]:
+            adjacency_flag[origin, destination] = 1.0
+
+    features = np.zeros((bus_count, bus_count, RPE_DIM), dtype=np.float32)
+    for origin in range(bus_count):
+        comp = int(component[origin])
+        if comp < 0:
+            continue
+        y_scale = scale_y[comp]
+        h_scale = hop_scale[comp]
+        r_scale = resistance_scale[comp]
+        for destination in range(bus_count):
+            if component[destination] != comp:
                 continue
-            shared = ancestor(origin, destination)
-            features[origin, destination, 0] = prefix_r[origin] + prefix_r[destination] - 2 * prefix_r[shared]
-            features[origin, destination, 1] = prefix_x[origin] + prefix_x[destination] - 2 * prefix_x[shared]
-            features[origin, destination, 2] = prefix_r[shared]
-            features[origin, destination, 3] = prefix_x[shared]
-            features[origin, destination, 4] = float(shared == origin and origin != destination)
-            features[origin, destination, 5] = float(shared == destination and origin != destination)
-    symmetric = np.max(np.abs(features[:, :, 0] - features[:, :, 0].T))
-    if symmetric > 1e-5:
-        raise RuntimeError("Path resistance on the spanning tree is not symmetric.")
+            features[origin, destination, 0] = y.real[origin, destination] / y_scale
+            features[origin, destination, 1] = y.imag[origin, destination] / y_scale
+            features[origin, destination, 2] = adjacency_flag[origin, destination]
+            if origin == destination:
+                features[origin, destination, 3] = 0.0
+                features[origin, destination, 4] = 0.0
+            else:
+                features[origin, destination, 3] = hop[origin, destination] / h_scale
+                features[origin, destination, 4] = effective[origin, destination] / r_scale
+            for step, power in enumerate(walk_powers, start=5):
+                features[origin, destination, step] = power[origin, destination]
+
+    hop_symmetry = np.max(np.abs(hop - hop.T))
+    if hop_symmetry > 1e-5:
+        raise RuntimeError("Hop distance on the meshed graph is not symmetric.")
+    resistance_symmetry = np.max(np.abs(effective - effective.T))
+    if resistance_symmetry > 1e-4:
+        raise RuntimeError("Effective resistance is not symmetric.")
+    if not np.isfinite(features).all():
+        raise RuntimeError("Meshed RPE contains non-finite values.")
     return features, component
 
 
@@ -518,22 +586,21 @@ def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
         rows_j = y_rows["index2"][chosen].astype(np.int64)
         ybus = np.zeros((118, 118), dtype=np.complex64)
         ybus[rows_i, rows_j] = y_rows["G"][chosen] + 1j * y_rows["B"][chosen]
-        edges = []
-        seen_pairs: dict[tuple[int, int], tuple[int, float, float]] = {}
+        branches = []
         for branch_id in range(branch_count):
             if status[local, branch_id] < 0.5:
                 continue
             first = int(origin[local, branch_id])
             second = int(destination[local, branch_id])
-            key = (first, second) if first < second else (second, first)
-            previous = seen_pairs.get(key)
-            if previous is None or branch_id < previous[0]:
-                seen_pairs[key] = (branch_id, float(resistance[local, branch_id]), float(reactance[local, branch_id]))
-        for _key, (branch_id, resistance_value, reactance_value) in seen_pairs.items():
-            first = int(origin[local, branch_id])
-            second = int(destination[local, branch_id])
-            edges.append((first, second, resistance_value, reactance_value))
-        features, component = electrical_rpe(118, edges, slack)
+            branches.append(
+                (
+                    first,
+                    second,
+                    float(resistance[local, branch_id]),
+                    float(reactance[local, branch_id]),
+                )
+            )
+        features, component = meshed_rpe(118, branches, ybus)
         solved = np.exp(1j * angle[local]) * voltage[local]
         injection = solved * np.conj(ybus.astype(np.complex128) @ solved)
         mismatch = np.sqrt((power_p[local] - injection.real) ** 2 + (power_q[local] - injection.imag) ** 2)
@@ -1132,5 +1199,41 @@ def main() -> None:
         )
 
 
+def sanity_check_meshed_rpe(data_root: Path) -> None:
+    """Load one 118-bus case and verify meshed RPE shape and invariants."""
+    split = read_split(raw_dir(data_root, "train", "n", "feasible"), "sanity", limit=1)
+    rpe = split.networks[0].rpe.numpy()
+    if rpe.shape != (118, 118, RPE_DIM):
+        raise RuntimeError(f"Expected RPE shape (118, 118, {RPE_DIM}), got {rpe.shape}.")
+    if not np.isfinite(rpe).all():
+        raise RuntimeError("RPE sanity check failed: non-finite values.")
+    diagonal = np.arange(118)
+    if not np.allclose(rpe[diagonal, diagonal, 3], 0.0):
+        raise RuntimeError("Diagonal hop feature must be zero.")
+    if not np.allclose(rpe[diagonal, diagonal, 4], 0.0):
+        raise RuntimeError("Diagonal effective-resistance feature must be zero.")
+    if not np.allclose(rpe[diagonal, diagonal, 2], 0.0):
+        raise RuntimeError("Diagonal adjacency feature must be zero.")
+    neighbor = int(np.argmax(rpe[:, :, 2]))
+    row, column = divmod(neighbor, 118)
+    if rpe[row, column, 2] < 0.5:
+        raise RuntimeError("Expected at least one directly connected bus pair.")
+    if not np.allclose(rpe[:, :, 3], rpe[:, :, 3].T, atol=1e-5):
+        raise RuntimeError("Normalized hop features are not symmetric.")
+    if not np.allclose(rpe[:, :, 4], rpe[:, :, 4].T, atol=1e-4):
+        raise RuntimeError("Normalized effective-resistance features are not symmetric.")
+    print(
+        f"meshed RPE sanity OK: shape {rpe.shape}, neighbor ({row},{column}) A={rpe[row, column, 2]:.0f}",
+        flush=True,
+    )
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--sanity-rpe":
+        ensure_runtime_packages()
+        drive = google_drive_root()
+        work, _legacy = legacy_locations(drive)
+        data = ensure_dataset(work, drive)
+        sanity_check_meshed_rpe(data)
+    else:
+        main()
