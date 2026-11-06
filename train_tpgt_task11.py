@@ -11,7 +11,7 @@ resistance (5 channels). See `meshed_rpe`.
 Architecture (checkpoint_version ``meshed-rpe-5-d4-v7``)
 --------------------------------------------------------
 * **4 correction stages** (``DEPTH``), each with its own weights; the physics
-  loss is the unweighted sum over stages.
+  loss sums stage residuals with GENCO weights ``0.5**(K-i)`` (last stage 1).
 * **5-channel RPE** (random-walk channels removed).
 * **RPE channel dropout**: during training each channel is zeroed with
   probability ``RPE_CHANNEL_DROPOUT`` per optimizer step; never at eval.
@@ -117,6 +117,9 @@ SEEDS = (0, 1, 2)
 BASE_MVA = 100.0
 LAMBDA_STATE = 0.85
 LAMBDA_PHYS = 0.15
+# Stage i of K gets physics weight PHYSICS_STAGE_DECAY**(K-i), as in GENCO
+# (HGNS_PF_pfdelta_bs64_seed1.yaml): last stage 1, each earlier stage halved.
+PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
 CACHE_VERSION = "tpgt-cache-4"
@@ -552,6 +555,10 @@ class TaskLossBreakdown:
     total: torch.Tensor
 
 
+def physics_stage_weights(depth: int) -> tuple[float, ...]:
+    return tuple(PHYSICS_STAGE_DECAY ** (depth - i) for i in range(1, depth + 1))
+
+
 def task_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -565,7 +572,8 @@ def task_loss(
     physics_stages = tuple(
         torch.mean(torch.sum(residual * residual, dim=-1)) for residual in residuals
     )
-    physics_sum = torch.stack(physics_stages).sum()
+    weights = physics_stage_weights(len(physics_stages))
+    physics_sum = sum(w * stage for w, stage in zip(weights, physics_stages))
     total = LAMBDA_STATE * state_mse + LAMBDA_PHYS * physics_sum
     return TaskLossBreakdown(state_mse, physics_sum, physics_stages, total)
 
@@ -2410,7 +2418,7 @@ def train_epoch_loss_line(
     lr_text = "" if lr is None else f"  lr {lr:.1e}"
     return (
         f"seed {seed} epoch {epoch_number}/{EPOCHS}  "
-        f"state {state_mse / n:.4f}  phys {physics_sum / n:.4f}  {stage_text}  "
+        f"state {state_mse / n:.4f}  phys_w {physics_sum / n:.4f}  {stage_text}  "
         f"train {train_total / n:.4f}  val_pbl {val_display}{lr_text}"
     )
 
@@ -2946,6 +2954,8 @@ def main() -> None:
     data = ensure_dataset(work, drive)
     print(f"Dataset: {data}", flush=True)
     print(f"Run tag {RUN_TAG} (checkpoint_version {CHECKPOINT_VERSION}, {DEPTH} stages, {RPE_DIM}-channel RPE)", flush=True)
+    stage_weight_text = " ".join(f"s{i + 1} {w:g}" for i, w in enumerate(physics_stage_weights(DEPTH)))
+    print(f"Physics stage weights (GENCO-style): {stage_weight_text}", flush=True)
     print(f"Checkpoints: {checkpoints}", flush=True)
     print(f"Results directory: {results}", flush=True)
     log_counts(data, results)
