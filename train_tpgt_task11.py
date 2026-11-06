@@ -93,6 +93,18 @@ TYPE_NAMES = ("PQ", "PV", "Slack")
 CACHE_VERSION = "tpgt-cache-3"
 RPE_WALK_STEPS = 5
 RPE_DIM = RPE_WALK_STEPS + 5
+RPE_FEATURE_NAMES = (
+    "ReY/sY",
+    "ImY/sY",
+    "adjacency",
+    "hop_norm",
+    "Reff_norm",
+    "P1",
+    "P2",
+    "P3",
+    "P4",
+    "P5",
+)
 # Bumped when pair-encoder input size or architecture changes; old Drive checkpoints are ignored.
 CHECKPOINT_VERSION = "meshed-rpe-10-v6-capacity"
 # Reference labels must satisfy nodal balance within this mean PBL (p.u.) when checked at load.
@@ -474,6 +486,215 @@ def task_loss(
 
 def mean_pbl(residual: torch.Tensor) -> torch.Tensor:
     return torch.mean(torch.sqrt(residual[..., 0] ** 2 + residual[..., 1] ** 2))
+
+
+def pbl_stats(residual: torch.Tensor) -> dict[str, float]:
+    """Per-bus PBL (p.u.) summary; residual shape (batch, buses, 2)."""
+    per_bus = torch.sqrt(residual[..., 0] ** 2 + residual[..., 1] ** 2)
+    return {
+        "mean": float(per_bus.mean()),
+        "max": float(per_bus.max()),
+        "p95": float(torch.quantile(per_bus.flatten(), 0.95)),
+    }
+
+
+def pbl_from_unknown(
+    specified: torch.Tensor,
+    unknown: torch.Tensor,
+    types: torch.Tensor,
+    ybus: torch.Tensor,
+) -> dict[str, float]:
+    return pbl_stats(nodal_residual(specified, unknown, types, ybus))
+
+
+def state_rmse_by_type(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    types: torch.Tensor,
+) -> dict[str, float]:
+    """RMSE on unknown slots (same packing as pack_case)."""
+    error = prediction - target
+    angle_unknown = (types == 0) | (types == 1)
+    error = error.clone()
+    error[:, angle_unknown, 1] = wrap_angle(error[:, angle_unknown, 1])
+    out: dict[str, float] = {}
+    labels = (
+        ("PQ_V", 0, 0),
+        ("PQ_theta", 0, 1),
+        ("PV_Q", 1, 0),
+        ("PV_theta", 1, 1),
+        ("slack_P", 2, 0),
+        ("slack_Q", 2, 1),
+    )
+    for name, type_id, slot in labels:
+        mask = types == type_id
+        if not bool(mask.any()):
+            continue
+        diff = error[:, mask, slot]
+        out[name] = float(torch.sqrt(torch.mean(diff * diff)))
+    return out
+
+
+def summarize_rpe(rpe: torch.Tensor) -> list[dict[str, float]]:
+    """Per-channel stats; separate diagonal and off-diagonal pairs."""
+    values = rpe.detach().cpu().numpy()
+    buses = values.shape[0]
+    diagonal = np.eye(buses, dtype=bool)
+    off = ~diagonal
+    rows: list[dict[str, float]] = []
+    for channel, name in enumerate(RPE_FEATURE_NAMES):
+        plane = values[:, :, channel]
+        rows.append(
+            {
+                "name": name,
+                "off_mean": float(plane[off].mean()),
+                "off_max": float(plane[off].max()),
+                "diag_mean": float(plane[diagonal].mean()),
+            }
+        )
+    return rows
+
+
+def summarize_pair_embed(pair: torch.Tensor) -> dict[str, float]:
+    with torch.no_grad():
+        norms = torch.linalg.vector_norm(pair, dim=-1)
+    return {
+        "mean_norm": float(norms.mean()),
+        "max_norm": float(norms.max()),
+    }
+
+
+@dataclass
+class ForwardDiagnostics:
+    oracle_pbl: dict[str, float]
+    flat_start_pbl: dict[str, float]
+    model_pbl: dict[str, float]
+    stage_pbl: list[dict[str, float]]
+    state_rmse: dict[str, float]
+    train_state_mse: float
+    train_phys_stages: tuple[float, ...]
+    pair_embed: dict[str, float]
+    rpe_channels: list[dict[str, float]]
+    ybus_abs_mean: float
+
+
+def collect_forward_diagnostics(
+    model: TPGT,
+    split: Split,
+    network: Network,
+    index: np.ndarray,
+    device: torch.device,
+) -> ForwardDiagnostics:
+    model.eval()
+    clear_pair_embed_cache([network])
+    chosen = np.asarray(index, dtype=np.int64)
+    power_p = split.power_p[chosen].to(device, non_blocking=True)
+    power_q = split.power_q[chosen].to(device, non_blocking=True)
+    voltage = split.voltage[chosen].to(device, non_blocking=True)
+    angle = split.angle[chosen].to(device, non_blocking=True)
+    specified, target = pack_case(power_p, power_q, voltage, angle, network.types)
+    types = network.types
+    ybus = network.ybus
+    with torch.no_grad():
+        oracle = pbl_from_unknown(specified, target, types, ybus)
+        flat = flat_start(specified, types)
+        flat_pbl = pbl_from_unknown(specified, flat, types, ybus)
+        pair = pair_features(model, network)
+        prediction, residuals = model(
+            specified,
+            types,
+            network.rpe,
+            network.pair_type_masks,
+            ybus,
+            pair=pair,
+        )
+        breakdown = task_loss(prediction, target, residuals, types)
+        stage_pbl = [pbl_stats(r) for r in residuals]
+        model_pbl = stage_pbl[-1] if stage_pbl else pbl_from_unknown(specified, prediction, types, ybus)
+        state_rmse = state_rmse_by_type(prediction, target, types)
+        ybus_abs = float(torch.abs(ybus).mean())
+    return ForwardDiagnostics(
+        oracle_pbl=oracle,
+        flat_start_pbl=flat_pbl,
+        model_pbl=model_pbl,
+        stage_pbl=stage_pbl,
+        state_rmse=state_rmse,
+        train_state_mse=float(breakdown.state_mse),
+        train_phys_stages=tuple(float(v) for v in breakdown.physics_stages),
+        pair_embed=summarize_pair_embed(pair),
+        rpe_channels=summarize_rpe(network.rpe),
+        ybus_abs_mean=ybus_abs,
+    )
+
+
+def format_forward_diagnostics(
+    tag: str,
+    diagnostics: ForwardDiagnostics,
+) -> str:
+    lines = [f"=== TPGT diagnostics {tag} ==="]
+    o = diagnostics.oracle_pbl
+    lines.append(
+        f"Oracle PBL (target state plugged in): mean {o['mean']:.6e} max {o['max']:.6e} "
+        f"(expect ~1e-6 if labels match Ybus)"
+    )
+    f = diagnostics.flat_start_pbl
+    lines.append(f"Flat-start PBL: mean {f['mean']:.6g} max {f['max']:.6g}")
+    m = diagnostics.model_pbl
+    lines.append(f"Model final-stage PBL: mean {m['mean']:.6g} max {m['max']:.6g}")
+    for stage_idx, stats in enumerate(diagnostics.stage_pbl, start=1):
+        lines.append(
+            f"  stage {stage_idx} PBL: mean {stats['mean']:.6g} max {stats['max']:.6g} p95 {stats['p95']:.6g}"
+        )
+    lines.append(
+        f"Loss: state_mse {diagnostics.train_state_mse:.6g}  "
+        + "  ".join(
+            f"phys_s{i + 1} {diagnostics.train_phys_stages[i]:.6g}" for i in range(len(diagnostics.train_phys_stages))
+        )
+    )
+    rmse = diagnostics.state_rmse
+    lines.append(
+        "State RMSE vs labels (pu or rad): "
+        + "  ".join(f"{key} {value:.6g}" for key, value in sorted(rmse.items()))
+    )
+    pe = diagnostics.pair_embed
+    lines.append(f"Pair embed |e_ij|: mean {pe['mean_norm']:.6g} max {pe['max_norm']:.6g}")
+    lines.append(f"Mean |Ybus| entry: {diagnostics.ybus_abs_mean:.6g}")
+    lines.append("RPE channels (off-diagonal / diagonal mean, off max):")
+    for row in diagnostics.rpe_channels:
+        lines.append(
+            f"  {row['name']:12s} off_mean {row['off_mean']:+.4g} off_max {row['off_max']:+.4g} "
+            f"diag_mean {row['diag_mean']:+.4g}"
+        )
+    lines.append(
+        "Note: val PBL ~0.39 with state RMSE above means mismatch loss is not yet near GENCO solver accuracy; "
+        "compare oracle line first — if oracle is not ~0, fix data/units before the model."
+    )
+    return "\n".join(lines)
+
+
+def print_forward_diagnostics(
+    model: TPGT,
+    split: Split,
+    network: Network,
+    index: np.ndarray,
+    device: torch.device,
+    tag: str,
+) -> None:
+    report = collect_forward_diagnostics(model, split, network, index, device)
+    print(format_forward_diagnostics(tag, report), flush=True)
+
+
+def wants_debug_diagnostics() -> bool:
+    if "--debug" in sys.argv:
+        return True
+    flag = os.environ.get("GENCO_TPGT_DEBUG", "").strip().lower()
+    return flag in ("1", "true", "yes")
+
+
+def debug_sample_index(split: Split, network_id: int = 0, count: int = 32) -> np.ndarray:
+    index = torch.nonzero(split.network_index == network_id, as_tuple=False).flatten()
+    take = min(int(count), int(index.numel()))
+    return index[:take].numpy()
 
 
 @dataclass
@@ -1474,6 +1695,7 @@ def train_seed(
     device: torch.device,
     eval_batch_size: int = EVAL_BATCH_SIZE,
     val_every: int = VAL_EVERY,
+    debug_diagnostics: bool = False,
     on_epoch_end: Callable[[TPGT, int], tuple[dict[str, float], dict[str, int]]] | None = None,
     after_periodic_checkpoint: Callable[
         [TPGT, Path, int, dict[str, float], dict[str, int]], None
@@ -1674,6 +1896,16 @@ def train_seed(
                 ),
                 flush=True,
             )
+            if debug_diagnostics:
+                sample = debug_sample_index(val_split)
+                print_forward_diagnostics(
+                    model,
+                    val_split,
+                    val_networks[0],
+                    sample,
+                    device,
+                    tag=f"seed {seed} epoch {epoch + 1} ({len(sample)} valid cases, network 0)",
+                )
             start_epoch = epoch + 1
             finish_checkpoint_epoch(start_epoch)
     if best_state is None:
@@ -1984,9 +2216,59 @@ def main() -> None:
             device,
             eval_batch_size=EVAL_BATCH_SIZE,
             val_every=VAL_EVERY,
+            debug_diagnostics=wants_debug_diagnostics(),
             on_epoch_end=on_epoch_end,
             after_periodic_checkpoint=publish_checkpoint,
         )
+
+
+def cli_diagnose(checkpoint: Path | None = None, seed: int = 0, cases: int = 32) -> None:
+    global DATA_FRACTION
+    ensure_runtime_packages()
+    DATA_FRACTION = parse_data_fraction()
+    drive = google_drive_root()
+    outputs = drive_output_dirs(drive)
+    work, legacy_results = legacy_locations(drive)
+    if outputs is not None:
+        checkpoints, results = outputs
+    else:
+        checkpoints = work / "tpgt_task11"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    configure_cuda_training(device)
+    data = ensure_dataset(work, drive)
+    active_cache, persistent_cache = split_cache_dirs(checkpoints)
+    val_split = cached_split(
+        active_cache,
+        persistent_cache,
+        raw_dir(data, "valid", "n", "feasible"),
+        "valid_n_feasible",
+    )
+    network = move_to(val_split.networks[0], device)
+    model = TPGT().to(device)
+    seed_dir = checkpoints / f"seed_{seed}"
+    ckpt = checkpoint or (seed_dir / "last.pt")
+    if ckpt.exists():
+        payload = try_load_checkpoint_file(ckpt, device)
+        if payload and isinstance(payload.get("model"), dict):
+            version_reason = checkpoint_version_reason(payload)
+            if version_reason is None:
+                model.load_state_dict(payload["model"], strict=True)
+                print(f"Loaded weights from {ckpt}", flush=True)
+            else:
+                print(f"Skipping weights ({version_reason}); random init.", flush=True)
+        else:
+            print(f"Could not load {ckpt}; random init.", flush=True)
+    else:
+        print(f"No checkpoint at {ckpt}; random init.", flush=True)
+    sample = debug_sample_index(val_split, count=cases)
+    print_forward_diagnostics(
+        model,
+        val_split,
+        network,
+        sample,
+        device,
+        tag=f"diagnose seed {seed} ({len(sample)} valid cases)",
+    )
 
 
 def verify_task11_splits(data_root: Path) -> None:
@@ -2049,7 +2331,26 @@ def sanity_check_meshed_rpe(data_root: Path) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--verify-splits":
+    if len(sys.argv) > 1 and sys.argv[1] == "--diagnose":
+        ckpt: Path | None = None
+        seed = 0
+        cases = 32
+        args = sys.argv[2:]
+        index = 0
+        while index < len(args):
+            if args[index] == "--checkpoint" and index + 1 < len(args):
+                ckpt = Path(args[index + 1])
+                index += 2
+            elif args[index] == "--seed" and index + 1 < len(args):
+                seed = int(args[index + 1])
+                index += 2
+            elif args[index] == "--cases" and index + 1 < len(args):
+                cases = int(args[index + 1])
+                index += 2
+            else:
+                raise SystemExit(f"Unknown diagnose argument: {args[index]}")
+        cli_diagnose(checkpoint=ckpt, seed=seed, cases=cases)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--verify-splits":
         cli_verify_splits()
     elif len(sys.argv) > 1 and sys.argv[1] == "--sanity-rpe":
         ensure_runtime_packages()
