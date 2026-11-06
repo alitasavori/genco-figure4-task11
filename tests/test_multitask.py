@@ -421,20 +421,22 @@ def test_batched_forward_matches_per_network_forwards():
             )
             assert torch.allclose(prediction[rows], alone, rtol=0, atol=1e-12)
             for stage, stage_alone in zip(residuals, alone_residuals):
-                assert torch.allclose(stage[rows], stage_alone, rtol=1e-6, atol=1e-7)
+                assert torch.allclose(stage[rows], stage_alone, rtol=0, atol=1e-12)
             specified = torch.randn(2, 3, 2, dtype=torch.float64)
             unknown = torch.randn(2, 3, 2, dtype=torch.float64)
             shared = tpgt.nodal_residual(specified, unknown, networks[net].types, networks[net].ybus)
             per_case = tpgt.nodal_residual(
                 specified, unknown, networks[net].types, networks[net].ybus.expand(2, 3, 3)
             )
-            assert torch.equal(shared, per_case)
+            assert torch.allclose(shared, per_case, rtol=0, atol=1e-12)
 
 
+@pytest.mark.parametrize("split_dominant", [False, True])
 @pytest.mark.parametrize("micro", [32, 3])
-def test_grouped_step_gradient_equals_per_network_accumulation(monkeypatch, micro):
+def test_grouped_step_gradient_equals_per_network_accumulation(monkeypatch, micro, split_dominant):
     monkeypatch.setattr(tpgt, "RPE_CHANNEL_DROPOUT", 0.0)
     monkeypatch.setattr(tpgt, "MICRO_BATCH_SIZE", micro)
+    monkeypatch.setattr(tpgt, "SPLIT_DOMINANT_PATTERN", split_dominant)
     split, networks = float64_split(*consistent_split(three_bus_topologies(), [5, 4, 3], seed=7))
     torch.manual_seed(0)
     model = tpgt.TPGT().double()
@@ -456,8 +458,12 @@ def test_grouped_step_gradient_equals_per_network_accumulation(monkeypatch, micr
     model.pair_encoder.register_forward_hook(lambda _module, inputs, _output: encodes.append(tuple(inputs[0].shape)))
     optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
     logged = tpgt.train_step(model, optimizer, None, split, [(networks[net], index) for net, index in groups], device)
-    assert encodes == [(2, 3, 3, 5), (3, 3, 5)]
-    assert forwards == ([8, 2] if micro == 32 else [3, 3, 2, 2])
+    if split_dominant:
+        assert encodes == [(2, 3, 3, 5), (3, 3, 5)]
+        assert forwards == ([8, 2] if micro == 32 else [3, 3, 2, 2])
+    else:
+        assert encodes == [(3, 3, 3, 5)]
+        assert forwards == ([10] if micro == 32 else [3, 3, 3, 1])
     assert float(logged.total) == pytest.approx(total, rel=1e-7)
     for expected, param in zip(reference, model.parameters()):
         assert torch.allclose(param.grad, expected, rtol=1e-10, atol=1e-12)
@@ -527,7 +533,7 @@ def test_grouped_evaluate_pbl_matches_per_network_evaluation():
     model.register_forward_hook(lambda _module, inputs, _output: forwards.append(inputs[0].shape[0]))
     per_network: dict[int, list[float]] = {}
     score = tpgt.evaluate_pbl(model, split, eager, device, batch_size=8, per_network_out=per_network)
-    assert forwards == [8, 1, 3]
+    assert forwards == [8, 4]
     assert score == pytest.approx(sum(total for total, _count in reference.values()) / split.count, rel=1e-6)
     assert sorted(per_network) == sorted(reference)
     for net, (total, count) in reference.items():

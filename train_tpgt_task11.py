@@ -10,11 +10,14 @@ Tasks (``--task`` or ``GENCO_TPGT_TASK``; see ``TASKS``)
 train/valid folders (each cached and cut to ``DATA_FRACTION`` on its own, then merged); every task
 is tested on N, N-1, N-2 and C2I. Task 1.1 keeps ``tpgt_task11_<RUN_TAG>``; other tasks write to
 ``tpgt_task<id>_<RUN_TAG>`` (results inside it). Each optimizer step takes the next 32 cases of
-one global shuffle and runs one forward/backward per bus-type pattern among them (topologies with
-equal bus types and components, e.g. line outages of one grid, share a forward with per-case pair
-embeddings and Ybus); networks stay on the CPU and only those in use are moved to the device
-(``DeviceNetworks``). Validation and test batch the same way. Checkpoint epochs also
-write a bar plot against the published numbers and IEEE 118 bus error maps.
+one global shuffle and runs them in one forward/backward: a single topology uses the shared
+block-wise path, topologies with equal bus types (line outages) share it with per-case pair
+embeddings and Ybus, and topologies with different bus types (generator outages) run per-case
+type masks (``TypeLayout``). Device copies of the networks (``DeviceNetworks``) stay resident when
+they fit the memory budget, otherwise in an LRU. Validation and test batch the same way. The
+250-batch and epoch log lines break the step time into network moves, pair encoder, forward,
+backward and optimizer (``StepTimer``). Checkpoint epochs also write a bar plot against the
+published numbers and IEEE 118 bus error maps.
 The hidden sizes, depth, batch, and epoch cap below are implementation
 choices so a Colab GPU can finish a run. They are not paper hyperparameters.
 
@@ -48,7 +51,9 @@ Performance notes (Colab / large train split)
   caches its encoded pairs on ``Network.pair_embed``.
 * **Type-pair attention**: ``CorrectionStage._messages`` evaluates each of the
   nine type-pair weight sets only on its own receiver-type × sender-type block
-  (both heads batched), then takes one softmax over all senders per receiver.
+  (both heads batched), then takes one softmax over all senders per receiver. With per-case
+  bus types a block spans the buses of that type in any case and per-case masks keep each
+  case's own pairs (the dense masked formulation restricted to those buses).
   Optional ``GENCO_TPGT_COMPILE=1`` or ``--compile`` wraps the model in
   ``torch.compile`` (may differ slightly in numerics).
 * **Batch 32**: Optimizer steps use 32 cases per batch. Default **micro-batch 32**
@@ -61,7 +66,12 @@ Performance notes (Colab / large train split)
   on GPU. Optional ``torch.compile`` via ``--fast``, ``GENCO_TPGT_FAST=1``, or
   ``--compile``.
 * **Less sync**: GPU ``synchronize`` only for timed log lines and validation,
-  not after every training batch.
+  not after every training batch. Bus-type indices, attention blocks and type presence are
+  precomputed per network (``move_to``) or per pass on the CPU, host-to-GPU copies are pinned,
+  and step losses accumulate on the device, so a training forward/backward has no device sync.
+* **Device network cache**: ``DeviceNetworks`` keeps every topology of a split on the GPU when
+  they fit min(``DEVICE_CACHE_FREE_FRACTION`` of free memory, ``DEVICE_CACHE_MAX_BYTES``), about
+  0.5 MB each on case118; otherwise an LRU of that size. The decision is logged at seed start.
 * **Optional**: ``GENCO_TPGT_VAL_EVERY=3`` or ``--val-every 3`` skips most
   validation passes (faster; coarser early stopping).
 * **LR schedule**: Adam at ``LEARNING_RATE`` with ``ReduceLROnPlateau`` on
@@ -184,8 +194,14 @@ CONDITIONS = ("feasible", "nose", "around_nose")
 PARQUET_FILES = ("bus_data.parquet", "branch_data.parquet", "gen_data.parquet", "y_bus_data.parquet")
 # Train/valid splits with at least this many topologies keep non-dominant RPEs in float16 on CPU.
 COMPACT_MIN_NETWORKS = 512
-# Device copies of networks kept per split (least recently used are dropped).
-DEVICE_NETWORK_CACHE = 64
+# Device copies of a split's networks stay resident when they fit min(fraction of free GPU memory,
+# cap); otherwise an LRU keeps as many as the budget holds. CPU runs use a fixed budget.
+DEVICE_CACHE_FREE_FRACTION = 0.35
+DEVICE_CACHE_MAX_BYTES = 6 * 1024**3
+DEVICE_CACHE_CPU_BYTES = 2 * 1024**3
+# Steps mixing bus-type patterns: False runs every case in one per-case-type pass; True runs the
+# largest pattern block-wise and the remaining cases in one per-case-type pass.
+SPLIT_DOMINANT_PATTERN = False
 # Bus error maps at checkpoint epochs: validation cases on the dominant topology.
 BUS_MAP_VAL_CASES = 256
 EXPECTED_COUNTS = {
@@ -309,6 +325,7 @@ def autocast_activation_dtype(reference: torch.Tensor) -> torch.dtype:
 
 
 def masked_write(base: torch.Tensor, mask: torch.Tensor, values: torch.Tensor) -> None:
+    """``mask`` is a boolean bus mask or a bus index tensor."""
     base[:, mask] = values.to(dtype=base.dtype)
 
 
@@ -330,7 +347,12 @@ def type_pair_masks(types: torch.Tensor, component: torch.Tensor) -> torch.Tenso
 
 @dataclass
 class TypePairBlock:
-    """Receivers of one type and senders of one type; ``mask`` keeps same-component pairs only."""
+    """Receivers of one type and senders of one type; ``mask`` keeps same-component pairs only.
+
+    ``mask`` is (receivers, senders) when bus types are shared by the batch, or (batch, receivers,
+    senders) when they differ per case; then the buses are those of the type in any case and the
+    mask also drops pairs whose types in that case are not this block's.
+    """
 
     pair_id: int
     receivers: torch.Tensor
@@ -338,19 +360,144 @@ class TypePairBlock:
     mask: torch.Tensor
 
 
-def type_pair_blocks(types: torch.Tensor, pair_type_masks: torch.Tensor) -> list[TypePairBlock]:
-    """Non-empty (receiver type, sender type) blocks of the bus-pair matrix, one per type pair."""
-    by_type = [torch.nonzero(types == type_id, as_tuple=False).flatten() for type_id in range(3)]
+@dataclass
+class TypeLayout:
+    """Bus types of one forward pass, shared by the batch or per case.
+
+    Shared: ``types`` is (N,) and ``index[t]`` lists the buses of type t. Per case: ``types`` is
+    (B, N), ``index[t]`` lists the buses of type t in at least one case, ``selects[t]`` (B, len(index[t]))
+    marks where they have it, and ``masks`` holds (PQ, PV, slack, PQ or PV) per case. ``present`` and the
+    indices are known on the CPU, so a forward needs no device sync to find the types or blocks.
+    """
+
+    types: torch.Tensor
+    index: tuple[torch.Tensor, ...]
+    present: tuple[bool, ...]
+    blocks: list[TypePairBlock]
+    angle_index: torch.Tensor | None = None
+    selects: tuple[torch.Tensor, ...] | None = None
+    masks: tuple[torch.Tensor, ...] | None = None
+    types_np: np.ndarray | None = field(default=None, repr=False)
+
+    @property
+    def per_case(self) -> bool:
+        return self.selects is not None
+
+    def take(self, select: torch.Tensor) -> TypeLayout:
+        """Per-case layout of rows ``select`` of this per-case layout."""
+        return TypeLayout(
+            types=self.types[select],
+            index=self.index,
+            present=self.present,
+            blocks=[TypePairBlock(b.pair_id, b.receivers, b.senders, b.mask[select]) for b in self.blocks],
+            selects=tuple(values[select] for values in self.selects),
+            masks=tuple(values[select] for values in self.masks),
+        )
+
+
+def host_to_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Copy without a stream sync: a pageable host-to-GPU copy can synchronize, a pinned one does not."""
+    if device.type != "cuda" or values.device.type != "cpu":
+        return values.to(device)
+    return values.pin_memory().to(device, non_blocking=True)
+
+
+def _bus_index(buses: np.ndarray, device: torch.device) -> torch.Tensor:
+    return host_to_device(torch.as_tensor(np.asarray(buses, dtype=np.int64)), device)
+
+
+def _layout_blocks(
+    index: tuple[torch.Tensor, ...],
+    present: tuple[bool, ...],
+    block_mask: Callable[[int, torch.Tensor, torch.Tensor], torch.Tensor],
+) -> list[TypePairBlock]:
     blocks = []
     for pair_id in range(9):
         receiver, sender = divmod(pair_id, 3)
-        receivers = by_type[receiver]
-        senders = by_type[sender]
-        if receivers.numel() == 0 or senders.numel() == 0:
+        if not (present[receiver] and present[sender]):
             continue
-        mask = pair_type_masks[pair_id][receivers.view(-1, 1), senders.view(1, -1)]
-        blocks.append(TypePairBlock(pair_id, receivers, senders, mask))
+        receivers, senders = index[receiver], index[sender]
+        blocks.append(TypePairBlock(pair_id, receivers, senders, block_mask(pair_id, receivers, senders)))
     return blocks
+
+
+def shared_layout(
+    types: torch.Tensor,
+    pair_type_masks: torch.Tensor | None = None,
+    types_np: np.ndarray | None = None,
+) -> TypeLayout:
+    """Layout of (N,) ``types``; blocks only when ``pair_type_masks`` (9, N, N) is given."""
+    if types_np is None:
+        types_np = types.detach().cpu().numpy()
+    index = tuple(_bus_index(np.flatnonzero(types_np == type_id), types.device) for type_id in range(3))
+    present = tuple(bool(np.any(types_np == type_id)) for type_id in range(3))
+    blocks = []
+    if pair_type_masks is not None:
+        blocks = _layout_blocks(
+            index, present, lambda p, receivers, senders: pair_type_masks[p][receivers.view(-1, 1), senders.view(1, -1)]
+        )
+    angle_index = _bus_index(np.flatnonzero((types_np == 0) | (types_np == 1)), types.device)
+    return TypeLayout(types, index, present, blocks, angle_index=angle_index, types_np=types_np)
+
+
+def per_case_layout(
+    types: torch.Tensor,
+    pair_type_masks: torch.Tensor | None = None,
+    types_np: np.ndarray | None = None,
+) -> TypeLayout:
+    """Layout of (B, N) ``types``; blocks only when per-case ``pair_type_masks`` (B, 9, N, N) is given."""
+    if types_np is None:
+        types_np = types.detach().cpu().numpy()
+    union = [np.any(types_np == type_id, axis=0) for type_id in range(3)]
+    index = tuple(_bus_index(np.flatnonzero(buses), types.device) for buses in union)
+    present = tuple(bool(buses.any()) for buses in union)
+    blocks = []
+    if pair_type_masks is not None:
+        blocks = _layout_blocks(
+            index,
+            present,
+            lambda p, receivers, senders: pair_type_masks[:, p][:, receivers.view(-1, 1), senders.view(1, -1)],
+        )
+    pq, pv, slack = (types == type_id for type_id in range(3))
+    return TypeLayout(
+        types,
+        index,
+        present,
+        blocks,
+        selects=tuple(types[:, buses] == type_id for type_id, buses in enumerate(index)),
+        masks=(pq, pv, slack, pq | pv),
+    )
+
+
+def type_layout(types: torch.Tensor | TypeLayout, pair_type_masks: torch.Tensor | None = None) -> TypeLayout:
+    """``types`` as a layout: (N,) shared or (B, N) per case (builds indices with a device sync)."""
+    if isinstance(types, TypeLayout):
+        return types
+    if types.dim() == 1:
+        return shared_layout(types, pair_type_masks)
+    return per_case_layout(types, pair_type_masks)
+
+
+def type_pair_blocks(types: torch.Tensor, pair_type_masks: torch.Tensor) -> list[TypePairBlock]:
+    """Non-empty (receiver type, sender type) blocks of the bus-pair matrix, one per type pair."""
+    return type_layout(types, pair_type_masks).blocks
+
+
+def gather_type(values: torch.Tensor, layout: TypeLayout, type_id: int) -> torch.Tensor:
+    return values[:, layout.index[type_id]]
+
+
+def write_type(base: torch.Tensor, layout: TypeLayout, type_id: int, values: torch.Tensor) -> torch.Tensor:
+    """Write ``values`` (one row per ``layout.index[type_id]`` bus) where buses have that type; returns ``base``.
+
+    Shared types write in place; per case the rows of other-type buses keep ``base``.
+    """
+    index = layout.index[type_id]
+    if not layout.per_case:
+        masked_write(base, index, values)
+        return base
+    keep = layout.selects[type_id].unsqueeze(-1)
+    return base.index_copy(1, index, torch.where(keep, values.to(dtype=base.dtype), base.index_select(1, index)))
 
 
 def wants_torch_compile() -> bool:
@@ -424,41 +571,40 @@ class CorrectionStage(nn.Module):
         unknown: torch.Tensor,
         specified: torch.Tensor,
         pair: torch.Tensor,
-        types: torch.Tensor,
-        blocks: list[TypePairBlock],
+        layout: TypeLayout,
         ybus: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        residual_in = nodal_residual(specified, unknown, types, ybus)
-        message = self._messages(hidden, pair, blocks)
+        residual_in = nodal_residual(specified, unknown, layout, ybus)
+        message = self._messages(hidden, pair, layout.blocks)
         updated = torch.zeros_like(hidden)
         for type_id, update in enumerate(self.update):
-            mask = types == type_id
-            if not bool(mask.any()):
+            if not layout.present[type_id]:
                 continue
             features = torch.cat(
                 (
-                    hidden[:, mask],
-                    message[:, mask],
-                    residual_in[:, mask].to(hidden.dtype),
+                    gather_type(hidden, layout, type_id),
+                    gather_type(message, layout, type_id),
+                    gather_type(residual_in, layout, type_id).to(hidden.dtype),
                 ),
                 dim=-1,
             )
-            masked_write(updated, mask, update(features))
+            updated = write_type(updated, layout, type_id, update(features))
         hidden_next = self.norm(hidden + updated)
         delta = torch.zeros_like(unknown)
         for type_id, decoder in enumerate(self.decode):
-            mask = types == type_id
-            if not bool(mask.any()):
+            if not layout.present[type_id]:
                 continue
-            masked_write(delta, mask, decoder(hidden_next[:, mask]))
-        pq = types == 0
-        pv = types == 1
-        if bool(pq.any()):
-            delta[:, pq, 1] = delta[:, pq, 1] * ETA_ANGLE
-        if bool(pv.any()):
-            delta[:, pv, 1] = delta[:, pv, 1] * ETA_ANGLE
-        unknown_next = constrain_unknown(unknown + ETA * delta, types)
-        residual_out = nodal_residual(specified, unknown_next, types, ybus)
+            delta = write_type(delta, layout, type_id, decoder(gather_type(hidden_next, layout, type_id)))
+        if layout.per_case:
+            angle_step = torch.where(layout.masks[3], delta[..., 1] * ETA_ANGLE, delta[..., 1])
+            delta = torch.stack((delta[..., 0], angle_step), dim=-1)
+        else:
+            for type_id in (0, 1):
+                if layout.present[type_id]:
+                    buses = layout.index[type_id]
+                    delta[:, buses, 1] = delta[:, buses, 1] * ETA_ANGLE
+        unknown_next = constrain_unknown(unknown + ETA * delta, layout)
+        residual_out = nodal_residual(specified, unknown_next, layout, ybus)
         return hidden_next, unknown_next, residual_out
 
     def _messages(
@@ -471,7 +617,9 @@ class CorrectionStage(nn.Module):
 
         Block scores are scattered into one (batch, heads, N, N) score matrix so the softmax
         runs over all senders of a receiver; cross-component entries stay -inf. ``pair`` is either
-        shared by the batch (N, N, E) or per case (batch, N, N, E) for topologies with equal bus types.
+        shared by the batch (N, N, E) or per case (batch, N, N, E). Blocks with per-case masks
+        (bus types differing per case) may overlap; each entry of a case is set by the one block of
+        its types and weighted only there.
         """
         batch, buses, _ = hidden.shape
         scores: torch.Tensor | None = None
@@ -493,10 +641,16 @@ class CorrectionStage(nn.Module):
                 bias = torch.einsum("bnme,hae->bhnma", edge, self.w_eb[p])
             interaction = torch.relu(mixed * projected + bias)
             score = torch.einsum("bhnma,ha->bhnm", interaction, self.w_a[p, :, 0])
-            score = score.masked_fill(~block.mask, float("-inf"))
             if scores is None:
                 scores = score.new_full((batch, HEADS, buses, buses), float("-inf"))
-            scores[:, :, receivers, senders] = score.to(scores.dtype)
+            if block.mask.dim() == 2:
+                score = score.masked_fill(~block.mask, float("-inf"))
+                scores[:, :, receivers, senders] = score.to(scores.dtype)
+            else:
+                own = block.mask.unsqueeze(1)
+                scores[:, :, receivers, senders] = torch.where(
+                    own, score.to(scores.dtype), scores[:, :, receivers, senders]
+                )
             interactions.append(interaction)
         if scores is None:
             return hidden.new_zeros(hidden.shape)
@@ -508,6 +662,8 @@ class CorrectionStage(nn.Module):
         for block, interaction in zip(blocks, interactions):
             p = block.pair_id
             block_weights = weights[:, :, block.receivers.view(-1, 1), block.senders.view(1, -1)]
+            if block.mask.dim() == 3:
+                block_weights = block_weights.masked_fill(~block.mask.unsqueeze(1), 0.0)
             value = torch.einsum("bnd,had->bhna", hidden[:, block.senders], self.w_v[p])
             # sum_j w_ij (W_V h_j + W_Ev x_ij) without materializing the per-pair values.
             gathered = torch.einsum("bhnm,bhma->bhna", block_weights, value)
@@ -534,9 +690,18 @@ class TPGT(nn.Module):
         pair_type_masks: torch.Tensor,
         ybus: torch.Tensor,
         pair: torch.Tensor | None = None,
+        layout: TypeLayout | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """``types`` (N,) with ``pair_type_masks`` (9, N, N), or per case (B, N) with (B, 9, N, N).
+
+        ``layout`` (precomputed by ``move_to`` / ``PassBatch``) replaces ``types`` and the masks.
+        """
         if pair is None:
             pair = self.pair_encoder(rpe)
+        if layout is None:
+            if pair_type_masks is None:
+                raise ValueError("TPGT forward needs pair_type_masks or a layout")
+            layout = type_layout(types, pair_type_masks)
         act_dtype = autocast_activation_dtype(specified)
         hidden = torch.zeros(
             specified.shape[0],
@@ -545,34 +710,45 @@ class TPGT(nn.Module):
             device=specified.device,
             dtype=act_dtype,
         )
-        unknown = flat_start(specified, types)
+        unknown = flat_start(specified, layout)
         for type_id, encoder in enumerate(self.encoders):
-            mask = types == type_id
-            if bool(mask.any()):
-                masked_write(hidden, mask, encoder(specified[:, mask]))
-        blocks = type_pair_blocks(types, pair_type_masks)
+            if layout.present[type_id]:
+                hidden = write_type(hidden, layout, type_id, encoder(gather_type(specified, layout, type_id)))
         residuals = []
         for stage in self.stages:
-            hidden, unknown, residual = stage(hidden, unknown, specified, pair, types, blocks, ybus)
+            hidden, unknown, residual = stage(hidden, unknown, specified, pair, layout, ybus)
             residuals.append(residual)
         return unknown, residuals
 
 
-def constrain_unknown(unknown: torch.Tensor, types: torch.Tensor) -> torch.Tensor:
-    """Keep states in a range where the AC equations are meaningful."""
+def constrain_unknown(unknown: torch.Tensor, types: torch.Tensor | TypeLayout) -> torch.Tensor:
+    """Keep states in a range where the AC equations are meaningful.
+
+    ``types`` here and in the helpers below is (N,), per case (B, N), or a ``TypeLayout``.
+    """
+    layout = type_layout(types)
+    if layout.per_case:
+        pq, _pv, _slack, angle_buses = layout.masks
+        voltage = torch.where(pq, unknown[..., 0].clamp(min=V_MIN_PU, max=V_MAX_PU), unknown[..., 0])
+        angle = torch.where(angle_buses, wrap_angle(unknown[..., 1]), unknown[..., 1])
+        return torch.stack((voltage, angle), dim=-1)
     out = unknown.clone()
-    pq = types == 0
-    if bool(pq.any()):
+    if layout.present[0]:
+        pq = layout.index[0]
         out[:, pq, 0] = unknown[:, pq, 0].clamp(min=V_MIN_PU, max=V_MAX_PU)
-    angle_buses = (types == 0) | (types == 1)
-    if bool(angle_buses.any()):
+    if layout.present[0] or layout.present[1]:
+        angle_buses = layout.angle_index
         out[:, angle_buses, 1] = wrap_angle(unknown[:, angle_buses, 1])
     return out
 
 
-def flat_start(specified: torch.Tensor, types: torch.Tensor) -> torch.Tensor:
+def flat_start(specified: torch.Tensor, types: torch.Tensor | TypeLayout) -> torch.Tensor:
+    layout = type_layout(types)
     unknown = torch.zeros_like(specified)
-    unknown[:, types == 0, 0] = 1.0
+    if layout.per_case:
+        unknown[..., 0] = layout.masks[0].to(unknown.dtype)
+    else:
+        unknown[:, layout.index[0], 0] = 1.0
     return unknown
 
 
@@ -581,14 +757,22 @@ def pack_case(
     power_q: torch.Tensor,
     voltage: torch.Tensor,
     angle: torch.Tensor,
-    types: torch.Tensor,
+    types: torch.Tensor | TypeLayout,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Specified quantities stay fixed. The target is the unknown part of the solution."""
+    layout = type_layout(types)
+    if layout.per_case:
+        pq, pv, slack, _angle = layout.masks
+        specified = torch.stack(
+            (torch.where(slack, voltage, power_p), torch.where(pq, power_q, torch.where(pv, voltage, angle))), dim=-1
+        )
+        target = torch.stack(
+            (torch.where(pq, voltage, torch.where(pv, power_q, power_p)), torch.where(slack, power_q, angle)), dim=-1
+        )
+        return specified, target
     specified = torch.zeros(*power_p.shape, 2, device=power_p.device, dtype=power_p.dtype)
     target = torch.zeros_like(specified)
-    pq = types == 0
-    pv = types == 1
-    slack = types == 2
+    pq, pv, slack = layout.index
     specified[:, pq, 0] = power_p[:, pq]
     specified[:, pq, 1] = power_q[:, pq]
     target[:, pq, 0] = voltage[:, pq]
@@ -607,15 +791,24 @@ def pack_case(
 def assemble(
     specified: torch.Tensor,
     unknown: torch.Tensor,
-    types: torch.Tensor,
+    types: torch.Tensor | TypeLayout,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    layout = type_layout(types)
+    if layout.per_case:
+        pq, pv, slack, _angle = layout.masks
+        given_0, given_1 = specified[..., 0], specified[..., 1]
+        solved_0, solved_1 = unknown[..., 0].to(specified.dtype), unknown[..., 1].to(specified.dtype)
+        return (
+            torch.where(slack, solved_0, given_0),
+            torch.where(pq, given_1, torch.where(pv, solved_0, solved_1)),
+            torch.where(pq, solved_0, torch.where(pv, given_1, given_0)),
+            torch.where(slack, given_1, solved_1),
+        )
     power_p = torch.empty(specified.shape[:2], device=specified.device, dtype=specified.dtype)
     power_q = torch.empty_like(power_p)
     voltage = torch.empty_like(power_p)
     angle = torch.empty_like(power_p)
-    pq = types == 0
-    pv = types == 1
-    slack = types == 2
+    pq, pv, slack = layout.index
     power_p[:, pq] = specified[:, pq, 0]
     power_q[:, pq] = specified[:, pq, 1]
     voltage[:, pq] = unknown[:, pq, 0]
@@ -634,17 +827,19 @@ def assemble(
 def nodal_residual(
     specified: torch.Tensor,
     unknown: torch.Tensor,
-    types: torch.Tensor,
+    types: torch.Tensor | TypeLayout,
     ybus: torch.Tensor,
 ) -> torch.Tensor:
     """AC mismatch in per unit. Ybus is already per unit, so this does not divide by baseMVA again.
 
-    ``ybus`` is shared (N, N) or per case (batch, N, N).
+    ``ybus`` is shared (N, N) or per case (batch, N, N). Returned in float32 (float64 when ``specified``
+    is float64, so float64 models can be checked to round-off).
     Evaluated in complex128: with TF32 enabled, a complex64 Ybus matmul on CUDA has a ~0.02 p.u. mean
     error floor on case118 (|Y| up to ~390 with heavy cancellation), 10^4 x the label accuracy.
     """
-    physical = constrain_unknown(unknown, types)
-    power_p, power_q, voltage, angle = assemble(specified, physical, types)
+    layout = type_layout(types)
+    physical = constrain_unknown(unknown, layout)
+    power_p, power_q, voltage, angle = assemble(specified, physical, layout)
     voltage_complex = voltage.double() * torch.exp(1j * angle.double())
     if ybus.dim() == 2:
         current = torch.matmul(ybus.to(torch.complex128), voltage_complex.transpose(0, 1)).transpose(0, 1)
@@ -652,7 +847,7 @@ def nodal_residual(
         current = torch.matmul(ybus.to(torch.complex128), voltage_complex.unsqueeze(-1)).squeeze(-1)
     flow = voltage_complex * torch.conj(current)
     residual = torch.stack((power_p.double() - flow.real, power_q.double() - flow.imag), dim=-1)
-    return residual.float()
+    return residual.to(torch.promote_types(specified.dtype, torch.float32))
 
 
 @dataclass
@@ -663,6 +858,15 @@ class TaskLossBreakdown:
     total: torch.Tensor
 
 
+def wrap_angle_errors(error: torch.Tensor, layout: TypeLayout) -> torch.Tensor:
+    """Wrap the angle slot of PQ and PV unknowns (in place for shared types)."""
+    if layout.per_case:
+        angle = torch.where(layout.masks[3], wrap_angle(error[..., 1]), error[..., 1])
+        return torch.stack((error[..., 0], angle), dim=-1)
+    error[:, layout.angle_index, 1] = wrap_angle(error[:, layout.angle_index, 1])
+    return error
+
+
 def physics_stage_weights(depth: int) -> tuple[float, ...]:
     return tuple(PHYSICS_STAGE_DECAY ** (depth - i) for i in range(1, depth + 1))
 
@@ -671,11 +875,10 @@ def task_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
     residuals: list[torch.Tensor],
-    types: torch.Tensor,
+    types: torch.Tensor | TypeLayout,
 ) -> TaskLossBreakdown:
     error = prediction - target
-    angle_unknown = (types == 0) | (types == 1)
-    error[:, angle_unknown, 1] = wrap_angle(error[:, angle_unknown, 1])
+    error = wrap_angle_errors(error, type_layout(types))
     state_mse = torch.mean(torch.sum(error * error, dim=-1))
     physics_stages = tuple(
         torch.mean(torch.sum(residual * residual, dim=-1)) for residual in residuals
@@ -717,13 +920,11 @@ def pbl_from_unknown(
 def state_rmse_by_type(
     prediction: torch.Tensor,
     target: torch.Tensor,
-    types: torch.Tensor,
+    types: torch.Tensor | TypeLayout,
 ) -> dict[str, float]:
     """RMSE on unknown slots (same packing as pack_case)."""
-    error = prediction - target
-    angle_unknown = (types == 0) | (types == 1)
-    error = error.clone()
-    error[:, angle_unknown, 1] = wrap_angle(error[:, angle_unknown, 1])
+    layout = type_layout(types)
+    error = wrap_angle_errors((prediction - target).clone(), layout)
     out: dict[str, float] = {}
     labels = (
         ("PQ_V", 0, 0),
@@ -734,10 +935,12 @@ def state_rmse_by_type(
         ("slack_Q", 2, 1),
     )
     for name, type_id, slot in labels:
-        mask = types == type_id
-        if not bool(mask.any()):
+        if not layout.present[type_id]:
             continue
-        diff = error[:, mask, slot]
+        if layout.per_case:
+            diff = error[..., slot][layout.masks[type_id]]
+        else:
+            diff = error[:, layout.index[type_id], slot]
         out[name] = float(torch.sqrt(torch.mean(diff * diff)))
     return out
 
@@ -1305,6 +1508,18 @@ class Network:
     pair_embed: torch.Tensor | None = field(default=None, repr=False)
     branches: tuple[tuple[int, int, float, float], ...] | None = field(default=None, repr=False)
     type_key: bytes | None = field(default=None, repr=False, compare=False)
+    layout: TypeLayout | None = field(default=None, repr=False, compare=False)
+
+
+def network_masks(network: Network) -> torch.Tensor:
+    masks = network.pair_type_masks
+    return type_pair_masks(network.types, network.component) if masks is None else masks
+
+
+def network_layout(network: Network) -> TypeLayout:
+    """Shared-type layout with attention blocks; precomputed by ``move_to``, else built on the fly."""
+    layout = getattr(network, "layout", None)
+    return shared_layout(network.types, network_masks(network)) if layout is None else layout
 
 
 def network_type_key(network: Network) -> bytes:
@@ -2396,8 +2611,9 @@ def ensure_task_dataset(work: Path, drive: Path | None, spec: TaskSpec) -> Path:
 
 
 def move_to(network: Network, device: torch.device) -> Network:
-    types = network.types.to(device)
-    component = network.component.to(device)
+    """Device copy with pair-type masks, attention blocks and type key precomputed (``Network.layout``)."""
+    types = host_to_device(network.types, device)
+    component = host_to_device(network.component, device)
     pair_embed = network.pair_embed.to(device) if network.pair_embed is not None else None
     masks = network.pair_type_masks
     if masks is None:
@@ -2405,28 +2621,72 @@ def move_to(network: Network, device: torch.device) -> Network:
     else:
         masks = masks.to(device)
     return Network(
-        ybus=network.ybus.to(device),
-        rpe=network.rpe.to(device, dtype=torch.float32),
+        ybus=host_to_device(network.ybus, device),
+        rpe=host_to_device(network.rpe, device).to(dtype=torch.float32),
         component=component,
         types=types,
         pair_type_masks=masks,
         pair_embed=pair_embed,
         branches=getattr(network, "branches", None),
         type_key=network_type_key(network),
+        layout=shared_layout(types, masks, types_np=network.types.detach().cpu().numpy()),
     )
+
+
+def network_device_bytes(buses: int) -> int:
+    """Device bytes of one moved network: float32 RPE, complex64 Ybus, pair-type and block masks, indices."""
+    pairs = buses * buses
+    return pairs * (RPE_DIM * 4 + 8 + 9 + 1) + buses * 8 * 6
+
+
+def device_cache_budget(device: torch.device) -> int:
+    if device.type == "cuda":
+        free, _total = torch.cuda.mem_get_info(device)
+        return int(min(DEVICE_CACHE_FREE_FRACTION * free, DEVICE_CACHE_MAX_BYTES))
+    return DEVICE_CACHE_CPU_BYTES
 
 
 class DeviceNetworks:
     """Device copies of ``networks`` made on first use; the ``capacity`` most recently used are kept.
 
-    Indexing mirrors a list of moved networks, so thousands of topologies never sit on the GPU at once.
+    Without an explicit ``capacity`` every network stays resident when all of them fit ``budget_bytes``
+    (default ``device_cache_budget``); otherwise the LRU holds as many as the budget allows.
     """
 
-    def __init__(self, networks: list[Network], device: torch.device, capacity: int | None = None) -> None:
+    def __init__(
+        self,
+        networks: list[Network],
+        device: torch.device,
+        capacity: int | None = None,
+        budget_bytes: int | None = None,
+    ) -> None:
         self.networks = networks
         self.device = device
-        self.capacity = max(1, int(DEVICE_NETWORK_CACHE if capacity is None else capacity))
+        buses = int(networks[0].types.numel()) if networks else 0
+        self.bytes_per_network = network_device_bytes(buses)
+        if capacity is None:
+            self.budget_bytes = device_cache_budget(device) if budget_bytes is None else int(budget_bytes)
+            if self.bytes_per_network * len(networks) <= self.budget_bytes:
+                capacity = len(networks)
+            else:
+                capacity = self.budget_bytes // max(self.bytes_per_network, 1)
+        else:
+            self.budget_bytes = int(capacity) * self.bytes_per_network
+        self.capacity = max(1, int(capacity))
         self._moved: OrderedDict[int, Network] = OrderedDict()
+
+    @property
+    def all_resident(self) -> bool:
+        return self.capacity >= len(self.networks)
+
+    def describe(self) -> str:
+        if self.all_resident:
+            total = self.bytes_per_network * len(self.networks)
+            return f"all {len(self.networks)} networks resident ({total / 1024**2:.1f} MB)"
+        return (
+            f"LRU capacity {self.capacity} of {len(self.networks)} networks "
+            f"({self.bytes_per_network / 1024:.0f} KB each, budget {self.budget_bytes / 1024**2:.0f} MB)"
+        )
 
     def __len__(self) -> int:
         return len(self.networks)
@@ -2470,25 +2730,34 @@ def forward_cases(
     device: torch.device,
     pair: torch.Tensor,
     ybus: torch.Tensor | None = None,
+    layout: TypeLayout | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
     """Prediction, target and stage residuals of ``index`` on ``network``'s bus types.
 
     ``pair`` and ``ybus`` default to the shared (N, N, ...) tensors of ``network``; per case they carry
-    a leading batch dimension (cases of topologies that share ``network_type_key``).
+    a leading batch dimension (cases of several topologies). A per-case ``layout`` replaces
+    ``network``'s bus types (topologies with different bus types, see ``PassBatch``).
     """
+    if layout is None:
+        layout = network_layout(network)
     chosen = torch.as_tensor(index, dtype=torch.long)
-    power_p = split.power_p[chosen].to(device, non_blocking=True)
-    power_q = split.power_q[chosen].to(device, non_blocking=True)
-    voltage = split.voltage[chosen].to(device, non_blocking=True)
-    angle = split.angle[chosen].to(device, non_blocking=True)
-    specified, target = pack_case(power_p, power_q, voltage, angle, network.types)
+    if device.type == "cuda":
+        rows = torch.stack((split.power_p[chosen], split.power_q[chosen], split.voltage[chosen], split.angle[chosen]))
+        power_p, power_q, voltage, angle = host_to_device(rows, device).unbind(0)
+    else:
+        power_p = split.power_p[chosen].to(device, non_blocking=True)
+        power_q = split.power_q[chosen].to(device, non_blocking=True)
+        voltage = split.voltage[chosen].to(device, non_blocking=True)
+        angle = split.angle[chosen].to(device, non_blocking=True)
+    specified, target = pack_case(power_p, power_q, voltage, angle, layout)
     prediction, residuals = model(
         specified,
-        network.types,
+        layout.types,
         network.rpe,
         network.pair_type_masks,
         network.ybus if ybus is None else ybus,
         pair=pair,
+        layout=layout,
     )
     return prediction, target, residuals
 
@@ -2501,12 +2770,28 @@ def run_batch(
     device: torch.device,
     pair: torch.Tensor | None = None,
     ybus: torch.Tensor | None = None,
+    layout: TypeLayout | None = None,
 ) -> tuple[TaskLossBreakdown, torch.Tensor]:
+    breakdown, residuals = run_batch_residuals(model, split, network, index, device, pair, ybus, layout)
+    return breakdown, mean_pbl(residuals[-1])
+
+
+def run_batch_residuals(
+    model: TPGT,
+    split: Split,
+    network: Network,
+    index: np.ndarray,
+    device: torch.device,
+    pair: torch.Tensor | None = None,
+    ybus: torch.Tensor | None = None,
+    layout: TypeLayout | None = None,
+) -> tuple[TaskLossBreakdown, list[torch.Tensor]]:
     if pair is None:
         pair = pair_features(model, network)
-    prediction, target, residuals = forward_cases(model, split, network, index, device, pair, ybus)
-    breakdown = task_loss(prediction, target, residuals, network.types)
-    return breakdown, mean_pbl(residuals[-1])
+    if layout is None:
+        layout = network_layout(network)
+    prediction, target, residuals = forward_cases(model, split, network, index, device, pair, ybus, layout)
+    return task_loss(prediction, target, residuals, layout), residuals
 
 
 def group_by_type_pattern(
@@ -2532,24 +2817,191 @@ def stacked_pair_and_ybus(
     return pair, ybus
 
 
+class PassBatch:
+    """Cases of one forward pass over ``networks``; ``owner[k]`` is the network position of ``cases[k]``.
+
+    ``kind`` is "single" (one topology: shared pair embedding, Ybus and blocks), "shared" (topologies with
+    equal ``network_type_key``: shared blocks, per-case pair embeddings and Ybus) or "mixed" (bus types
+    differ: per-case ``TypeLayout`` as well).
+    """
+
+    def __init__(self, networks: list[Network], cases: np.ndarray, owner: np.ndarray | None = None) -> None:
+        self.networks = networks
+        self.cases = np.asarray(cases)
+        self.owner = np.zeros(len(self.cases), dtype=np.int64) if owner is None else np.asarray(owner)
+        self.ybus: torch.Tensor | None = None
+        self.select: torch.Tensor | None = None
+        self.member_layout: TypeLayout | None = None
+        if len(networks) == 1:
+            self.kind = "single"
+            return
+        keys = {network_type_key(network) for network in networks}
+        self.kind = "shared" if len(keys) == 1 else "mixed"
+        self.ybus = torch.stack([network.ybus for network in networks]).to(torch.complex128)
+        self.select = host_to_device(torch.as_tensor(self.owner, dtype=torch.long), self.ybus.device)
+        if self.kind == "mixed":
+            layouts = [network_layout(network) for network in networks]
+            self.member_layout = per_case_layout(
+                torch.stack([layout.types for layout in layouts]),
+                torch.stack([network_masks(network) for network in networks]),
+                types_np=np.stack([layout.types_np for layout in layouts]),
+            )
+
+    @classmethod
+    def from_groups(cls, groups: list[tuple[Network, np.ndarray]]) -> PassBatch:
+        networks = [network for network, _index in groups]
+        if len(groups) == 1:
+            return cls(networks, np.asarray(groups[0][1]))
+        cases = np.concatenate([np.asarray(index) for _network, index in groups])
+        owner = np.repeat(np.arange(len(groups)), [len(index) for _network, index in groups])
+        return cls(networks, cases, owner)
+
+    def __len__(self) -> int:
+        return len(self.cases)
+
+    def encode(self, model: TPGT, keep: torch.Tensor | None = None) -> torch.Tensor:
+        """Pair embeddings: (N, N, D_E) for one topology (cached in eval), else (U, N, N, D_E) in one call."""
+        if self.kind == "single":
+            network = self.networks[0]
+            if not model.training:
+                return pair_features(model, network)
+            rpe = rpe_channel_dropout(network.rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
+            return model.pair_encoder(rpe)
+        rpe = torch.stack([network.rpe for network in self.networks])
+        rpe = rpe_channel_dropout(rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
+        return model.pair_encoder(rpe)
+
+    def run(
+        self,
+        model: TPGT,
+        split: Split,
+        pair: torch.Tensor,
+        device: torch.device,
+        start: int = 0,
+        stop: int | None = None,
+    ) -> tuple[TaskLossBreakdown, list[torch.Tensor]]:
+        """Loss and stage residuals of ``cases[start:stop]`` with ``pair`` (one row per topology) from ``encode``."""
+        chunk = self.cases[start:stop]
+        if self.kind == "single":
+            return run_batch_residuals(model, split, self.networks[0], chunk, device, pair=pair)
+        select = self.select[start:stop]
+        layout = None if self.member_layout is None else self.member_layout.take(select)
+        return run_batch_residuals(
+            model, split, self.networks[0], chunk, device, pair=pair[select], ybus=self.ybus[select], layout=layout
+        )
+
+
+def step_passes(groups: list[tuple[Network, np.ndarray]]) -> list[list[tuple[Network, np.ndarray]]]:
+    """Forward passes of one step: all groups in one pass, or (``SPLIT_DOMINANT_PATTERN``) the largest
+    bus-type pattern in its own pass and every other case in a second one."""
+    if len(groups) == 1 or not SPLIT_DOMINANT_PATTERN:
+        return [groups]
+    patterns = group_by_type_pattern(groups)
+    if len(patterns) == 1:
+        return [groups]
+    dominant = max(patterns, key=lambda members: sum(len(index) for _network, index in members))
+    rest = [member for members in patterns if members is not dominant for member in members]
+    return [dominant, rest]
+
+
+STEP_PHASES = ("move", "pair", "fwd", "bwd", "opt")
+
+
+class StepTimer:
+    """Time per training-step phase (network moves/prep, pair encoder, forward, backward, optimizer).
+
+    On CUDA each phase records two CUDA events, read with one synchronize only when ``summary`` is called,
+    so timing adds no sync to the training loop. Summaries report per-step means since the last
+    ``summary`` (``scope="window"``) or since the timer was made (``scope="epoch"``).
+    """
+
+    def __init__(self, device: torch.device | None = None, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self.cuda = enabled and device is not None and device.type == "cuda"
+        self._pending: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        self._scopes = {"window": self._empty(), "epoch": self._empty()}
+
+    @staticmethod
+    def _empty() -> dict[str, float]:
+        return {"steps": 0, "seconds": 0.0, "passes": 0, "topologies": 0, **dict.fromkeys(STEP_PHASES, 0.0)}
+
+    def _add(self, key: str, value: float) -> None:
+        for totals in self._scopes.values():
+            totals[key] += value
+
+    @contextlib.contextmanager
+    def phase(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        if self.cuda:
+            start = torch.cuda.Event(enable_timing=True)
+            start.record()
+            try:
+                yield
+            finally:
+                end = torch.cuda.Event(enable_timing=True)
+                end.record()
+                self._pending.append((name, start, end))
+            return
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._add(name, time.perf_counter() - started)
+
+    def add_pass(self) -> None:
+        if self.enabled:
+            self._add("passes", 1)
+
+    def end_step(self, topologies: int, seconds: float) -> None:
+        if self.enabled:
+            self._add("steps", 1)
+            self._add("topologies", topologies)
+            self._add("seconds", seconds)
+
+    def _resolve(self) -> None:
+        if not self._pending:
+            return
+        self._pending[-1][2].synchronize()
+        for name, start, end in self._pending:
+            self._add(name, start.elapsed_time(end) / 1000.0)
+        self._pending.clear()
+
+    def summary(self, scope: str = "window") -> str:
+        """``t/step 3.472s (move 1.200 pair 0.300 fwd 0.900 bwd 1.000 opt 0.050) passes 5.1 topo 18.0``."""
+        self._resolve()
+        totals = self._scopes[scope]
+        steps = max(int(totals["steps"]), 1)
+        phases = " ".join(f"{name} {totals[name] / steps:.3f}" for name in STEP_PHASES)
+        text = (
+            f"t/step {totals['seconds'] / steps:.3f}s ({phases}) "
+            f"passes {totals['passes'] / steps:.1f} topo {totals['topologies'] / steps:.1f}"
+        )
+        if scope == "window":
+            self._scopes["window"] = self._empty()
+        return text
+
+
+NO_TIMER = StepTimer(enabled=False)
+
+
 def _weighted_loss_breakdown(
     parts: list[tuple[TaskLossBreakdown, float]],
 ) -> TaskLossBreakdown:
+    """Case-weighted mean of the parts' (detached) losses; stays on the device so logging needs no sync."""
     weight = sum(weight for _breakdown, weight in parts)
     if weight <= 0:
         raise RuntimeError("empty training batch")
-    state = sum(float(b.state_mse.detach()) * w for b, w in parts) / weight
-    phys = sum(float(b.physics_sum.detach()) * w for b, w in parts) / weight
-    stages = tuple(
-        sum(float(b.physics_stages[stage_idx].detach()) * w for b, w in parts) / weight
-        for stage_idx in range(DEPTH)
-    )
-    total = sum(float(b.total.detach()) * w for b, w in parts) / weight
+
+    def mean(values: list[torch.Tensor]) -> torch.Tensor:
+        return (sum(value.double() * w for value, (_b, w) in zip(values, parts)) / weight).float()
+
     return TaskLossBreakdown(
-        torch.tensor(state),
-        torch.tensor(phys),
-        tuple(torch.tensor(value) for value in stages),
-        torch.tensor(total),
+        mean([b.state_mse for b, _w in parts]),
+        mean([b.physics_sum for b, _w in parts]),
+        tuple(mean([b.physics_stages[stage_idx] for b, _w in parts]) for stage_idx in range(DEPTH)),
+        mean([b.total for b, _w in parts]),
     )
 
 
@@ -2581,58 +3033,58 @@ def train_step(
     split: Split,
     groups: list[tuple[Network, np.ndarray]],
     device: torch.device,
+    timer: StepTimer | None = None,
 ) -> TaskLossBreakdown:
     """One optimizer step over all ``groups`` (topology, case index).
 
-    Topologies with the same bus types and components (``network_type_key``) run as one forward/backward
-    with per-case pair embeddings and Ybus; the pair encoder runs once per topology. A pattern with a single
-    topology uses its shared pair embedding and Ybus. Each micro-batch loss is weighted by its share of the
-    step's cases, so the gradient is the mean over every case of the step, exactly as for a single-topology batch.
+    The cases run as one forward/backward (``step_passes``, ``PassBatch``): a single topology with its
+    shared pair embedding and Ybus, several with per-case pair embeddings and Ybus from one pair-encoder
+    call, and per-case bus types when their types differ. Each micro-batch loss is weighted by its share
+    of the step's cases, so the gradient is the mean over every case of the step, exactly as for a
+    single-topology batch.
     """
+    timer = NO_TIMER if timer is None else timer
     n = sum(len(index) for _network, index in groups)
     micro = min(MICRO_BATCH_SIZE, n)
     use_amp = device.type == "cuda"
     optimizer.zero_grad(set_to_none=True)
     logged_parts: list[tuple[TaskLossBreakdown, float]] = []
     keep = rpe_channel_keep(RPE_DIM, RPE_CHANNEL_DROPOUT, model.training, groups[0][0].rpe.device)
-    for members in group_by_type_pattern(groups):
-        network, cases = members[0]
-        stacked_ybus = None
-        if len(members) == 1:
-            rpe = rpe_channel_dropout(network.rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
-            with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
-                pair_embed = model.pair_encoder(rpe)
-        else:
-            cases = np.concatenate([index for _network, index in members])
-            owner = np.repeat(np.arange(len(members)), [len(index) for _network, index in members])
-            with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
-                pair_embed, stacked_ybus = stacked_pair_and_ybus(model, [m for m, _index in members], keep)
-        for start in range(0, len(cases), micro):
-            chunk = cases[start : start + micro]
-            weight = len(chunk) / n
-            retain = start + micro < len(cases)
-            with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
-                if stacked_ybus is None:
-                    breakdown, _score = run_batch(model, split, network, chunk, device, pair=pair_embed)
+    for members in step_passes(groups):
+        with timer.phase("move"):
+            batch = PassBatch.from_groups(members)
+        with timer.phase("pair"), torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
+            pair_embed = batch.encode(model, keep)
+        for start in range(0, len(batch), micro):
+            weight = len(batch.cases[start : start + micro]) / n
+            retain = start + micro < len(batch)
+            with timer.phase("fwd"), torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
+                breakdown, _residuals = batch.run(model, split, pair_embed, device, start, start + micro)
+            with timer.phase("bwd"):
+                scaled = breakdown.total * weight
+                if scaler is not None:
+                    scaler.scale(scaled).backward(retain_graph=retain)
                 else:
-                    select = torch.as_tensor(owner[start : start + micro], device=stacked_ybus.device)
-                    breakdown, _score = run_batch(
-                        model, split, network, chunk, device, pair=pair_embed[select], ybus=stacked_ybus[select]
-                    )
-            scaled = breakdown.total * weight
-            if scaler is not None:
-                scaler.scale(scaled).backward(retain_graph=retain)
-            else:
-                scaled.backward(retain_graph=retain)
-            logged_parts.append((breakdown, weight))
-            if device.type == "cuda":
-                del breakdown, scaled
-    if scaler is not None:
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        optimizer.step()
+                    scaled.backward(retain_graph=retain)
+            timer.add_pass()
+            logged_parts.append((detached_breakdown(breakdown), weight))
+            del breakdown, scaled, _residuals
+    with timer.phase("opt"):
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
     return _weighted_loss_breakdown(logged_parts)
+
+
+def detached_breakdown(breakdown: TaskLossBreakdown) -> TaskLossBreakdown:
+    return TaskLossBreakdown(
+        breakdown.state_mse.detach(),
+        breakdown.physics_sum.detach(),
+        tuple(stage.detach() for stage in breakdown.physics_stages),
+        breakdown.total.detach(),
+    )
 
 
 def train_batch(
@@ -2694,12 +3146,13 @@ def iterate_indexes(
             yield network_id, index[start : start + batch_size]
 
 
-def iterate_type_batches(split: Split, batch_size: int = EVAL_BATCH_SIZE):
+def iterate_type_batches(split: Split, batch_size: int = EVAL_BATCH_SIZE, mix_patterns: bool = False):
     """Batches of up to ``batch_size`` cases whose topologies share ``network_type_key``.
 
     Patterns in order of their first network id; within a pattern, networks in id order and cases in
     split order. Yields (network id per case, case index). With one topology this matches
-    ``iterate_indexes`` without shuffling.
+    ``iterate_indexes`` without shuffling. ``mix_patterns`` keeps the order but fills every batch,
+    so a batch may span bus-type patterns.
     """
     keys: dict[bytes, int] = {}
     pattern = np.array(
@@ -2708,7 +3161,7 @@ def iterate_type_batches(split: Split, batch_size: int = EVAL_BATCH_SIZE):
     network_index = split.network_index.numpy()
     case_pattern = pattern[network_index]
     order = np.lexsort((np.arange(split.count), network_index, case_pattern))
-    bounds = np.flatnonzero(np.diff(case_pattern[order])) + 1
+    bounds = [] if mix_patterns else np.flatnonzero(np.diff(case_pattern[order])) + 1
     for run in np.split(order, bounds):
         for start in range(0, len(run), batch_size):
             index = run[start : start + batch_size]
@@ -2723,26 +3176,31 @@ def evaluate_pbl(
     batch_size: int = EVAL_BATCH_SIZE,
     per_network_out: dict[int, list[float]] | None = None,
 ) -> float:
-    """Mean final-stage PBL over ``split``; topologies sharing bus types are batched together."""
+    """Mean final-stage PBL over ``split`` in full batches (several topologies and bus types per batch).
+
+    A single-topology batch reuses that topology's cached pair embedding, dropped once its cases are done.
+    """
     model.eval()
     clear_pair_embed_cache(networks)
     total = 0.0
     seen = 0
+    cached: dict[int, Network] = {}
     with torch.no_grad():
-        for owners, index in iterate_type_batches(split, batch_size=batch_size):
+        for owners, index in iterate_type_batches(split, batch_size=batch_size, mix_patterns=True):
             ids, inverse = np.unique(owners, return_inverse=True)
             inverse = inverse.reshape(-1)
+            for network_id in [key for key in cached if key not in set(ids.tolist())]:
+                cached.pop(network_id).pair_embed = None
             if len(ids) == 1:
-                _breakdown, score = run_batch(model, split, networks[int(ids[0])], index, device)
+                network = networks[int(ids[0])]
+                _breakdown, score = run_batch(model, split, network, index, device)
+                cached[int(ids[0])] = network
                 sums = [float(score) * len(index)]
                 counts = [len(index)]
             else:
-                members = [networks[int(network_id)] for network_id in ids]
-                pair, ybus = stacked_pair_and_ybus(model, members)
-                select = torch.as_tensor(inverse, device=ybus.device)
-                pair, ybus = pair[select], ybus[select]
-                _prediction, _target, residuals = forward_cases(model, split, members[0], index, device, pair, ybus)
-                del pair, ybus
+                batch = PassBatch([networks[int(network_id)] for network_id in ids], index, inverse)
+                _breakdown, residuals = batch.run(model, split, batch.encode(model), device)
+                del batch
                 per_case = case_pbl(residuals[-1]).double().cpu().numpy()
                 sums = np.bincount(inverse, weights=per_case, minlength=len(ids)).tolist()
                 counts = np.bincount(inverse, minlength=len(ids)).tolist()
@@ -2753,6 +3211,8 @@ def evaluate_pbl(
                     bucket = per_network_out.setdefault(int(network_id), [0.0, 0.0])
                     bucket[0] += weighted
                     bucket[1] += cases
+    for network in cached.values():
+        network.pair_embed = None
     if seen != split.count:
         raise RuntimeError(f"Evaluated {seen} of {split.count} scenarios in {split.name}.")
     return total / seen
@@ -2921,14 +3381,16 @@ def train_epoch_loss_line(
     train_total: float,
     val_display: str,
     lr: float | None = None,
+    timing: str | None = None,
 ) -> str:
     n = max(batches, 1)
     stage_text = "  ".join(f"phys_s{i + 1} {value / n:.4f}" for i, value in enumerate(physics_stages))
     lr_text = "" if lr is None else f"  lr {lr:.1e}"
+    timing_text = "" if timing is None else f"  {timing}"
     return (
         f"seed {seed} epoch {epoch_number}/{EPOCHS}  "
         f"state {state_mse / n:.4f}  phys_w {physics_sum / n:.4f}  {stage_text}  "
-        f"train {train_total / n:.4f}  val_pbl {val_display}{lr_text}"
+        f"train {train_total / n:.4f}  val_pbl {val_display}{lr_text}{timing_text}"
     )
 
 
@@ -2978,8 +3440,17 @@ def train_seed(
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = make_lr_scheduler(optimizer)
     grad_scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
-    train_networks = DeviceNetworks(train_split.networks, device)
-    val_networks = DeviceNetworks(val_split.networks, device)
+    cache_budget = device_cache_budget(device)
+    train_share = len(train_split.networks) / max(len(train_split.networks) + len(val_split.networks), 1)
+    train_networks = DeviceNetworks(train_split.networks, device, budget_bytes=int(cache_budget * train_share))
+    val_networks = DeviceNetworks(
+        val_split.networks, device, budget_bytes=cache_budget - int(cache_budget * train_share)
+    )
+    print(
+        f"device network cache (budget {cache_budget / 1024**2:.0f} MB): "
+        f"train {train_networks.describe()}; valid {val_networks.describe()}",
+        flush=True,
+    )
     train_probe = train_probe_split(train_split, min(val_split.count, TRAIN_PROBE_CASES))
     start_epoch = 0
     best_val = float("inf")
@@ -3108,25 +3579,28 @@ def train_seed(
             model.train()
             clear_pair_embed_cache(train_networks)
             clear_pair_embed_cache(val_networks)
-            running_total = 0.0
-            running_state = 0.0
-            running_phys = 0.0
-            running_phys_stages = [0.0] * DEPTH
+            # Loss sums (total, state, physics, stages) stay on the device in float64 until printed.
+            running = torch.zeros(3 + DEPTH, dtype=torch.float64, device=device)
             batches = 0
             logged_first_batch = False
             batch_durations: list[float] = []
+            timer = StepTimer(device)
             for step_groups in iterate_steps(train_split, seed, epoch):
                 if not logged_first_batch:
                     first_batch_started = time.perf_counter()
                 step_started = time.perf_counter()
+                with timer.phase("move"):
+                    moved = [(train_networks[network_id], index) for network_id, index in step_groups]
                 breakdown = train_step(
                     model,
                     optimizer,
                     grad_scaler if device.type == "cuda" else None,
                     train_split,
-                    [(train_networks[network_id], index) for network_id, index in step_groups],
+                    moved,
                     device,
+                    timer=timer,
                 )
+                del moved
                 if not logged_first_batch:
                     if device.type == "cuda":
                         torch.cuda.synchronize()
@@ -3140,11 +3614,9 @@ def train_seed(
                     )
                     logged_first_batch = True
                 batch_durations.append(time.perf_counter() - step_started)
-                running_total += float(breakdown.total.detach())
-                running_state += float(breakdown.state_mse.detach())
-                running_phys += float(breakdown.physics_sum.detach())
-                for stage_idx, stage_mse in enumerate(breakdown.physics_stages):
-                    running_phys_stages[stage_idx] += float(stage_mse.detach())
+                timer.end_step(len(step_groups), batch_durations[-1])
+                losses = (breakdown.total, breakdown.state_mse, breakdown.physics_sum, *breakdown.physics_stages)
+                running += torch.stack([value.detach().to(device) for value in losses]).double()
                 batches += 1
                 if batches % 250 == 0:
                     if device.type == "cuda":
@@ -3152,10 +3624,12 @@ def train_seed(
                     window = batch_durations[-250:]
                     avg_sec = sum(window) / len(window)
                     print(
-                        f"  seed {seed} epoch {epoch + 1} batch {batches} train {running_total / batches:.4f} "
-                        f"avg {avg_sec:.3f}s/batch (last {len(window)})",
+                        f"  seed {seed} epoch {epoch + 1} batch {batches} train {float(running[0]) / batches:.4f} "
+                        f"avg {avg_sec:.3f}s/batch (last {len(window)})  {timer.summary()}",
                         flush=True,
                     )
+            running_total, running_state, running_phys, *running_phys_stages = running.tolist()
+            epoch_timing = timer.summary("epoch")
             run_validation = val_every <= 1 or (epoch + 1) % val_every == 0 or (epoch + 1) == EPOCHS
             if run_validation:
                 if device.type == "cuda":
@@ -3206,6 +3680,7 @@ def train_seed(
                     running_total,
                     val_display,
                     lr=current_lr(optimizer),
+                    timing=epoch_timing,
                 ),
                 flush=True,
             )
