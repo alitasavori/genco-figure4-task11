@@ -10,8 +10,10 @@ Tasks (``--task`` or ``GENCO_TPGT_TASK``; see ``TASKS``)
 train/valid folders (each cached and cut to ``DATA_FRACTION`` on its own, then merged); every task
 is tested on N, N-1, N-2 and C2I. Task 1.1 keeps ``tpgt_task11_<RUN_TAG>``; other tasks write to
 ``tpgt_task<id>_<RUN_TAG>`` (results inside it). Each optimizer step takes the next 32 cases of
-one global shuffle and runs one forward/backward per topology among them; networks stay on the
-CPU and only those in use are moved to the device (``DeviceNetworks``). Checkpoint epochs also
+one global shuffle and runs one forward/backward per bus-type pattern among them (topologies with
+equal bus types and components, e.g. line outages of one grid, share a forward with per-case pair
+embeddings and Ybus); networks stay on the CPU and only those in use are moved to the device
+(``DeviceNetworks``). Validation and test batch the same way. Checkpoint epochs also
 write a bar plot against the published numbers and IEEE 118 bus error maps.
 The hidden sizes, depth, batch, and epoch cap below are implementation
 choices so a Colab GPU can finish a run. They are not paper hyperparameters.
@@ -40,9 +42,10 @@ Performance notes (Colab / large train split)
 * **``meshed_rpe``**: Computed only when building or refreshing the split cache,
   once per *distinct* in-service topology (see ``read_split`` representatives),
   not per scenario and not per training batch.
-* **``pair_encoder``**: Runs once per forward on the static ``118×118`` RPE for
-  the batch's topology. Weights train, so training must re-encode every step;
-  in ``eval`` mode encoded pairs are cached on ``Network.pair_embed``.
+* **``pair_encoder``**: Runs once per forward on the static ``118×118`` RPEs of
+  the batch's topologies (stacked when several share bus types). Weights train, so
+  training must re-encode every step; in ``eval`` mode a single-topology batch
+  caches its encoded pairs on ``Network.pair_embed``.
 * **Type-pair attention**: ``CorrectionStage._messages`` evaluates each of the
   nine type-pair weight sets only on its own receiver-type × sender-type block
   (both heads batched), then takes one softmax over all senders per receiver.
@@ -467,7 +470,8 @@ class CorrectionStage(nn.Module):
         """Each type pair's weights see only its own receiver-type x sender-type block.
 
         Block scores are scattered into one (batch, heads, N, N) score matrix so the softmax
-        runs over all senders of a receiver; cross-component entries stay -inf.
+        runs over all senders of a receiver; cross-component entries stay -inf. ``pair`` is either
+        shared by the batch (N, N, E) or per case (batch, N, N, E) for topologies with equal bus types.
         """
         batch, buses, _ = hidden.shape
         scores: torch.Tensor | None = None
@@ -479,10 +483,15 @@ class CorrectionStage(nn.Module):
             query = torch.einsum("bnd,had->bhna", hidden[:, block.receivers], self.w_q[p])
             key = torch.einsum("bnd,had->bhna", hidden[:, block.senders], self.w_k[p])
             mixed = rho_nonlinearity(query.unsqueeze(-2) + key.unsqueeze(-3))
-            edge = pair[receivers, senders]
-            projected = torch.einsum("nme,hae->hnma", edge, self.w_ew[p])
-            bias = torch.einsum("nme,hae->hnma", edge, self.w_eb[p])
-            interaction = torch.relu(mixed * projected.unsqueeze(0) + bias.unsqueeze(0))
+            if pair.dim() == 3:
+                edge = pair[receivers, senders]
+                projected = torch.einsum("nme,hae->hnma", edge, self.w_ew[p]).unsqueeze(0)
+                bias = torch.einsum("nme,hae->hnma", edge, self.w_eb[p]).unsqueeze(0)
+            else:
+                edge = pair[:, receivers, senders]
+                projected = torch.einsum("bnme,hae->bhnma", edge, self.w_ew[p])
+                bias = torch.einsum("bnme,hae->bhnma", edge, self.w_eb[p])
+            interaction = torch.relu(mixed * projected + bias)
             score = torch.einsum("bhnma,ha->bhnm", interaction, self.w_a[p, :, 0])
             score = score.masked_fill(~block.mask, float("-inf"))
             if scores is None:
@@ -630,13 +639,17 @@ def nodal_residual(
 ) -> torch.Tensor:
     """AC mismatch in per unit. Ybus is already per unit, so this does not divide by baseMVA again.
 
+    ``ybus`` is shared (N, N) or per case (batch, N, N).
     Evaluated in complex128: with TF32 enabled, a complex64 Ybus matmul on CUDA has a ~0.02 p.u. mean
     error floor on case118 (|Y| up to ~390 with heavy cancellation), 10^4 x the label accuracy.
     """
     physical = constrain_unknown(unknown, types)
     power_p, power_q, voltage, angle = assemble(specified, physical, types)
     voltage_complex = voltage.double() * torch.exp(1j * angle.double())
-    current = torch.matmul(ybus.to(torch.complex128), voltage_complex.transpose(0, 1)).transpose(0, 1)
+    if ybus.dim() == 2:
+        current = torch.matmul(ybus.to(torch.complex128), voltage_complex.transpose(0, 1)).transpose(0, 1)
+    else:
+        current = torch.matmul(ybus.to(torch.complex128), voltage_complex.unsqueeze(-1)).squeeze(-1)
     flow = voltage_complex * torch.conj(current)
     residual = torch.stack((power_p.double() - flow.real, power_q.double() - flow.imag), dim=-1)
     return residual.float()
@@ -675,6 +688,11 @@ def task_loss(
 
 def mean_pbl(residual: torch.Tensor) -> torch.Tensor:
     return torch.mean(torch.sqrt(residual[..., 0] ** 2 + residual[..., 1] ** 2))
+
+
+def case_pbl(residual: torch.Tensor) -> torch.Tensor:
+    """Mean PBL over buses for each case; residual shape (batch, buses, 2)."""
+    return torch.mean(torch.sqrt(residual[..., 0] ** 2 + residual[..., 1] ** 2), dim=-1)
 
 
 def pbl_stats(residual: torch.Tensor) -> dict[str, float]:
@@ -1286,6 +1304,18 @@ class Network:
     pair_type_masks: torch.Tensor | None = field(default=None, repr=False)
     pair_embed: torch.Tensor | None = field(default=None, repr=False)
     branches: tuple[tuple[int, int, float, float], ...] | None = field(default=None, repr=False)
+    type_key: bytes | None = field(default=None, repr=False, compare=False)
+
+
+def network_type_key(network: Network) -> bytes:
+    """Bus types and component labels as bytes; networks with equal keys share attention blocks and masks."""
+    key = getattr(network, "type_key", None)
+    if key is None:
+        types = network.types.detach().cpu().numpy().astype(np.int64)
+        component = network.component.detach().cpu().numpy().astype(np.int64)
+        key = np.int64(types.size).tobytes() + types.tobytes() + component.tobytes()
+        network.type_key = key
+    return key
 
 
 @dataclass
@@ -2382,6 +2412,7 @@ def move_to(network: Network, device: torch.device) -> Network:
         pair_type_masks=masks,
         pair_embed=pair_embed,
         branches=getattr(network, "branches", None),
+        type_key=network_type_key(network),
     )
 
 
@@ -2431,6 +2462,37 @@ def pair_features(model: TPGT, network: Network) -> torch.Tensor:
     return encoded
 
 
+def forward_cases(
+    model: TPGT,
+    split: Split,
+    network: Network,
+    index: np.ndarray,
+    device: torch.device,
+    pair: torch.Tensor,
+    ybus: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+    """Prediction, target and stage residuals of ``index`` on ``network``'s bus types.
+
+    ``pair`` and ``ybus`` default to the shared (N, N, ...) tensors of ``network``; per case they carry
+    a leading batch dimension (cases of topologies that share ``network_type_key``).
+    """
+    chosen = torch.as_tensor(index, dtype=torch.long)
+    power_p = split.power_p[chosen].to(device, non_blocking=True)
+    power_q = split.power_q[chosen].to(device, non_blocking=True)
+    voltage = split.voltage[chosen].to(device, non_blocking=True)
+    angle = split.angle[chosen].to(device, non_blocking=True)
+    specified, target = pack_case(power_p, power_q, voltage, angle, network.types)
+    prediction, residuals = model(
+        specified,
+        network.types,
+        network.rpe,
+        network.pair_type_masks,
+        network.ybus if ybus is None else ybus,
+        pair=pair,
+    )
+    return prediction, target, residuals
+
+
 def run_batch(
     model: TPGT,
     split: Split,
@@ -2438,25 +2500,36 @@ def run_batch(
     index: np.ndarray,
     device: torch.device,
     pair: torch.Tensor | None = None,
+    ybus: torch.Tensor | None = None,
 ) -> tuple[TaskLossBreakdown, torch.Tensor]:
-    chosen = torch.as_tensor(index, dtype=torch.long)
-    power_p = split.power_p[chosen].to(device, non_blocking=True)
-    power_q = split.power_q[chosen].to(device, non_blocking=True)
-    voltage = split.voltage[chosen].to(device, non_blocking=True)
-    angle = split.angle[chosen].to(device, non_blocking=True)
-    specified, target = pack_case(power_p, power_q, voltage, angle, network.types)
     if pair is None:
         pair = pair_features(model, network)
-    prediction, residuals = model(
-        specified,
-        network.types,
-        network.rpe,
-        network.pair_type_masks,
-        network.ybus,
-        pair=pair,
-    )
+    prediction, target, residuals = forward_cases(model, split, network, index, device, pair, ybus)
     breakdown = task_loss(prediction, target, residuals, network.types)
     return breakdown, mean_pbl(residuals[-1])
+
+
+def group_by_type_pattern(
+    groups: list[tuple[Network, np.ndarray]],
+) -> list[list[tuple[Network, np.ndarray]]]:
+    """(network, case index) pairs split by ``network_type_key``, patterns and members in order of appearance."""
+    by_key: dict[bytes, list[tuple[Network, np.ndarray]]] = {}
+    for network, index in groups:
+        by_key.setdefault(network_type_key(network), []).append((network, np.asarray(index)))
+    return list(by_key.values())
+
+
+def stacked_pair_and_ybus(
+    model: TPGT,
+    networks: list[Network],
+    keep: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pair embeddings (U, N, N, D_E) from one pair-encoder call and complex128 Ybus (U, N, N)."""
+    rpe = torch.stack([network.rpe for network in networks])
+    rpe = rpe_channel_dropout(rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
+    pair = model.pair_encoder(rpe)
+    ybus = torch.stack([network.ybus for network in networks]).to(torch.complex128)
+    return pair, ybus
 
 
 def _weighted_loss_breakdown(
@@ -2509,10 +2582,12 @@ def train_step(
     groups: list[tuple[Network, np.ndarray]],
     device: torch.device,
 ) -> TaskLossBreakdown:
-    """One optimizer step over all ``groups`` (topology, case index), each forwarded on its own network.
+    """One optimizer step over all ``groups`` (topology, case index).
 
-    Each micro-batch loss is weighted by its share of the step's cases, so the gradient is the mean over
-    every case of the step, exactly as for a single-topology batch.
+    Topologies with the same bus types and components (``network_type_key``) run as one forward/backward
+    with per-case pair embeddings and Ybus; the pair encoder runs once per topology. A pattern with a single
+    topology uses its shared pair embedding and Ybus. Each micro-batch loss is weighted by its share of the
+    step's cases, so the gradient is the mean over every case of the step, exactly as for a single-topology batch.
     """
     n = sum(len(index) for _network, index in groups)
     micro = min(MICRO_BATCH_SIZE, n)
@@ -2520,17 +2595,30 @@ def train_step(
     optimizer.zero_grad(set_to_none=True)
     logged_parts: list[tuple[TaskLossBreakdown, float]] = []
     keep = rpe_channel_keep(RPE_DIM, RPE_CHANNEL_DROPOUT, model.training, groups[0][0].rpe.device)
-    for network, index in groups:
-        cases = np.asarray(index)
-        rpe = rpe_channel_dropout(network.rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
-        with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
-            pair_embed = model.pair_encoder(rpe)
+    for members in group_by_type_pattern(groups):
+        network, cases = members[0]
+        stacked_ybus = None
+        if len(members) == 1:
+            rpe = rpe_channel_dropout(network.rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
+            with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
+                pair_embed = model.pair_encoder(rpe)
+        else:
+            cases = np.concatenate([index for _network, index in members])
+            owner = np.repeat(np.arange(len(members)), [len(index) for _network, index in members])
+            with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
+                pair_embed, stacked_ybus = stacked_pair_and_ybus(model, [m for m, _index in members], keep)
         for start in range(0, len(cases), micro):
             chunk = cases[start : start + micro]
             weight = len(chunk) / n
             retain = start + micro < len(cases)
             with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
-                breakdown, _score = run_batch(model, split, network, chunk, device, pair=pair_embed)
+                if stacked_ybus is None:
+                    breakdown, _score = run_batch(model, split, network, chunk, device, pair=pair_embed)
+                else:
+                    select = torch.as_tensor(owner[start : start + micro], device=stacked_ybus.device)
+                    breakdown, _score = run_batch(
+                        model, split, network, chunk, device, pair=pair_embed[select], ybus=stacked_ybus[select]
+                    )
             scaled = breakdown.total * weight
             if scaler is not None:
                 scaler.scale(scaled).backward(retain_graph=retain)
@@ -2606,6 +2694,27 @@ def iterate_indexes(
             yield network_id, index[start : start + batch_size]
 
 
+def iterate_type_batches(split: Split, batch_size: int = EVAL_BATCH_SIZE):
+    """Batches of up to ``batch_size`` cases whose topologies share ``network_type_key``.
+
+    Patterns in order of their first network id; within a pattern, networks in id order and cases in
+    split order. Yields (network id per case, case index). With one topology this matches
+    ``iterate_indexes`` without shuffling.
+    """
+    keys: dict[bytes, int] = {}
+    pattern = np.array(
+        [keys.setdefault(network_type_key(network), len(keys)) for network in split.networks], dtype=np.int64
+    )
+    network_index = split.network_index.numpy()
+    case_pattern = pattern[network_index]
+    order = np.lexsort((np.arange(split.count), network_index, case_pattern))
+    bounds = np.flatnonzero(np.diff(case_pattern[order])) + 1
+    for run in np.split(order, bounds):
+        for start in range(0, len(run), batch_size):
+            index = run[start : start + batch_size]
+            yield network_index[index], index
+
+
 def evaluate_pbl(
     model: TPGT,
     split: Split,
@@ -2614,20 +2723,36 @@ def evaluate_pbl(
     batch_size: int = EVAL_BATCH_SIZE,
     per_network_out: dict[int, list[float]] | None = None,
 ) -> float:
+    """Mean final-stage PBL over ``split``; topologies sharing bus types are batched together."""
     model.eval()
     clear_pair_embed_cache(networks)
     total = 0.0
     seen = 0
     with torch.no_grad():
-        for network_id, index in iterate_indexes(split, seed=0, epoch=0, shuffle=False, batch_size=batch_size):
-            _breakdown, score = run_batch(model, split, networks[network_id], index, device)
-            weighted = float(score) * len(index)
-            total += weighted
-            seen += len(index)
-            if per_network_out is not None:
-                bucket = per_network_out.setdefault(network_id, [0.0, 0.0])
-                bucket[0] += weighted
-                bucket[1] += len(index)
+        for owners, index in iterate_type_batches(split, batch_size=batch_size):
+            ids, inverse = np.unique(owners, return_inverse=True)
+            inverse = inverse.reshape(-1)
+            if len(ids) == 1:
+                _breakdown, score = run_batch(model, split, networks[int(ids[0])], index, device)
+                sums = [float(score) * len(index)]
+                counts = [len(index)]
+            else:
+                members = [networks[int(network_id)] for network_id in ids]
+                pair, ybus = stacked_pair_and_ybus(model, members)
+                select = torch.as_tensor(inverse, device=ybus.device)
+                pair, ybus = pair[select], ybus[select]
+                _prediction, _target, residuals = forward_cases(model, split, members[0], index, device, pair, ybus)
+                del pair, ybus
+                per_case = case_pbl(residuals[-1]).double().cpu().numpy()
+                sums = np.bincount(inverse, weights=per_case, minlength=len(ids)).tolist()
+                counts = np.bincount(inverse, minlength=len(ids)).tolist()
+            for network_id, weighted, cases in zip(ids, sums, counts):
+                total += weighted
+                seen += cases
+                if per_network_out is not None:
+                    bucket = per_network_out.setdefault(int(network_id), [0.0, 0.0])
+                    bucket[0] += weighted
+                    bucket[1] += cases
     if seen != split.count:
         raise RuntimeError(f"Evaluated {seen} of {split.count} scenarios in {split.name}.")
     return total / seen

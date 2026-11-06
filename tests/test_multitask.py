@@ -357,6 +357,184 @@ def test_one_dropout_draw_per_step_for_every_topology(monkeypatch):
         assert len(set(dropped)) == 1
 
 
+def float64_split(split: tpgt.Split, networks: list[tpgt.Network]) -> tuple[tpgt.Split, list[tpgt.Network]]:
+    wide = [
+        tpgt.Network(
+            ybus=network.ybus.to(torch.complex128),
+            rpe=network.rpe.double(),
+            component=network.component,
+            types=network.types,
+            pair_type_masks=tpgt.type_pair_masks(network.types, network.component),
+        )
+        for network in networks
+    ]
+    return (
+        tpgt.Split(
+            name=split.name,
+            count=split.count,
+            power_p=split.power_p.double(),
+            power_q=split.power_q.double(),
+            voltage=split.voltage.double(),
+            angle=split.angle.double(),
+            network_index=split.network_index,
+            networks=wide,
+        ),
+        wide,
+    )
+
+
+def test_type_key_groups_line_outages_but_not_generator_outages():
+    _split, networks = consistent_split(three_bus_topologies(), [1, 1, 1])
+    keys = [tpgt.network_type_key(network) for network in networks]
+    assert keys[0] == keys[1] != keys[2]
+    moved = tpgt.move_to(networks[0], torch.device("cpu"))
+    assert moved.type_key == keys[0]
+    islanded = tpgt.Network(
+        ybus=networks[0].ybus, rpe=networks[0].rpe, component=torch.tensor([0, 0, 1]), types=networks[0].types
+    )
+    assert tpgt.network_type_key(islanded) != keys[0]
+    groups = tpgt.group_by_type_pattern([(networks[2], [4]), (networks[0], [0, 1]), (networks[1], [2])])
+    assert [[network is networks[i] for network, _index in group] for group, i in zip(groups, (2, 0))] == [
+        [True],
+        [True, False],
+    ]
+    assert groups[1][1][0] is networks[1]
+
+
+def test_batched_forward_matches_per_network_forwards():
+    split, networks = float64_split(*consistent_split(three_bus_topologies(), [3, 2, 1], seed=4))
+    torch.manual_seed(0)
+    model = tpgt.TPGT().double()
+    model.eval()
+    device = torch.device("cpu")
+    index = np.array([0, 3, 1, 4, 2])
+    owner = torch.tensor([0, 1, 0, 1, 0])
+    with torch.no_grad():
+        pair, ybus = tpgt.stacked_pair_and_ybus(model, networks[:2])
+        prediction, _target, residuals = tpgt.forward_cases(
+            model, split, networks[0], index, device, pair[owner], ybus[owner]
+        )
+        for net in (0, 1):
+            rows = (owner == net).nonzero().flatten()
+            alone, _target, alone_residuals = tpgt.forward_cases(
+                model, split, networks[net], index[rows.numpy()], device, model.pair_encoder(networks[net].rpe)
+            )
+            assert torch.allclose(prediction[rows], alone, rtol=0, atol=1e-12)
+            for stage, stage_alone in zip(residuals, alone_residuals):
+                assert torch.allclose(stage[rows], stage_alone, rtol=1e-6, atol=1e-7)
+            specified = torch.randn(2, 3, 2, dtype=torch.float64)
+            unknown = torch.randn(2, 3, 2, dtype=torch.float64)
+            shared = tpgt.nodal_residual(specified, unknown, networks[net].types, networks[net].ybus)
+            per_case = tpgt.nodal_residual(
+                specified, unknown, networks[net].types, networks[net].ybus.expand(2, 3, 3)
+            )
+            assert torch.equal(shared, per_case)
+
+
+@pytest.mark.parametrize("micro", [32, 3])
+def test_grouped_step_gradient_equals_per_network_accumulation(monkeypatch, micro):
+    monkeypatch.setattr(tpgt, "RPE_CHANNEL_DROPOUT", 0.0)
+    monkeypatch.setattr(tpgt, "MICRO_BATCH_SIZE", micro)
+    split, networks = float64_split(*consistent_split(three_bus_topologies(), [5, 4, 3], seed=7))
+    torch.manual_seed(0)
+    model = tpgt.TPGT().double()
+    model.train()
+    device = torch.device("cpu")
+    owners = split.network_index.numpy()
+    chosen = np.array([0, 7, 11, 1, 6, 2, 10, 8, 5, 3])
+    groups = [(net, chosen[owners[chosen] == net]) for net in (0, 2, 1)]
+    model.zero_grad()
+    total = 0.0
+    for net, index in groups:
+        breakdown, _score = tpgt.run_batch(model, split, networks[net], index, device)
+        (breakdown.total * len(index) / len(chosen)).backward()
+        total += float(breakdown.total.detach()) * len(index) / len(chosen)
+    reference = [param.grad.clone() for param in model.parameters()]
+    forwards: list[int] = []
+    encodes: list[tuple[int, ...]] = []
+    model.register_forward_hook(lambda _module, inputs, _output: forwards.append(inputs[0].shape[0]))
+    model.pair_encoder.register_forward_hook(lambda _module, inputs, _output: encodes.append(tuple(inputs[0].shape)))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    logged = tpgt.train_step(model, optimizer, None, split, [(networks[net], index) for net, index in groups], device)
+    assert encodes == [(2, 3, 3, 5), (3, 3, 5)]
+    assert forwards == ([8, 2] if micro == 32 else [3, 3, 2, 2])
+    assert float(logged.total) == pytest.approx(total, rel=1e-7)
+    for expected, param in zip(reference, model.parameters()):
+        assert torch.allclose(param.grad, expected, rtol=1e-10, atol=1e-12)
+
+
+def old_single_network_step(model, optimizer, split, network, index, device) -> None:
+    """``train_step`` of 9932e7e for one topology (micro-batch 32, no AMP)."""
+    optimizer.zero_grad(set_to_none=True)
+    keep = tpgt.rpe_channel_keep(tpgt.RPE_DIM, tpgt.RPE_CHANNEL_DROPOUT, model.training, network.rpe.device)
+    rpe = tpgt.rpe_channel_dropout(network.rpe, tpgt.RPE_CHANNEL_DROPOUT, model.training, keep=keep)
+    pair_embed = model.pair_encoder(rpe)
+    breakdown, _score = tpgt.run_batch(model, split, network, np.asarray(index), device, pair=pair_embed)
+    (breakdown.total * 1.0).backward()
+    optimizer.step()
+
+
+def test_single_topology_step_is_bitwise_unchanged(monkeypatch):
+    monkeypatch.setattr(tpgt, "RPE_CHANNEL_DROPOUT", 0.5)
+    split, cpu_network = tiny_consistent_split(cases=12)
+    network = tpgt.move_to(cpu_network, torch.device("cpu"))
+    models = []
+    for step in (old_single_network_step, None):
+        torch.manual_seed(3)
+        model = tpgt.TPGT()
+        model.train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        for batch in (np.arange(6), np.arange(6, 12), np.arange(4)):
+            if step is None:
+                tpgt.train_step(model, optimizer, None, split, [(network, batch)], torch.device("cpu"))
+            else:
+                step(model, optimizer, split, network, batch, torch.device("cpu"))
+        models.append(model.state_dict())
+    for key, value in models[0].items():
+        assert torch.equal(value, models[1][key]), key
+
+
+def test_iterate_type_batches_groups_patterns_in_network_order():
+    split, _networks = consistent_split(three_bus_topologies(), [5, 4, 3])
+    split.network_index = torch.tensor([1, 0, 2, 0, 1, 0, 2, 1, 0, 1, 2, 0])
+    batches = [(owners.tolist(), index.tolist()) for owners, index in tpgt.iterate_type_batches(split, batch_size=4)]
+    assert batches == [
+        ([0, 0, 0, 0], [1, 3, 5, 8]),
+        ([0, 1, 1, 1], [11, 0, 4, 7]),
+        ([1], [9]),
+        ([2, 2, 2], [2, 6, 10]),
+    ]
+    single, _network = tiny_consistent_split(cases=75)
+    expected = [index.tolist() for _net, index in tpgt.iterate_indexes(single, 0, 0, shuffle=False, batch_size=32)]
+    assert [index.tolist() for _owners, index in tpgt.iterate_type_batches(single, batch_size=32)] == expected
+
+
+def test_grouped_evaluate_pbl_matches_per_network_evaluation():
+    split, networks = consistent_split(three_bus_topologies(), [5, 4, 3], seed=5)
+    torch.manual_seed(0)
+    model = tpgt.TPGT()
+    model.eval()
+    device = torch.device("cpu")
+    eager = [tpgt.move_to(network, device) for network in networks]
+    reference: dict[int, list[float]] = {}
+    with torch.no_grad():
+        for net, index in tpgt.iterate_indexes(split, 0, 0, shuffle=False, batch_size=4):
+            _breakdown, score = tpgt.run_batch(model, split, eager[net], index, device)
+            bucket = reference.setdefault(net, [0.0, 0.0])
+            bucket[0] += float(score) * len(index)
+            bucket[1] += len(index)
+    forwards: list[int] = []
+    model.register_forward_hook(lambda _module, inputs, _output: forwards.append(inputs[0].shape[0]))
+    per_network: dict[int, list[float]] = {}
+    score = tpgt.evaluate_pbl(model, split, eager, device, batch_size=8, per_network_out=per_network)
+    assert forwards == [8, 1, 3]
+    assert score == pytest.approx(sum(total for total, _count in reference.values()) / split.count, rel=1e-6)
+    assert sorted(per_network) == sorted(reference)
+    for net, (total, count) in reference.items():
+        assert per_network[net][1] == count
+        assert per_network[net][0] == pytest.approx(total, rel=1e-6)
+
+
 def test_device_networks_move_lazily_and_evict_least_recent():
     _split, networks = consistent_split(three_bus_topologies(), [1, 1, 1])
     networks[1].rpe = networks[1].rpe.to(torch.float16)
