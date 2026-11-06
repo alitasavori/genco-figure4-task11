@@ -38,6 +38,10 @@ Performance notes (Colab / large train split)
   not after every training batch.
 * **Optional**: ``GENCO_TPGT_VAL_EVERY=3`` or ``--val-every 3`` skips most
   validation passes (faster; coarser early stopping).
+* **LR schedule**: Adam at ``LEARNING_RATE`` with ``ReduceLROnPlateau`` on
+  validation PBL (x0.7 after 5 non-improving validations) and early stopping
+  after 100, as in GENCO. The epoch line shows ``lr``; scheduler state is saved
+  in checkpoints, and resumed runs keep their saved optimizer learning rate.
 * **Debug (on by default)**: every validation pass also scores a fixed training
   subset (``train_pbl`` and ``gap`` in the epoch line). On checkpoint epochs the
   run prints the forward report, RPE zero-ablation, RPE and residual correctness
@@ -88,7 +92,12 @@ HEADS = 2
 DEPTH = 2
 ETA = 1.0
 BATCH_SIZE = 32
-LEARNING_RATE = 1e-4
+# Optimizer schedule follows GENCO's Task 1.1 config (HGNS_PF_pfdelta_bs64_seed1.yaml):
+# Adam at 5e-4, ReduceLROnPlateau on validation PBL (x0.7, patience 5), early stop after 100.
+LEARNING_RATE = 5e-4
+LR_PLATEAU_FACTOR = 0.7
+LR_PLATEAU_PATIENCE = 5
+EARLY_STOP_PATIENCE = 100
 EPOCHS = 100
 # Drive checkpoints (and results CSV / comparison plot) every 3rd epoch and at the final epoch.
 # The four held-out test PBL scores run on checkpoint epochs (3, 6, …) and the final epoch.
@@ -2282,11 +2291,16 @@ def load_resume_checkpoint(
 
 
 def read_completed_epochs(done_path: Path) -> int:
-    """Epochs finished for the current code version only (old complete.json counts as 0)."""
+    """Epochs finished for the current code version only (old complete.json counts as 0).
+
+    An early-stopped seed counts as EPOCHS so reruns skip it.
+    """
     try:
         payload = json.loads(done_path.read_text(encoding="utf-8"))
         if payload.get("checkpoint_version") != CHECKPOINT_VERSION:
             return 0
+        if payload.get("early_stopped"):
+            return EPOCHS
         return int(payload.get("epochs_completed", 0))
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return 0
@@ -2324,6 +2338,7 @@ def restore_checkpoint_payload(
             "wait": int(payload["wait"]),
             "best_state": best_state,
             "data_fraction": payload.get("data_fraction"),
+            "scheduler": payload.get("scheduler"),
         },
         None,
     )
@@ -2353,14 +2368,29 @@ def train_epoch_loss_line(
     physics_stages: list[float],
     train_total: float,
     val_display: str,
+    lr: float | None = None,
 ) -> str:
     n = max(batches, 1)
     stage_text = "  ".join(f"phys_s{i + 1} {value / n:.4f}" for i, value in enumerate(physics_stages))
+    lr_text = "" if lr is None else f"  lr {lr:.1e}"
     return (
         f"seed {seed} epoch {epoch_number}/{EPOCHS}  "
         f"state {state_mse / n:.4f}  phys {physics_sum / n:.4f}  {stage_text}  "
-        f"train {train_total / n:.4f}  val_pbl {val_display}"
+        f"train {train_total / n:.4f}  val_pbl {val_display}{lr_text}"
     )
+
+
+def make_lr_scheduler(optimizer: torch.optim.Optimizer) -> torch.optim.lr_scheduler.ReduceLROnPlateau:
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=LR_PLATEAU_FACTOR,
+        patience=LR_PLATEAU_PATIENCE,
+    )
+
+
+def current_lr(optimizer: torch.optim.Optimizer) -> float:
+    return float(optimizer.param_groups[0]["lr"])
 
 
 def train_seed(
@@ -2394,6 +2424,7 @@ def train_seed(
         )
         model = torch.compile(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = make_lr_scheduler(optimizer)
     grad_scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     train_networks = [move_to(network, device) for network in train_split.networks]
     val_networks = [move_to(network, device) for network in val_split.networks]
@@ -2420,6 +2451,15 @@ def train_seed(
             best_val = float("inf")
             wait = 0
             best_state = None
+        elif restored["scheduler"] is None:
+            print(f"Seed {seed}: checkpoint has no LR scheduler state; starting a fresh scheduler.", flush=True)
+        else:
+            try:
+                scheduler.load_state_dict(restored["scheduler"])
+            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                scheduler = make_lr_scheduler(optimizer)
+                print(f"Seed {seed}: LR scheduler state not restored ({error}); starting fresh.", flush=True)
+        print(f"Seed {seed}: resumed optimizer lr {current_lr(optimizer):.1e}", flush=True)
     else:
         obsolete_reason = restore_obsolete or load_obsolete
         if obsolete_reason is not None:
@@ -2447,6 +2487,7 @@ def train_seed(
             "checkpoint_version": CHECKPOINT_VERSION,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
             "epoch": epoch_number,
             "best_val": best_val,
             "wait": wait,
@@ -2472,12 +2513,13 @@ def train_seed(
             encoding="utf-8",
         )
 
-    def finish_checkpoint_epoch(epoch_number: int) -> None:
+    def finish_checkpoint_epoch(epoch_number: int, force: bool = False) -> None:
         """Run held-out test on checkpoint epochs, then save Drive checkpoint when due."""
+        due = force or saves_checkpoint_epoch(epoch_number)
         test_scores: tuple[dict[str, float], dict[str, int]] | None = None
-        if on_epoch_end is not None and saves_checkpoint_epoch(epoch_number):
+        if on_epoch_end is not None and due:
             test_scores = on_epoch_end(model, epoch_number)
-        if saves_checkpoint_epoch(epoch_number):
+        if due:
             save_epoch(epoch_number, test_scores)
 
     pending_test = saves_checkpoint_epoch(start_epoch) and not (
@@ -2500,8 +2542,17 @@ def train_seed(
         if pending_test:
             finish_checkpoint_epoch(start_epoch)
 
+    stopped_early = False
     if not finished:
         for epoch in range(start_epoch, EPOCHS):
+            if wait >= EARLY_STOP_PATIENCE:
+                print(
+                    f"Seed {seed}: early stopping after epoch {start_epoch} "
+                    f"({wait} validations without improvement, best val_pbl {best_val:.6f}).",
+                    flush=True,
+                )
+                stopped_early = True
+                break
             model.train()
             clear_pair_embed_cache(train_networks)
             clear_pair_embed_cache(val_networks)
@@ -2580,6 +2631,15 @@ def train_seed(
                     best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
                 else:
                     wait += 1
+                lr_before = current_lr(optimizer)
+                scheduler.step(val_score)
+                lr_after = current_lr(optimizer)
+                if lr_after < lr_before:
+                    print(
+                        f"Seed {seed} epoch {epoch + 1}: val_pbl plateaued; "
+                        f"lr reduced {lr_before:.1e} -> {lr_after:.1e}",
+                        flush=True,
+                    )
             else:
                 val_display = "skipped"
             print(
@@ -2592,6 +2652,7 @@ def train_seed(
                     running_phys_stages,
                     running_total,
                     val_display,
+                    lr=current_lr(optimizer),
                 ),
                 flush=True,
             )
@@ -2609,6 +2670,8 @@ def train_seed(
                 )
             start_epoch = epoch + 1
             finish_checkpoint_epoch(start_epoch)
+    if stopped_early and not (model_dir / f"epoch_{start_epoch}.compared").exists():
+        finish_checkpoint_epoch(start_epoch, force=True)
     if best_state is None:
         raise RuntimeError(f"Seed {seed} produced no checkpoint.")
     model.load_state_dict(best_state)
@@ -2618,6 +2681,7 @@ def train_seed(
                 "seed": seed,
                 "checkpoint_version": CHECKPOINT_VERSION,
                 "epochs_completed": start_epoch,
+                "early_stopped": stopped_early,
                 "best_val_pbl": best_val,
             }
         ),
