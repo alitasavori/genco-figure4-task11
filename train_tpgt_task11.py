@@ -158,7 +158,7 @@ def wrap_angle(delta: torch.Tensor) -> torch.Tensor:
 
 def autocast_activation_dtype(reference: torch.Tensor) -> torch.dtype:
     if reference.is_cuda and torch.is_autocast_enabled():
-        return torch.get_autocast_gpu_dtype()
+        return torch.get_autocast_dtype("cuda")
     return reference.dtype
 
 
@@ -1205,13 +1205,13 @@ def _weighted_loss_breakdown(
     weight = sum(weight for _breakdown, weight in parts)
     if weight <= 0:
         raise RuntimeError("empty training batch")
-    state = sum(float(b.state_mse) * w for b, w in parts) / weight
-    phys = sum(float(b.physics_sum) * w for b, w in parts) / weight
+    state = sum(float(b.state_mse.detach()) * w for b, w in parts) / weight
+    phys = sum(float(b.physics_sum.detach()) * w for b, w in parts) / weight
     stages = tuple(
-        sum(float(b.physics_stages[stage_idx]) * w for b, w in parts) / weight
+        sum(float(b.physics_stages[stage_idx].detach()) * w for b, w in parts) / weight
         for stage_idx in range(DEPTH)
     )
-    total = sum(float(b.total) * w for b, w in parts) / weight
+    total = sum(float(b.total.detach()) * w for b, w in parts) / weight
     return TaskLossBreakdown(
         torch.tensor(state),
         torch.tensor(phys),
