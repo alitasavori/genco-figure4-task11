@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 
 from train_tpgt_task11 import (  # noqa: E402
     RPE_DIM,
+    RPE_FEATURE_NAMES,
     TPGT,
     Network,
     Split,
@@ -41,10 +42,21 @@ def test_pbl_stats_on_zero_residual():
 
 
 def test_summarize_rpe_shape():
-    rpe = torch.randn(5, 5, 10)
+    rpe = torch.randn(5, 5, RPE_DIM)
     rows = summarize_rpe(rpe)
-    assert len(rows) == 10
+    assert len(rows) == RPE_DIM
     assert rows[0]["off_mean"] == rows[0]["off_mean"]  # finite
+
+
+def test_rpe_has_five_channels_without_random_walks():
+    assert RPE_DIM == 5
+    assert RPE_FEATURE_NAMES == ("ReY/sY", "ImY/sY", "adjacency", "hop_norm", "Reff_norm")
+    branches = [(0, 1, 0.1, 0.1), (1, 2, 0.1, 0.1), (0, 2, 0.1, 0.2)]
+    ybus = np.zeros((3, 3), dtype=np.complex64)
+    ybus[0, 1] = ybus[1, 0] = 2.0 + 1.0j
+    features, _component = meshed_rpe(3, branches, ybus)
+    assert features.shape == (3, 3, 5)
+    assert TPGT().pair_encoder.net[0].in_features == 5
 
 
 def test_pair_encoder_weight_norms():

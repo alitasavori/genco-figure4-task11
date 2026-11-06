@@ -5,24 +5,35 @@ The hidden sizes, depth, batch, and epoch cap below are implementation
 choices so a Colab GPU can finish a run. They are not paper hyperparameters.
 
 IEEE 118 is meshed, so pair features use the full in-service topology:
-admittance, adjacency, hop distance, effective resistance, and weighted
-random walks. See `meshed_rpe`.
+admittance (real, imaginary), adjacency, hop distance, and effective
+resistance (5 channels). See `meshed_rpe`.
+
+Architecture (checkpoint_version ``meshed-rpe-5-d4-v7``)
+--------------------------------------------------------
+* **4 correction stages** (``DEPTH``), each with its own weights; the physics
+  loss is the unweighted sum over stages.
+* **5-channel RPE** (random-walk channels removed).
+* **RPE channel dropout**: during training each channel is zeroed with
+  probability ``RPE_CHANNEL_DROPOUT`` per optimizer step; never at eval.
+* **Versioned run folder**: checkpoints go to ``Foundation Model/tpgt_task11_<RUN_TAG>``
+  and tables/plot to ``Foundation Model/results/tpgt_task11_<RUN_TAG>``, so runs
+  of older architectures (``tpgt_task11/``) are left untouched.
 
 Performance notes (Colab / large train split)
 ---------------------------------------------
 * **Drive I/O**: The 48600-case train/valid tensors live under the checkpoint
   tree on Google Drive. ``torch.load`` from Drive is often minutes slower than
   from ``/content`` local disk. On Colab, ``split_cache_dirs`` mirrors ``.pt``
-  caches to ``/content/tpgt_task11_cache`` after the first Drive read or build.
+  caches to ``/content/tpgt_task11_<RUN_TAG>_cache`` after the first Drive read or build.
 * **``meshed_rpe``**: Computed only when building or refreshing the split cache,
   once per *distinct* in-service topology (see ``read_split`` representatives),
   not per scenario and not per training batch.
 * **``pair_encoder``**: Runs once per forward on the static ``118×118`` RPE for
   the batch's topology. Weights train, so training must re-encode every step;
   in ``eval`` mode encoded pairs are cached on ``Network.pair_embed``.
-* **Type-pair attention**: ``CorrectionStage._messages`` fuses all nine
-  receiver–sender masks and both heads into batched ``einsum`` ops over
-  ``118×118`` (one kernel graph per stage instead of eighteen Python loops).
+* **Type-pair attention**: ``CorrectionStage._messages`` evaluates each of the
+  nine type-pair weight sets only on its own receiver-type × sender-type block
+  (both heads batched), then takes one softmax over all senders per receiver.
   Optional ``GENCO_TPGT_COMPILE=1`` or ``--compile`` wraps the model in
   ``torch.compile`` (may differ slightly in numerics).
 * **Batch 32**: Optimizer steps use 32 cases per batch. Default **micro-batch 32**
@@ -89,7 +100,7 @@ D = 48
 D_E = 24
 D_A = 24
 HEADS = 2
-DEPTH = 2
+DEPTH = 4
 ETA = 1.0
 BATCH_SIZE = 32
 # Optimizer schedule follows GENCO's Task 1.1 config (HGNS_PF_pfdelta_bs64_seed1.yaml):
@@ -108,23 +119,24 @@ LAMBDA_STATE = 0.85
 LAMBDA_PHYS = 0.15
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
-CACHE_VERSION = "tpgt-cache-3"
-RPE_WALK_STEPS = 5
-RPE_DIM = RPE_WALK_STEPS + 5
+CACHE_VERSION = "tpgt-cache-4"
 RPE_FEATURE_NAMES = (
     "ReY/sY",
     "ImY/sY",
     "adjacency",
     "hop_norm",
     "Reff_norm",
-    "P1",
-    "P2",
-    "P3",
-    "P4",
-    "P5",
 )
+RPE_DIM = len(RPE_FEATURE_NAMES)
+# Per optimizer step, each RPE channel is zeroed (whole 118x118 plane, no rescaling) with this
+# probability. Training only; validation, test and diagnostics always see the full RPE.
+RPE_CHANNEL_DROPOUT = 0.1
 # Bumped when pair-encoder input size or architecture changes; old Drive checkpoints are ignored.
-CHECKPOINT_VERSION = "meshed-rpe-10-v6-capacity"
+CHECKPOINT_VERSION = "meshed-rpe-5-d4-v7"
+# Checkpoints, split caches and result tables live in tpgt_task11_<RUN_TAG> so runs of an
+# older architecture (e.g. the 2-stage, 10-channel run in tpgt_task11/) are never overwritten.
+RUN_TAG = "v7"
+RUN_DIR_NAME = f"tpgt_task11_{RUN_TAG}"
 # Fixed training subset scored with val's PBL metric each validation pass (overfitting check).
 TRAIN_PROBE_CASES = 2000
 # Reference labels must satisfy nodal balance within this mean PBL (p.u.) when checked at load.
@@ -215,6 +227,31 @@ def type_pair_masks(types: torch.Tensor, component: torch.Tensor) -> torch.Tenso
     return torch.stack(masks, dim=0)
 
 
+@dataclass
+class TypePairBlock:
+    """Receivers of one type and senders of one type; ``mask`` keeps same-component pairs only."""
+
+    pair_id: int
+    receivers: torch.Tensor
+    senders: torch.Tensor
+    mask: torch.Tensor
+
+
+def type_pair_blocks(types: torch.Tensor, pair_type_masks: torch.Tensor) -> list[TypePairBlock]:
+    """Non-empty (receiver type, sender type) blocks of the bus-pair matrix, one per type pair."""
+    by_type = [torch.nonzero(types == type_id, as_tuple=False).flatten() for type_id in range(3)]
+    blocks = []
+    for pair_id in range(9):
+        receiver, sender = divmod(pair_id, 3)
+        receivers = by_type[receiver]
+        senders = by_type[sender]
+        if receivers.numel() == 0 or senders.numel() == 0:
+            continue
+        mask = pair_type_masks[pair_id][receivers.view(-1, 1), senders.view(1, -1)]
+        blocks.append(TypePairBlock(pair_id, receivers, senders, mask))
+    return blocks
+
+
 def wants_torch_compile() -> bool:
     if "--compile" in sys.argv or "--fast" in sys.argv:
         return True
@@ -287,11 +324,11 @@ class CorrectionStage(nn.Module):
         specified: torch.Tensor,
         pair: torch.Tensor,
         types: torch.Tensor,
-        pair_type_masks: torch.Tensor,
+        blocks: list[TypePairBlock],
         ybus: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         residual_in = nodal_residual(specified, unknown, types, ybus)
-        message = self._messages(hidden, pair, pair_type_masks)
+        message = self._messages(hidden, pair, blocks)
         updated = torch.zeros_like(hidden)
         for type_id, update in enumerate(self.update):
             mask = types == type_id
@@ -327,27 +364,49 @@ class CorrectionStage(nn.Module):
         self,
         hidden: torch.Tensor,
         pair: torch.Tensor,
-        pair_type_masks: torch.Tensor,
+        blocks: list[TypePairBlock],
     ) -> torch.Tensor:
+        """Each type pair's weights see only its own receiver-type x sender-type block.
+
+        Block scores are scattered into one (batch, heads, N, N) score matrix so the softmax
+        runs over all senders of a receiver; cross-component entries stay -inf.
+        """
         batch, buses, _ = hidden.shape
-        mask_view = pair_type_masks.view(1, 9, 1, buses, buses)
-        # Contract hidden dim D with w_*; attention lives in D_A (same as the pre-batch matmul loops).
-        query = torch.einsum("bnd,phad->bphna", hidden, self.w_q)
-        key = torch.einsum("bnd,phad->bphna", hidden, self.w_k)
-        mixed = rho_nonlinearity(query.unsqueeze(-2) + key.unsqueeze(-3))
-        projected = torch.einsum("nme,phae->phnma", pair, self.w_ew)
-        bias = torch.einsum("nme,phae->phnma", pair, self.w_eb)
-        interaction = torch.relu(mixed * projected.unsqueeze(0) + bias.unsqueeze(0))
-        all_scores = (interaction * self.w_a.unsqueeze(0).unsqueeze(-2)).sum(dim=-1)
-        scores = all_scores.masked_fill(~mask_view, float("-inf")).amax(dim=1)
-        value = torch.einsum("bnd,phad->bphna", hidden, self.w_v)
-        content = value.unsqueeze(3) + torch.einsum("bphnma,phxa->bphnmx", interaction, self.w_ev)
-        values = (content * mask_view.unsqueeze(-1)).sum(dim=1)
+        scores: torch.Tensor | None = None
+        interactions = []
+        for block in blocks:
+            p = block.pair_id
+            receivers = block.receivers.view(-1, 1)
+            senders = block.senders.view(1, -1)
+            query = torch.einsum("bnd,had->bhna", hidden[:, block.receivers], self.w_q[p])
+            key = torch.einsum("bnd,had->bhna", hidden[:, block.senders], self.w_k[p])
+            mixed = rho_nonlinearity(query.unsqueeze(-2) + key.unsqueeze(-3))
+            edge = pair[receivers, senders]
+            projected = torch.einsum("nme,hae->hnma", edge, self.w_ew[p])
+            bias = torch.einsum("nme,hae->hnma", edge, self.w_eb[p])
+            interaction = torch.relu(mixed * projected.unsqueeze(0) + bias.unsqueeze(0))
+            score = torch.einsum("bhnma,ha->bhnm", interaction, self.w_a[p, :, 0])
+            score = score.masked_fill(~block.mask, float("-inf"))
+            if scores is None:
+                scores = score.new_full((batch, HEADS, buses, buses), float("-inf"))
+            scores[:, :, receivers, senders] = score.to(scores.dtype)
+            interactions.append(interaction)
+        if scores is None:
+            return hidden.new_zeros(hidden.shape)
         weights = torch.softmax(scores, dim=-1)
         weights = torch.nan_to_num(weights, nan=0.0)
         row_sum = weights.sum(dim=-1, keepdim=True)
         weights = torch.where(row_sum > 0, weights / row_sum.clamp(min=1e-12), weights)
-        mixed_heads = (weights.unsqueeze(-1) * values).sum(dim=3)
+        mixed_heads = weights.new_zeros((batch, HEADS, buses, D_A))
+        for block, interaction in zip(blocks, interactions):
+            p = block.pair_id
+            block_weights = weights[:, :, block.receivers.view(-1, 1), block.senders.view(1, -1)]
+            value = torch.einsum("bnd,had->bhna", hidden[:, block.senders], self.w_v[p])
+            # sum_j w_ij (W_V h_j + W_Ev x_ij) without materializing the per-pair values.
+            gathered = torch.einsum("bhnm,bhma->bhna", block_weights, value)
+            pooled = torch.einsum("bhnm,bhnma->bhna", block_weights, interaction)
+            gathered = gathered + torch.einsum("bhna,hxa->bhnx", pooled, self.w_ev[p])
+            mixed_heads = mixed_heads.index_add(2, block.receivers, gathered.to(mixed_heads.dtype))
         return torch.einsum("bhna,hda->bnd", mixed_heads, self.w_o)
 
 
@@ -384,9 +443,10 @@ class TPGT(nn.Module):
             mask = types == type_id
             if bool(mask.any()):
                 masked_write(hidden, mask, encoder(specified[:, mask]))
+        blocks = type_pair_blocks(types, pair_type_masks)
         residuals = []
         for stage in self.stages:
-            hidden, unknown, residual = stage(hidden, unknown, specified, pair, types, pair_type_masks, ybus)
+            hidden, unknown, residual = stage(hidden, unknown, specified, pair, types, blocks, ybus)
             residuals.append(residual)
         return unknown, residuals
 
@@ -1142,11 +1202,11 @@ def meshed_rpe(
     branches: list[tuple[int, int, float, float]],
     ybus: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Ten pair features on the full in-service meshed graph.
+    """Five pair features on the full in-service meshed graph.
 
-    Order: Re(Y)/s_Y, Im(Y)/s_Y, A_ij, hop/d_max, eff_res/r_max, then
-    (P^k)_ij for k = 1..RPE_WALK_STEPS. Branch r and x build W; Y comes
-    from the case Ybus used in the power-flow residual.
+    Order: Re(Y)/s_Y, Im(Y)/s_Y, A_ij, hop/d_max, eff_res/r_max. Branch r and
+    x build W (for effective resistance); Y comes from the case Ybus used in
+    the power-flow residual.
 
     s_Y(c) is the mean of off-diagonal |Y_pq| with p != q and |Y_pq| > eps
     (zeros from non-adjacent pairs are excluded).
@@ -1207,14 +1267,6 @@ def meshed_rpe(
             if distances[destination] >= 0:
                 hop[start, destination] = float(distances[destination])
 
-    degree = np.sum(weight, axis=1)
-    transition = np.zeros_like(weight)
-    positive_degree = degree > 0
-    transition[positive_degree] = weight[positive_degree] / degree[positive_degree, None]
-    walk_powers = [transition.copy()]
-    for _ in range(2, RPE_WALK_STEPS + 1):
-        walk_powers.append(walk_powers[-1] @ transition)
-
     scale_y = np.ones(component_id, dtype=np.float64)
     hop_scale = np.ones(component_id, dtype=np.float64)
     resistance_scale = np.ones(component_id, dtype=np.float64)
@@ -1266,8 +1318,6 @@ def meshed_rpe(
             else:
                 features[origin, destination, 3] = hop[origin, destination] / h_scale
                 features[origin, destination, 4] = effective[origin, destination] / r_scale
-            for step, power in enumerate(walk_powers, start=5):
-                features[origin, destination, step] = power[origin, destination]
 
     hop_symmetry = np.max(np.abs(hop - hop.T))
     if hop_symmetry > 1e-5:
@@ -1410,30 +1460,6 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
                 "recompute_from_ybus_branches",
                 True,
                 "skipped (branches not stored on Network; rebuild split cache to enable)",
-            )
-        )
-
-    walk_start = 5
-    for step in range(RPE_WALK_STEPS):
-        channel = walk_start + step
-        plane = rpe[:, :, channel]
-        row_sums: list[float] = []
-        for bus in range(bus_count):
-            if int(component[bus]) < 0:
-                continue
-            comp = int(component[bus])
-            same = component == comp
-            row_sums.append(float(plane[bus, same].sum()))
-        if not row_sums:
-            continue
-        max_row = float(max(row_sums))
-        min_row = float(min(row_sums))
-        walk_ok = max_row <= 1.0 + 1e-4 and min_row >= -1e-4
-        checks.append(
-            CorrectnessCheck(
-                f"walk_P{step + 1}_row_sums",
-                walk_ok,
-                f"row sums on component in [{min_row:.4f}, {max_row:.4f}] (expect ~1 on connected buses)",
             )
         )
 
@@ -1948,7 +1974,7 @@ DATASET_RELATIVE = Path("Foundation Model") / "vendor" / "pfdelta_task1.1"
 WINDOWS_DRIVE = Path(r"K:\My Drive")
 COLAB_DRIVE = Path("/content/drive/MyDrive")
 # Fast split-cache mirror on Colab runtime disk (not synced across disconnects).
-COLAB_LOCAL_CACHE = Path("/content/tpgt_task11_cache")
+COLAB_LOCAL_CACHE = Path(f"/content/{RUN_DIR_NAME}_cache")
 
 
 def dataset_request() -> Path:
@@ -1998,7 +2024,7 @@ def legacy_locations(drive: Path | None) -> tuple[Path, Path]:
 
 
 def drive_output_dirs(drive: Path | None) -> tuple[Path, Path] | None:
-    """Checkpoint directory and TPGT result directory on Drive.
+    """Checkpoint directory and TPGT result directory on Drive, both versioned by ``RUN_DIR_NAME``.
 
     Colab writes under MyDrive/Foundation Model once Drive is mounted.
     Windows writes under K:\\My Drive\\Foundation Model when that folder exists.
@@ -2008,8 +2034,8 @@ def drive_output_dirs(drive: Path | None) -> tuple[Path, Path] | None:
     foundation = drive / "Foundation Model"
     if not in_colab() and not foundation.is_dir():
         return None
-    checkpoints = foundation / "tpgt_task11"
-    results = foundation / "results"
+    checkpoints = foundation / RUN_DIR_NAME
+    results = foundation / "results" / RUN_DIR_NAME
     checkpoints.mkdir(parents=True, exist_ok=True)
     results.mkdir(parents=True, exist_ok=True)
     return checkpoints, results
@@ -2119,6 +2145,14 @@ def _weighted_loss_breakdown(
     )
 
 
+def rpe_channel_dropout(rpe: torch.Tensor, probability: float, training: bool) -> torch.Tensor:
+    """Zero whole RPE channels independently with ``probability`` (no rescaling); identity unless training."""
+    if not training or probability <= 0.0:
+        return rpe
+    keep = torch.rand(rpe.shape[-1], device=rpe.device) >= probability
+    return rpe * keep.to(rpe.dtype)
+
+
 def train_batch(
     model: TPGT,
     optimizer: torch.optim.Optimizer,
@@ -2135,8 +2169,9 @@ def train_batch(
     use_amp = device.type == "cuda"
     optimizer.zero_grad(set_to_none=True)
     logged_parts: list[tuple[TaskLossBreakdown, float]] = []
+    rpe = rpe_channel_dropout(network.rpe, RPE_CHANNEL_DROPOUT, model.training)
     with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
-        pair_embed = model.pair_encoder(network.rpe)
+        pair_embed = model.pair_encoder(rpe)
     for start in range(0, n, micro):
         chunk = cases[start : start + micro]
         weight = len(chunk) / n
@@ -2896,10 +2931,10 @@ def main() -> None:
         checkpoints, results = outputs
     else:
         work.mkdir(parents=True, exist_ok=True)
-        legacy_results.mkdir(parents=True, exist_ok=True)
-        checkpoints = work / "tpgt_task11"
+        checkpoints = work / RUN_DIR_NAME
         checkpoints.mkdir(parents=True, exist_ok=True)
-        results = legacy_results
+        results = legacy_results / RUN_DIR_NAME
+        results.mkdir(parents=True, exist_ok=True)
     os.environ["GENCO_RESULTS_DIR"] = str(results)
     os.environ["GENCO_WORK_ROOT"] = str(checkpoints.parent)
     os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
@@ -2910,6 +2945,7 @@ def main() -> None:
     results.mkdir(parents=True, exist_ok=True)
     data = ensure_dataset(work, drive)
     print(f"Dataset: {data}", flush=True)
+    print(f"Run tag {RUN_TAG} (checkpoint_version {CHECKPOINT_VERSION}, {DEPTH} stages, {RPE_DIM}-channel RPE)", flush=True)
     print(f"Checkpoints: {checkpoints}", flush=True)
     print(f"Results directory: {results}", flush=True)
     log_counts(data, results)
@@ -3036,7 +3072,7 @@ def cli_diagnose(
     if outputs is not None:
         checkpoints, results = outputs
     else:
-        checkpoints = work / "tpgt_task11"
+        checkpoints = work / RUN_DIR_NAME
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     configure_cuda_training(device)
     data = ensure_dataset(work, drive)
