@@ -38,6 +38,13 @@ Performance notes (Colab / large train split)
   not after every training batch.
 * **Optional**: ``GENCO_TPGT_VAL_EVERY=3`` or ``--val-every 3`` skips most
   validation passes (faster; coarser early stopping).
+* **Debug**: ``--debug`` or ``GENCO_TPGT_DEBUG=1`` prints oracle/flat-start/PBL,
+  state RMSE, static RPE scales, **RPE correctness audit** (Ybus/admittance,
+  symmetry, full recompute vs cache), and optional ablation each validation epoch.
+  ``--diagnose`` runs the same on a checkpoint (default includes **RPE zero-ablation**).
+  Skip ablation with ``--no-rpe-ablation``; force it during training debug with
+  ``GENCO_TPGT_RPE_ABLATION=1`` or ``--rpe-ablation``. ``--sanity-rpe`` runs the
+  correctness audit on one train case.
 """
 
 from __future__ import annotations
@@ -555,6 +562,110 @@ def summarize_rpe(rpe: torch.Tensor) -> list[dict[str, float]]:
     return rows
 
 
+def pair_encoder_input_weight_norms(model: TPGT) -> list[dict[str, float]]:
+    """L2 norm of each column of the pair_encoder first layer (how strongly each RPE channel is wired in)."""
+    first = model.pair_encoder.net[0]
+    if not isinstance(first, nn.Linear):
+        raise TypeError("pair_encoder first layer must be Linear")
+    norms = torch.linalg.vector_norm(first.weight.detach(), dim=0)
+    return [
+        {"name": RPE_FEATURE_NAMES[channel], "weight_l2": float(norms[channel])}
+        for channel in range(RPE_DIM)
+    ]
+
+
+def eval_batch_with_pair(
+    model: TPGT,
+    split: Split,
+    network: Network,
+    index: np.ndarray,
+    device: torch.device,
+    pair: torch.Tensor,
+) -> dict[str, float]:
+    """Loss and final-stage PBL on a fixed batch with precomputed pair embeddings."""
+    model.eval()
+    chosen = np.asarray(index, dtype=np.int64)
+    power_p = split.power_p[chosen].to(device, non_blocking=True)
+    power_q = split.power_q[chosen].to(device, non_blocking=True)
+    voltage = split.voltage[chosen].to(device, non_blocking=True)
+    angle = split.angle[chosen].to(device, non_blocking=True)
+    specified, target = pack_case(power_p, power_q, voltage, angle, network.types)
+    with torch.no_grad():
+        prediction, residuals = model(
+            specified,
+            network.types,
+            network.rpe,
+            network.pair_type_masks,
+            network.ybus,
+            pair=pair,
+        )
+        breakdown = task_loss(prediction, target, residuals, network.types)
+        final_pbl = pbl_stats(residuals[-1])
+    return {
+        "pbl_mean": float(final_pbl["mean"]),
+        "state_mse": float(breakdown.state_mse),
+        "total_loss": float(breakdown.total),
+    }
+
+
+def collect_rpe_channel_ablation(
+    model: TPGT,
+    split: Split,
+    network: Network,
+    index: np.ndarray,
+    device: torch.device,
+) -> tuple[dict[str, float], list[dict[str, float]]]:
+    """Zero one RPE channel at a time; compare batch metrics to the full-RPE baseline."""
+    model.eval()
+    clear_pair_embed_cache([network])
+    baseline_pair = pair_features(model, network)
+    baseline = eval_batch_with_pair(model, split, network, index, device, baseline_pair)
+    rows: list[dict[str, float]] = []
+    for channel, name in enumerate(RPE_FEATURE_NAMES):
+        rpe_ablated = network.rpe.clone()
+        rpe_ablated[..., channel] = 0.0
+        ablated_pair = model.pair_encoder(rpe_ablated)
+        metrics = eval_batch_with_pair(model, split, network, index, device, ablated_pair)
+        rows.append(
+            {
+                "name": name,
+                "delta_pbl_mean": metrics["pbl_mean"] - baseline["pbl_mean"],
+                "delta_state_mse": metrics["state_mse"] - baseline["state_mse"],
+                "delta_total_loss": metrics["total_loss"] - baseline["total_loss"],
+            }
+        )
+    clear_pair_embed_cache([network])
+    return baseline, rows
+
+
+def format_rpe_effectiveness_diagnostics(
+    weight_rows: list[dict[str, float]],
+    baseline: dict[str, float] | None,
+    ablation_rows: list[dict[str, float]] | None,
+) -> str:
+    lines = ["Pair-encoder input weight L2 per RPE channel (structural; not causal):"]
+    for row in sorted(weight_rows, key=lambda item: item["weight_l2"], reverse=True):
+        lines.append(f"  {row['name']:12s} weight_l2 {row['weight_l2']:.4g}")
+    if baseline is None or ablation_rows is None:
+        lines.append(
+            "RPE channel ablation: not run (use --diagnose, --rpe-ablation, or GENCO_TPGT_RPE_ABLATION=1)."
+        )
+        return "\n".join(lines)
+    lines.append(
+        f"RPE zero-ablation on same batch (baseline PBL mean {baseline['pbl_mean']:.6g}, "
+        f"state_mse {baseline['state_mse']:.6g}):"
+    )
+    lines.append(
+        "  Positive ΔPBL after zeroing => channel helped; negative ΔPBL => zeroing improved metrics (hurting/noisy)."
+    )
+    for row in sorted(ablation_rows, key=lambda item: item["delta_pbl_mean"], reverse=True):
+        lines.append(
+            f"  {row['name']:12s} ΔPBL {row['delta_pbl_mean']:+.4g}  "
+            f"Δstate_mse {row['delta_state_mse']:+.4g}  Δloss {row['delta_total_loss']:+.4g}"
+        )
+    return "\n".join(lines)
+
+
 def summarize_pair_embed(pair: torch.Tensor) -> dict[str, float]:
     with torch.no_grad():
         norms = torch.linalg.vector_norm(pair, dim=-1)
@@ -659,7 +770,7 @@ def format_forward_diagnostics(
     pe = diagnostics.pair_embed
     lines.append(f"Pair embed |e_ij|: mean {pe['mean_norm']:.6g} max {pe['max_norm']:.6g}")
     lines.append(f"Mean |Ybus| entry: {diagnostics.ybus_abs_mean:.6g}")
-    lines.append("RPE channels (off-diagonal / diagonal mean, off max):")
+    lines.append("RPE channels (static feature scale; does not measure model usefulness):")
     for row in diagnostics.rpe_channels:
         lines.append(
             f"  {row['name']:12s} off_mean {row['off_mean']:+.4g} off_max {row['off_max']:+.4g} "
@@ -679,9 +790,19 @@ def print_forward_diagnostics(
     index: np.ndarray,
     device: torch.device,
     tag: str,
+    *,
+    rpe_ablation: bool = False,
 ) -> None:
     report = collect_forward_diagnostics(model, split, network, index, device)
-    print(format_forward_diagnostics(tag, report), flush=True)
+    text = format_forward_diagnostics(tag, report)
+    weight_rows = pair_encoder_input_weight_norms(model)
+    baseline: dict[str, float] | None = None
+    ablation_rows: list[dict[str, float]] | None = None
+    if rpe_ablation:
+        baseline, ablation_rows = collect_rpe_channel_ablation(model, split, network, index, device)
+    text = text + "\n" + format_rpe_effectiveness_diagnostics(weight_rows, baseline, ablation_rows)
+    text = text + "\n" + format_rpe_correctness_checks(audit_rpe_correctness(network))
+    print(text, flush=True)
 
 
 def wants_debug_diagnostics() -> bool:
@@ -689,6 +810,19 @@ def wants_debug_diagnostics() -> bool:
         return True
     flag = os.environ.get("GENCO_TPGT_DEBUG", "").strip().lower()
     return flag in ("1", "true", "yes")
+
+
+def wants_rpe_ablation(*, default: bool) -> bool:
+    if "--no-rpe-ablation" in sys.argv:
+        return False
+    if "--rpe-ablation" in sys.argv:
+        return True
+    flag = os.environ.get("GENCO_TPGT_RPE_ABLATION", "").strip().lower()
+    if flag in ("1", "true", "yes"):
+        return True
+    if flag in ("0", "false", "no"):
+        return False
+    return default
 
 
 def debug_sample_index(split: Split, network_id: int = 0, count: int = 32) -> np.ndarray:
@@ -705,6 +839,7 @@ class Network:
     types: torch.Tensor
     pair_type_masks: torch.Tensor | None = field(default=None, repr=False)
     pair_embed: torch.Tensor | None = field(default=None, repr=False)
+    branches: tuple[tuple[int, int, float, float], ...] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -862,6 +997,178 @@ def meshed_rpe(
     return features, component
 
 
+@dataclass
+class RpeCorrectnessCheck:
+    name: str
+    passed: bool
+    detail: str
+
+
+def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> list[RpeCorrectnessCheck]:
+    """Structural checks plus optional full recompute from stored Ybus and in-service branches."""
+    rpe = network.rpe.detach().cpu().numpy()
+    ybus = network.ybus.detach().cpu().numpy()
+    component = network.component.detach().cpu().numpy().astype(np.int64)
+    bus_count = rpe.shape[0]
+    checks: list[RpeCorrectnessCheck] = []
+
+    if rpe.shape != (bus_count, bus_count, RPE_DIM):
+        checks.append(
+            RpeCorrectnessCheck("shape", False, f"expected ({bus_count}, {bus_count}, {RPE_DIM}), got {rpe.shape}")
+        )
+        return checks
+    checks.append(RpeCorrectnessCheck("shape", True, str(tuple(rpe.shape))))
+
+    finite = bool(np.isfinite(rpe).all())
+    checks.append(
+        RpeCorrectnessCheck(
+            "finite",
+            finite,
+            "all channels finite" if finite else "non-finite values in cached RPE",
+        )
+    )
+
+    diagonal = np.arange(bus_count)
+    diag_adj = bool(np.allclose(rpe[diagonal, diagonal, 2], 0.0))
+    checks.append(
+        RpeCorrectnessCheck(
+            "diag_adjacency_zero",
+            diag_adj,
+            "diagonal adjacency is 0" if diag_adj else "diagonal adjacency must be 0",
+        )
+    )
+    diag_hop = bool(np.allclose(rpe[diagonal, diagonal, 3], 0.0))
+    checks.append(
+        RpeCorrectnessCheck(
+            "diag_hop_zero",
+            diag_hop,
+            "diagonal normalized hop is 0" if diag_hop else "diagonal hop must be 0",
+        )
+    )
+    diag_reff = bool(np.allclose(rpe[diagonal, diagonal, 4], 0.0))
+    checks.append(
+        RpeCorrectnessCheck(
+            "diag_reff_zero",
+            diag_reff,
+            "diagonal normalized Reff is 0" if diag_reff else "diagonal Reff must be 0",
+        )
+    )
+
+    hop_sym = bool(np.allclose(rpe[:, :, 3], rpe[:, :, 3].T, atol=1e-5))
+    checks.append(
+        RpeCorrectnessCheck(
+            "hop_symmetric",
+            hop_sym,
+            "normalized hop symmetric" if hop_sym else "hop channel not symmetric",
+        )
+    )
+    reff_sym = bool(np.allclose(rpe[:, :, 4], rpe[:, :, 4].T, atol=1e-4))
+    checks.append(
+        RpeCorrectnessCheck(
+            "reff_symmetric",
+            reff_sym,
+            "normalized Reff symmetric" if reff_sym else "Reff channel not symmetric",
+        )
+    )
+
+    y_abs = np.abs(ybus.astype(np.complex128))
+    admittance_errors: list[float] = []
+    for origin in range(bus_count):
+        comp = int(component[origin])
+        if comp < 0:
+            continue
+        y_scale = component_admittance_scale(y_abs, component, comp)
+        for destination in range(bus_count):
+            if int(component[destination]) != comp:
+                continue
+            admittance_errors.append(abs(rpe[origin, destination, 0] - ybus.real[origin, destination] / y_scale))
+            admittance_errors.append(abs(rpe[origin, destination, 1] - ybus.imag[origin, destination] / y_scale))
+    max_adm = float(max(admittance_errors)) if admittance_errors else 0.0
+    adm_ok = max_adm <= recompute_atol
+    checks.append(
+        RpeCorrectnessCheck(
+            "ybus_admittance_channels",
+            adm_ok,
+            f"max |RPE0/1 - Y/s_Y| = {max_adm:.3e} (tol {recompute_atol:.0e})",
+        )
+    )
+
+    if getattr(network, "branches", None) is not None:
+        branches = network.branches
+        assert branches is not None
+        adjacency = np.zeros((bus_count, bus_count), dtype=np.float32)
+        for origin, destination, _resistance, _reactance in branches:
+            adjacency[origin, destination] = 1.0
+            adjacency[destination, origin] = 1.0
+        adj_ok = bool(np.allclose(rpe[:, :, 2], adjacency, atol=1e-6))
+        checks.append(
+            RpeCorrectnessCheck(
+                "adjacency_vs_branches",
+                adj_ok,
+                f"{len(branches)} in-service branches"
+                + (" match channel 2" if adj_ok else " disagree with channel 2"),
+            )
+        )
+
+        expected, expected_component = meshed_rpe(bus_count, list(branches), ybus)
+        max_diff = float(np.max(np.abs(expected - rpe)))
+        recompute_ok = max_diff <= recompute_atol and np.array_equal(expected_component, component)
+        checks.append(
+            RpeCorrectnessCheck(
+                "recompute_from_ybus_branches",
+                recompute_ok,
+                f"max |recomputed - cached| = {max_diff:.3e} (tol {recompute_atol:.0e})",
+            )
+        )
+    else:
+        checks.append(
+            RpeCorrectnessCheck(
+                "recompute_from_ybus_branches",
+                True,
+                "skipped (branches not stored on Network; rebuild split cache to enable)",
+            )
+        )
+
+    walk_start = 5
+    for step in range(RPE_WALK_STEPS):
+        channel = walk_start + step
+        plane = rpe[:, :, channel]
+        row_sums: list[float] = []
+        for bus in range(bus_count):
+            if int(component[bus]) < 0:
+                continue
+            comp = int(component[bus])
+            same = component == comp
+            row_sums.append(float(plane[bus, same].sum()))
+        if not row_sums:
+            continue
+        max_row = float(max(row_sums))
+        min_row = float(min(row_sums))
+        walk_ok = max_row <= 1.0 + 1e-4 and min_row >= -1e-4
+        checks.append(
+            RpeCorrectnessCheck(
+                f"walk_P{step + 1}_row_sums",
+                walk_ok,
+                f"row sums on component in [{min_row:.4f}, {max_row:.4f}] (expect ~1 on connected buses)",
+            )
+        )
+
+    return checks
+
+
+def format_rpe_correctness_checks(checks: list[RpeCorrectnessCheck]) -> str:
+    lines = ["RPE correctness audit (cached tensor vs Ybus/branches invariants):"]
+    all_pass = all(check.passed for check in checks)
+    for check in checks:
+        mark = "OK" if check.passed else "FAIL"
+        lines.append(f"  [{mark}] {check.name}: {check.detail}")
+    if all_pass:
+        lines.append("  => RPE calculation checks passed for this topology.")
+    else:
+        lines.append("  => Fix meshed_rpe or split cache before trusting pair features.")
+    return "\n".join(lines)
+
+
 def component_admittance_scale(
     y_abs: np.ndarray,
     component: np.ndarray,
@@ -945,12 +1252,61 @@ def parse_val_every() -> int:
 
 
 def scenario_limit(raw: Path) -> int | None:
+    """Number of scenarios kept from the start of each split folder (prefix, not a random subset)."""
     if DATA_FRACTION >= 1.0:
         return None
     if DATA_FRACTION <= 0.0:
         raise ValueError(f"data fraction must be in (0, 1], got {DATA_FRACTION}")
     full = scenario_count(raw)
     return max(1, min(full, int(full * DATA_FRACTION)))
+
+
+def networks_match(left: Network, right: Network) -> bool:
+    return bool(
+        torch.equal(left.types, right.types)
+        and torch.allclose(left.ybus, right.ybus, rtol=1e-5, atol=1e-6)
+    )
+
+
+def merge_splits(base: Split, extra: Split) -> Split:
+    """Append ``extra`` scenarios after ``base``; reuse matching ``Network`` objects."""
+    network_map: dict[int, int] = {}
+    merged_networks = list(base.networks)
+    for local_id, network in enumerate(extra.networks):
+        matched = next(
+            (index for index, existing in enumerate(merged_networks) if networks_match(existing, network)),
+            None,
+        )
+        if matched is None:
+            matched = len(merged_networks)
+            merged_networks.append(network)
+        network_map[local_id] = matched
+    extra_index = extra.network_index.numpy()
+    mapped = np.array([network_map[int(value)] for value in extra_index], dtype=np.int64)
+    return Split(
+        name=base.name,
+        count=base.count + extra.count,
+        power_p=torch.cat([base.power_p, extra.power_p]),
+        power_q=torch.cat([base.power_q, extra.power_q]),
+        voltage=torch.cat([base.voltage, extra.voltage]),
+        angle=torch.cat([base.angle, extra.angle]),
+        network_index=torch.cat([base.network_index, torch.from_numpy(mapped)]),
+        networks=merged_networks,
+    )
+
+
+def extend_split_prefix(raw: Path, name: str, existing: Split, new_prefix_end: int) -> Split:
+    full = scenario_count(raw)
+    new_end = min(full, new_prefix_end)
+    if new_end <= existing.count:
+        raise ValueError(f"Cannot extend {name}: new prefix {new_end} <= existing {existing.count}.")
+    print(
+        f"Extending {name} prefix {existing.count} -> {new_end} (+{new_end - existing.count} scenarios); "
+        f"first {existing.count} scenarios unchanged.",
+        flush=True,
+    )
+    extra = read_split(raw, name, prefix_start=existing.count, prefix_end=new_end)
+    return merge_splits(existing, extra)
 
 
 YBusEntry = tuple[int, int, float, float]
@@ -1026,13 +1382,23 @@ def reference_mean_pbl(
     return float(mismatch.mean())
 
 
-def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
+def read_split(
+    raw: Path,
+    name: str,
+    *,
+    prefix_end: int | None = None,
+    prefix_start: int = 0,
+) -> Split:
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
     import pyarrow.parquet as pq
 
     full = scenario_count(raw)
-    count = full if limit is None else min(limit, full)
+    start = prefix_start
+    end = full if prefix_end is None else min(full, prefix_end)
+    if start < 0 or start >= end:
+        raise ValueError(f"{name}: invalid scenario prefix [{start}, {end}) for {full} scenarios.")
+    count = end - start
     branch_rows = pq.ParquetFile(raw / "branch_data.parquet").metadata.num_rows
     if branch_rows % full != 0:
         raise RuntimeError(f"{raw} branch rows are not one block per scenario.")
@@ -1040,7 +1406,7 @@ def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
     bus = pq.read_table(
         raw / "bus_data.parquet",
         columns=["scenario", "bus", "Pd", "Qd", "Pg", "Qg", "Vm", "Va", "PQ", "PV", "REF"],
-    ).slice(0, count * 118)
+    ).slice(start * 118, count * 118)
     buses = _blocks(bus.column("bus").to_numpy(), 118)
     scenario_blocks = _blocks(bus.column("scenario").to_numpy(), 118)
     if not np.all(scenario_blocks[:, :1] == scenario_blocks):
@@ -1063,7 +1429,7 @@ def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
     branch = pq.read_table(
         raw / "branch_data.parquet",
         columns=["scenario", "idx", "from_bus", "to_bus", "r", "x", "br_status"],
-    ).slice(0, count * branch_count)
+    ).slice(start * branch_count, count * branch_count)
     branch_scenario = _blocks(branch.column("scenario").to_numpy(), branch_count)
     bus_scenario = _blocks(bus.column("scenario").to_numpy(), 118)
     if not np.array_equal(branch_scenario[:, 0], bus_scenario[:, 0]):
@@ -1089,7 +1455,9 @@ def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
     _, network_ids = np.unique(signature, axis=0, return_inverse=True)
     print(
         f"{name}: {count} scenarios loaded"
-        f"{'' if limit is None else f' of {full}'} across {int(network_ids.max()) + 1} network(s).",
+        f"{'' if prefix_end is None else f' of {full}'}"
+        f"{'' if start == 0 else f' (prefix offset {start})'}"
+        f" across {int(network_ids.max()) + 1} network(s).",
         flush=True,
     )
 
@@ -1150,6 +1518,7 @@ def read_split(raw: Path, name: str, limit: int | None = None) -> Split:
                 rpe=torch.from_numpy(features),
                 component=torch.from_numpy(component.astype(np.int64)),
                 types=torch.from_numpy(types),
+                branches=tuple(branches),
             )
         )
     return Split(
@@ -1242,12 +1611,13 @@ def cached_split(active: Path, persistent: Path, raw: Path, name: str, limit: in
     tensor_path = active / f"{name}.pt"
     if stamp_path.exists() and tensor_path.exists():
         saved = json.loads(stamp_path.read_text(encoding="utf-8"))
-        if (
+        version_ok = (
             saved.get("version") == stamp["version"]
             and saved.get("checkpoint_version") == stamp["checkpoint_version"]
             and saved.get("bytes") == stamp["bytes"]
-            and saved.get("scenario_limit") == limit
-        ):
+        )
+        old_limit = saved.get("scenario_limit")
+        if version_ok and old_limit is not None and limit is not None and limit == old_limit:
             load_started = time.perf_counter()
             print(f"Loading cached {name} split from {tensor_path}", flush=True)
             payload = torch.load(tensor_path, map_location="cpu", weights_only=False)
@@ -1255,9 +1625,27 @@ def cached_split(active: Path, persistent: Path, raw: Path, name: str, limit: in
             print(f"  loaded {name} split in {elapsed:.1f}s ({tensor_path})", flush=True)
             sync_split_cache_to_drive(active, persistent)
             return payload
+        if version_ok and old_limit is not None and limit is not None and limit > old_limit:
+            existing = torch.load(tensor_path, map_location="cpu", weights_only=False)
+            if isinstance(existing, Split) and existing.count == old_limit:
+                build_started = time.perf_counter()
+                split = extend_split_prefix(raw, name, existing, limit)
+                print(
+                    f"  extended {name} split in {time.perf_counter() - build_started:.1f}s",
+                    flush=True,
+                )
+                torch.save(split, tensor_path)
+                stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
+                sync_split_cache_to_drive(active, persistent)
+                return split
+        if version_ok and old_limit is not None and limit is not None and limit < old_limit:
+            print(
+                f"Shrinking {name} data prefix {old_limit} -> {limit}; rebuilding split cache.",
+                flush=True,
+            )
     active.mkdir(parents=True, exist_ok=True)
     build_started = time.perf_counter()
-    split = read_split(raw, name, limit=limit)
+    split = read_split(raw, name, prefix_end=limit)
     print(f"  built {name} split from parquet in {time.perf_counter() - build_started:.1f}s", flush=True)
     save_started = time.perf_counter()
     torch.save(split, tensor_path)
@@ -1374,6 +1762,7 @@ def move_to(network: Network, device: torch.device) -> Network:
         types=types,
         pair_type_masks=masks,
         pair_embed=pair_embed,
+        branches=getattr(network, "branches", None),
     )
 
 
@@ -1905,6 +2294,7 @@ def train_seed(
                     sample,
                     device,
                     tag=f"seed {seed} epoch {epoch + 1} ({len(sample)} valid cases, network 0)",
+                    rpe_ablation=wants_rpe_ablation(default=False),
                 )
             start_epoch = epoch + 1
             finish_checkpoint_epoch(start_epoch)
@@ -2110,8 +2500,8 @@ def main() -> None:
     )
     if DATA_FRACTION < 1.0:
         print(
-            f"Data fraction {DATA_FRACTION}: first scenarios in each train/valid/test folder "
-            f"(keeps PFΔ split boundaries). {batch_note}",
+            f"Data fraction {DATA_FRACTION}: fixed prefix of scenarios in each folder "
+            f"(0..N-1 in parquet order; e.g. 0.30 keeps all of 0.25 plus the next 5%). {batch_note}",
             flush=True,
         )
     elif DATA_FRACTION > 1.0:
@@ -2222,7 +2612,13 @@ def main() -> None:
         )
 
 
-def cli_diagnose(checkpoint: Path | None = None, seed: int = 0, cases: int = 32) -> None:
+def cli_diagnose(
+    checkpoint: Path | None = None,
+    seed: int = 0,
+    cases: int = 32,
+    *,
+    rpe_ablation: bool | None = None,
+) -> None:
     global DATA_FRACTION
     ensure_runtime_packages()
     DATA_FRACTION = parse_data_fraction()
@@ -2261,6 +2657,8 @@ def cli_diagnose(checkpoint: Path | None = None, seed: int = 0, cases: int = 32)
     else:
         print(f"No checkpoint at {ckpt}; random init.", flush=True)
     sample = debug_sample_index(val_split, count=cases)
+    if rpe_ablation is None:
+        rpe_ablation = wants_rpe_ablation(default=True)
     print_forward_diagnostics(
         model,
         val_split,
@@ -2268,6 +2666,7 @@ def cli_diagnose(checkpoint: Path | None = None, seed: int = 0, cases: int = 32)
         sample,
         device,
         tag=f"diagnose seed {seed} ({len(sample)} valid cases)",
+        rpe_ablation=rpe_ablation,
     )
 
 
@@ -2285,7 +2684,7 @@ def verify_task11_splits(data_root: Path) -> None:
     ]
     for name, parts in checks:
         raw = data_root.joinpath(*parts)
-        read_split(raw, name, limit=scenario_limit(raw))
+        read_split(raw, name, prefix_end=scenario_limit(raw))
     print(f"verify_task11_splits OK ({len(checks)} folders)", flush=True)
 
 
@@ -2302,30 +2701,20 @@ def cli_verify_splits() -> None:
 
 
 def sanity_check_meshed_rpe(data_root: Path) -> None:
-    """Load one 118-bus case and verify meshed RPE shape and invariants."""
-    split = read_split(raw_dir(data_root, "train", "n", "feasible"), "sanity", limit=1)
-    rpe = split.networks[0].rpe.numpy()
-    if rpe.shape != (118, 118, RPE_DIM):
-        raise RuntimeError(f"Expected RPE shape (118, 118, {RPE_DIM}), got {rpe.shape}.")
-    if not np.isfinite(rpe).all():
-        raise RuntimeError("RPE sanity check failed: non-finite values.")
-    diagonal = np.arange(118)
-    if not np.allclose(rpe[diagonal, diagonal, 3], 0.0):
-        raise RuntimeError("Diagonal hop feature must be zero.")
-    if not np.allclose(rpe[diagonal, diagonal, 4], 0.0):
-        raise RuntimeError("Diagonal effective-resistance feature must be zero.")
-    if not np.allclose(rpe[diagonal, diagonal, 2], 0.0):
-        raise RuntimeError("Diagonal adjacency feature must be zero.")
-    neighbor = int(np.argmax(rpe[:, :, 2]))
+    """Load one 118-bus case and verify meshed RPE via the shared correctness audit."""
+    split = read_split(raw_dir(data_root, "train", "n", "feasible"), "sanity", prefix_end=1)
+    network = split.networks[0]
+    checks = audit_rpe_correctness(network)
+    text = format_rpe_correctness_checks(checks)
+    print(text, flush=True)
+    failed = [check for check in checks if not check.passed]
+    if failed:
+        raise RuntimeError(f"meshed RPE sanity failed: {failed[0].name} — {failed[0].detail}")
+    neighbor = int(np.argmax(network.rpe.numpy()[:, :, 2]))
     row, column = divmod(neighbor, 118)
-    if rpe[row, column, 2] < 0.5:
-        raise RuntimeError("Expected at least one directly connected bus pair.")
-    if not np.allclose(rpe[:, :, 3], rpe[:, :, 3].T, atol=1e-5):
-        raise RuntimeError("Normalized hop features are not symmetric.")
-    if not np.allclose(rpe[:, :, 4], rpe[:, :, 4].T, atol=1e-4):
-        raise RuntimeError("Normalized effective-resistance features are not symmetric.")
     print(
-        f"meshed RPE sanity OK: shape {rpe.shape}, neighbor ({row},{column}) A={rpe[row, column, 2]:.0f}",
+        f"meshed RPE sanity OK: shape {tuple(network.rpe.shape)}, "
+        f"sample neighbor ({row},{column}) A={network.rpe[row, column, 2].item():.0f}",
         flush=True,
     )
 
