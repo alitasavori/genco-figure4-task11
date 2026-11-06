@@ -38,13 +38,15 @@ Performance notes (Colab / large train split)
   not after every training batch.
 * **Optional**: ``GENCO_TPGT_VAL_EVERY=3`` or ``--val-every 3`` skips most
   validation passes (faster; coarser early stopping).
-* **Debug**: ``--debug`` or ``GENCO_TPGT_DEBUG=1`` prints oracle/flat-start/PBL,
-  state RMSE, static RPE scales, **RPE correctness audit** (Ybus/admittance,
-  symmetry, full recompute vs cache), and optional ablation each validation epoch.
-  ``--diagnose`` runs the same on a checkpoint (default includes **RPE zero-ablation**).
-  Skip ablation with ``--no-rpe-ablation``; force it during training debug with
-  ``GENCO_TPGT_RPE_ABLATION=1`` or ``--rpe-ablation``. ``--sanity-rpe`` runs the
-  correctness audit on one train case.
+* **Debug (on by default)**: every validation pass also scores a fixed training
+  subset (``train_pbl`` and ``gap`` in the epoch line). On checkpoint epochs the
+  run prints the forward report, RPE zero-ablation, RPE and residual correctness
+  audits on the validation topology, and contingency diagnostics on test N-1/N-2
+  (per-topology PBL spread, audits and ablation on the largest outage topologies,
+  RPE shift from the training topology). Disable with ``GENCO_TPGT_DEBUG=0`` or
+  ``--no-debug``; skip only the ablation with ``GENCO_TPGT_RPE_ABLATION=0``.
+  ``--diagnose`` runs the same on a saved checkpoint (``--no-contingency``,
+  ``--no-rpe-ablation`` to trim). ``--sanity-rpe`` audits one train case.
 """
 
 from __future__ import annotations
@@ -114,6 +116,8 @@ RPE_FEATURE_NAMES = (
 )
 # Bumped when pair-encoder input size or architecture changes; old Drive checkpoints are ignored.
 CHECKPOINT_VERSION = "meshed-rpe-10-v6-capacity"
+# Fixed training subset scored with val's PBL metric each validation pass (overfitting check).
+TRAIN_PROBE_CASES = 2000
 # Reference labels must satisfy nodal balance within this mean PBL (p.u.) when checked at load.
 REFERENCE_PBL_TOLERANCE = 1e-2
 # Off-diagonal |Y_pq| below this are treated as disconnected for admittance scaling.
@@ -132,6 +136,7 @@ TEST_PARTS = (
     ("C2I-N-1", "n-1", "nose"),
     ("C2I-N-2", "n-2", "nose"),
 )
+CONTINGENCY_DIAGNOSTIC_LABELS = ("N-1", "N-2")
 EXPECTED_COUNTS = {
     ("train", "n", "feasible"): 48600,
     ("valid", "n", "feasible"): 5400,
@@ -777,9 +782,98 @@ def format_forward_diagnostics(
             f"diag_mean {row['diag_mean']:+.4g}"
         )
     lines.append(
-        "Note: val PBL ~0.39 with state RMSE above means mismatch loss is not yet near GENCO solver accuracy; "
-        "compare oracle line first — if oracle is not ~0, fix data/units before the model."
+        "Read the oracle line first: if it is not ~1e-6, fix data/units before judging the model."
     )
+    return "\n".join(lines)
+
+
+def audit_residual_correctness(
+    model: TPGT,
+    split: Split,
+    network: Network,
+    index: np.ndarray,
+    device: torch.device,
+    *,
+    agreement_atol: float = 1e-4,
+) -> list[CorrectnessCheck]:
+    """Labels satisfy the torch residual; torch matches the numpy reference; model residuals match its output."""
+    model.eval()
+    chosen = np.asarray(index, dtype=np.int64)
+    power_p = split.power_p[chosen]
+    power_q = split.power_q[chosen]
+    voltage = split.voltage[chosen]
+    angle = split.angle[chosen]
+    types = network.types
+    ybus = network.ybus
+    specified, target = pack_case(
+        power_p.to(device), power_q.to(device), voltage.to(device), angle.to(device), types
+    )
+    checks: list[CorrectnessCheck] = []
+    with torch.no_grad():
+        oracle_residual = nodal_residual(specified, target, types, ybus)
+        oracle_per_case = torch.sqrt(oracle_residual[..., 0] ** 2 + oracle_residual[..., 1] ** 2).mean(dim=1)
+        oracle_mean = float(oracle_per_case.mean())
+        checks.append(
+            CorrectnessCheck(
+                "oracle_labels_torch",
+                oracle_mean <= REFERENCE_PBL_TOLERANCE,
+                f"torch residual on ground-truth labels: mean PBL {oracle_mean:.3e} "
+                f"(tol {REFERENCE_PBL_TOLERANCE:.0e}; ~1e-6 expected)",
+                value=oracle_mean,
+            )
+        )
+
+        ybus_np = ybus.detach().cpu().numpy()
+        numpy_per_case = np.array(
+            [
+                reference_mean_pbl(
+                    power_p[row].numpy().astype(np.float64),
+                    power_q[row].numpy().astype(np.float64),
+                    voltage[row].numpy().astype(np.float64),
+                    angle[row].numpy().astype(np.float64),
+                    ybus_np,
+                )
+                for row in range(len(chosen))
+            ]
+        )
+        gap = float(np.max(np.abs(numpy_per_case - oracle_per_case.cpu().numpy())))
+        checks.append(
+            CorrectnessCheck(
+                "torch_vs_numpy_reference",
+                gap <= agreement_atol,
+                f"max per-case |torch PBL - numpy PBL| = {gap:.3e} (tol {agreement_atol:.0e})",
+                value=gap,
+            )
+        )
+
+        pair = pair_features(model, network)
+        prediction, residuals = model(
+            specified, types, network.rpe, network.pair_type_masks, ybus, pair=pair
+        )
+        recomputed = nodal_residual(specified, prediction, types, ybus)
+        scale = float(residuals[-1].abs().max().clamp(min=1.0))
+        drift = float((recomputed - residuals[-1]).abs().max())
+        checks.append(
+            CorrectnessCheck(
+                "model_residual_matches_output",
+                drift <= agreement_atol * scale,
+                f"max |residual(final state) - stage residual| = {drift:.3e} "
+                f"(tol {agreement_atol * scale:.0e})",
+                value=drift,
+            )
+        )
+    return checks
+
+
+def format_correctness_checks(title: str, checks: list[CorrectnessCheck], failure_hint: str) -> str:
+    lines = [title]
+    for check in checks:
+        mark = "OK" if check.passed else "FAIL"
+        lines.append(f"  [{mark}] {check.name}: {check.detail}")
+    if all(check.passed for check in checks):
+        lines.append("  => all checks passed.")
+    else:
+        lines.append(f"  => {failure_hint}")
     return "\n".join(lines)
 
 
@@ -802,14 +896,22 @@ def print_forward_diagnostics(
         baseline, ablation_rows = collect_rpe_channel_ablation(model, split, network, index, device)
     text = text + "\n" + format_rpe_effectiveness_diagnostics(weight_rows, baseline, ablation_rows)
     text = text + "\n" + format_rpe_correctness_checks(audit_rpe_correctness(network))
+    text = text + "\n" + format_correctness_checks(
+        "Residual correctness audit (power-balance computation):",
+        audit_residual_correctness(model, split, network, index, device),
+        "Fix nodal_residual, units, or Ybus grouping before trusting PBL numbers.",
+    )
     print(text, flush=True)
 
 
 def wants_debug_diagnostics() -> bool:
+    """On by default; disable with ``--no-debug`` or ``GENCO_TPGT_DEBUG=0``."""
+    if "--no-debug" in sys.argv:
+        return False
     if "--debug" in sys.argv:
         return True
     flag = os.environ.get("GENCO_TPGT_DEBUG", "").strip().lower()
-    return flag in ("1", "true", "yes")
+    return flag not in ("0", "false", "no")
 
 
 def wants_rpe_ablation(*, default: bool) -> bool:
@@ -829,6 +931,134 @@ def debug_sample_index(split: Split, network_id: int = 0, count: int = 32) -> np
     index = torch.nonzero(split.network_index == network_id, as_tuple=False).flatten()
     take = min(int(count), int(index.numel()))
     return index[:take].numpy()
+
+
+def subset_split(split: Split, index: np.ndarray, name: str) -> Split:
+    """Rows ``index`` of ``split``; keeps the full network list so network ids stay valid."""
+    chosen = torch.as_tensor(np.asarray(index, dtype=np.int64))
+    return Split(
+        name=name,
+        count=int(chosen.numel()),
+        power_p=split.power_p[chosen],
+        power_q=split.power_q[chosen],
+        voltage=split.voltage[chosen],
+        angle=split.angle[chosen],
+        network_index=split.network_index[chosen],
+        networks=split.networks,
+    )
+
+
+def train_probe_split(split: Split, count: int) -> Split:
+    """Evenly spaced fixed subset of training cases, scored with the same PBL metric as validation."""
+    take = max(1, min(int(count), split.count))
+    index = np.unique(np.linspace(0, split.count - 1, take).round().astype(np.int64))
+    return subset_split(split, index, f"{split.name}_probe")
+
+
+def dominant_network_id(split: Split) -> int:
+    counts = torch.bincount(split.network_index, minlength=len(split.networks))
+    return int(torch.argmax(counts))
+
+
+def network_case_counts(split: Split) -> list[tuple[int, int]]:
+    """(network_id, case count) sorted by count, largest first."""
+    counts = torch.bincount(split.network_index, minlength=len(split.networks))
+    order = torch.argsort(counts, descending=True)
+    return [(int(net), int(counts[net])) for net in order if int(counts[net]) > 0]
+
+
+def rpe_shift_from_reference(rpe: torch.Tensor, reference: torch.Tensor) -> list[float]:
+    """Mean |RPE - reference RPE| per channel over off-diagonal pairs (how far a topology is from training)."""
+    diff = (rpe.detach().float().cpu() - reference.detach().float().cpu()).abs()
+    buses = diff.shape[0]
+    off = ~torch.eye(buses, dtype=torch.bool)
+    return [float(diff[..., channel][off].mean()) for channel in range(diff.shape[-1])]
+
+
+def print_contingency_diagnostics(
+    model: TPGT,
+    label: str,
+    split: Split,
+    networks: list[Network],
+    device: torch.device,
+    reference_rpe: torch.Tensor,
+    per_network_pbl: dict[int, list[float]],
+    *,
+    max_networks: int = 6,
+    cases_per_network: int = 8,
+) -> None:
+    """Per-topology PBL spread, plus RPE/residual audits and RPE ablation on the largest outage topologies."""
+    lines = [f"=== Contingency diagnostics {label} ({split.count} cases, {len(networks)} topologies) ==="]
+    scored = sorted(
+        ((total / count, net, int(count)) for net, (total, count) in per_network_pbl.items() if count > 0),
+        reverse=True,
+    )
+    if scored:
+        values = np.array([score for score, _net, _count in scored])
+        worst_score, worst_net, worst_count = scored[0]
+        lines.append(
+            f"Per-topology PBL: median {np.median(values):.4g}  p90 {np.quantile(values, 0.9):.4g}  "
+            f"best {values.min():.4g}  worst {worst_score:.4g} (topology {worst_net}, {worst_count} cases)"
+        )
+        lines.append(
+            "  Wide spread => a few outages dominate the mean; narrow spread => uniform topology-shift error."
+        )
+
+    chosen = network_case_counts(split)[:max_networks]
+    weight_total = 0
+    baseline_sum = 0.0
+    delta_sums = np.zeros(RPE_DIM, dtype=np.float64)
+    shift_sums = np.zeros(RPE_DIM, dtype=np.float64)
+    rpe_failures: dict[str, int] = {}
+    residual_failures: dict[str, int] = {}
+    worst_oracle = 0.0
+    for net, _count in chosen:
+        network = networks[net]
+        index = debug_sample_index(split, network_id=net, count=cases_per_network)
+        weight = len(index)
+        baseline, rows = collect_rpe_channel_ablation(model, split, network, index, device)
+        baseline_sum += baseline["pbl_mean"] * weight
+        delta_sums += np.array([row["delta_pbl_mean"] for row in rows]) * weight
+        shift_sums += np.array(rpe_shift_from_reference(network.rpe, reference_rpe)) * weight
+        weight_total += weight
+        for check in audit_rpe_correctness(network):
+            if not check.passed:
+                rpe_failures[check.name] = rpe_failures.get(check.name, 0) + 1
+        for check in audit_residual_correctness(model, split, network, index, device):
+            if check.name == "oracle_labels_torch" and check.value is not None:
+                worst_oracle = max(worst_oracle, check.value)
+            if not check.passed:
+                residual_failures[check.name] = residual_failures.get(check.name, 0) + 1
+        clear_pair_embed_cache([network])
+
+    checked = len(chosen)
+    if rpe_failures:
+        detail = ", ".join(f"{name} x{count}" for name, count in sorted(rpe_failures.items()))
+        lines.append(f"RPE correctness on {checked} topologies: FAIL ({detail})")
+    else:
+        lines.append(f"RPE correctness on {checked} topologies: OK")
+    if residual_failures:
+        detail = ", ".join(f"{name} x{count}" for name, count in sorted(residual_failures.items()))
+        lines.append(f"Residual correctness on {checked} topologies: FAIL ({detail})")
+    else:
+        lines.append(f"Residual correctness on {checked} topologies: OK (worst oracle PBL {worst_oracle:.3e})")
+
+    if weight_total > 0:
+        lines.append(
+            f"RPE zero-ablation averaged over {checked} topologies "
+            f"(baseline PBL {baseline_sum / weight_total:.4g}); shift = mean |RPE - training RPE|:"
+        )
+        deltas = delta_sums / weight_total
+        shifts = shift_sums / weight_total
+        for channel in np.argsort(-deltas):
+            lines.append(
+                f"  {RPE_FEATURE_NAMES[channel]:12s} ΔPBL {deltas[channel]:+.4g}  shift {shifts[channel]:.4g}"
+            )
+        lines.append(
+            "  Channels with large shift and large positive ΔPBL are what the model relies on and what "
+            "changes under outages — the likely source of N-1/N-2 instability."
+        )
+    print("\n".join(lines), flush=True)
 
 
 @dataclass
@@ -998,30 +1228,31 @@ def meshed_rpe(
 
 
 @dataclass
-class RpeCorrectnessCheck:
+class CorrectnessCheck:
     name: str
     passed: bool
     detail: str
+    value: float | None = None
 
 
-def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> list[RpeCorrectnessCheck]:
+def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> list[CorrectnessCheck]:
     """Structural checks plus optional full recompute from stored Ybus and in-service branches."""
     rpe = network.rpe.detach().cpu().numpy()
     ybus = network.ybus.detach().cpu().numpy()
     component = network.component.detach().cpu().numpy().astype(np.int64)
     bus_count = rpe.shape[0]
-    checks: list[RpeCorrectnessCheck] = []
+    checks: list[CorrectnessCheck] = []
 
     if rpe.shape != (bus_count, bus_count, RPE_DIM):
         checks.append(
-            RpeCorrectnessCheck("shape", False, f"expected ({bus_count}, {bus_count}, {RPE_DIM}), got {rpe.shape}")
+            CorrectnessCheck("shape", False, f"expected ({bus_count}, {bus_count}, {RPE_DIM}), got {rpe.shape}")
         )
         return checks
-    checks.append(RpeCorrectnessCheck("shape", True, str(tuple(rpe.shape))))
+    checks.append(CorrectnessCheck("shape", True, str(tuple(rpe.shape))))
 
     finite = bool(np.isfinite(rpe).all())
     checks.append(
-        RpeCorrectnessCheck(
+        CorrectnessCheck(
             "finite",
             finite,
             "all channels finite" if finite else "non-finite values in cached RPE",
@@ -1031,7 +1262,7 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
     diagonal = np.arange(bus_count)
     diag_adj = bool(np.allclose(rpe[diagonal, diagonal, 2], 0.0))
     checks.append(
-        RpeCorrectnessCheck(
+        CorrectnessCheck(
             "diag_adjacency_zero",
             diag_adj,
             "diagonal adjacency is 0" if diag_adj else "diagonal adjacency must be 0",
@@ -1039,7 +1270,7 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
     )
     diag_hop = bool(np.allclose(rpe[diagonal, diagonal, 3], 0.0))
     checks.append(
-        RpeCorrectnessCheck(
+        CorrectnessCheck(
             "diag_hop_zero",
             diag_hop,
             "diagonal normalized hop is 0" if diag_hop else "diagonal hop must be 0",
@@ -1047,7 +1278,7 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
     )
     diag_reff = bool(np.allclose(rpe[diagonal, diagonal, 4], 0.0))
     checks.append(
-        RpeCorrectnessCheck(
+        CorrectnessCheck(
             "diag_reff_zero",
             diag_reff,
             "diagonal normalized Reff is 0" if diag_reff else "diagonal Reff must be 0",
@@ -1056,7 +1287,7 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
 
     hop_sym = bool(np.allclose(rpe[:, :, 3], rpe[:, :, 3].T, atol=1e-5))
     checks.append(
-        RpeCorrectnessCheck(
+        CorrectnessCheck(
             "hop_symmetric",
             hop_sym,
             "normalized hop symmetric" if hop_sym else "hop channel not symmetric",
@@ -1064,7 +1295,7 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
     )
     reff_sym = bool(np.allclose(rpe[:, :, 4], rpe[:, :, 4].T, atol=1e-4))
     checks.append(
-        RpeCorrectnessCheck(
+        CorrectnessCheck(
             "reff_symmetric",
             reff_sym,
             "normalized Reff symmetric" if reff_sym else "Reff channel not symmetric",
@@ -1086,7 +1317,7 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
     max_adm = float(max(admittance_errors)) if admittance_errors else 0.0
     adm_ok = max_adm <= recompute_atol
     checks.append(
-        RpeCorrectnessCheck(
+        CorrectnessCheck(
             "ybus_admittance_channels",
             adm_ok,
             f"max |RPE0/1 - Y/s_Y| = {max_adm:.3e} (tol {recompute_atol:.0e})",
@@ -1102,7 +1333,7 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
             adjacency[destination, origin] = 1.0
         adj_ok = bool(np.allclose(rpe[:, :, 2], adjacency, atol=1e-6))
         checks.append(
-            RpeCorrectnessCheck(
+            CorrectnessCheck(
                 "adjacency_vs_branches",
                 adj_ok,
                 f"{len(branches)} in-service branches"
@@ -1114,7 +1345,7 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
         max_diff = float(np.max(np.abs(expected - rpe)))
         recompute_ok = max_diff <= recompute_atol and np.array_equal(expected_component, component)
         checks.append(
-            RpeCorrectnessCheck(
+            CorrectnessCheck(
                 "recompute_from_ybus_branches",
                 recompute_ok,
                 f"max |recomputed - cached| = {max_diff:.3e} (tol {recompute_atol:.0e})",
@@ -1122,7 +1353,7 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
         )
     else:
         checks.append(
-            RpeCorrectnessCheck(
+            CorrectnessCheck(
                 "recompute_from_ybus_branches",
                 True,
                 "skipped (branches not stored on Network; rebuild split cache to enable)",
@@ -1146,7 +1377,7 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
         min_row = float(min(row_sums))
         walk_ok = max_row <= 1.0 + 1e-4 and min_row >= -1e-4
         checks.append(
-            RpeCorrectnessCheck(
+            CorrectnessCheck(
                 f"walk_P{step + 1}_row_sums",
                 walk_ok,
                 f"row sums on component in [{min_row:.4f}, {max_row:.4f}] (expect ~1 on connected buses)",
@@ -1156,7 +1387,7 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
     return checks
 
 
-def format_rpe_correctness_checks(checks: list[RpeCorrectnessCheck]) -> str:
+def format_rpe_correctness_checks(checks: list[CorrectnessCheck]) -> str:
     lines = ["RPE correctness audit (cached tensor vs Ybus/branches invariants):"]
     all_pass = all(check.passed for check in checks)
     for check in checks:
@@ -1599,8 +1830,11 @@ def sync_split_cache_to_drive(active: Path, persistent: Path) -> None:
 
 def cached_split(active: Path, persistent: Path, raw: Path, name: str, limit: int | None = None) -> Split:
     sync_split_cache_from_drive(persistent, active)
+    full = scenario_count(raw)
     if limit is None:
         limit = scenario_limit(raw)
+    if limit is None:
+        limit = full
     stamp = {
         "version": CACHE_VERSION,
         "checkpoint_version": CHECKPOINT_VERSION,
@@ -1617,7 +1851,9 @@ def cached_split(active: Path, persistent: Path, raw: Path, name: str, limit: in
             and saved.get("bytes") == stamp["bytes"]
         )
         old_limit = saved.get("scenario_limit")
-        if version_ok and old_limit is not None and limit is not None and limit == old_limit:
+        if old_limit is None:
+            old_limit = full
+        if version_ok and limit == old_limit:
             load_started = time.perf_counter()
             print(f"Loading cached {name} split from {tensor_path}", flush=True)
             payload = torch.load(tensor_path, map_location="cpu", weights_only=False)
@@ -1625,7 +1861,7 @@ def cached_split(active: Path, persistent: Path, raw: Path, name: str, limit: in
             print(f"  loaded {name} split in {elapsed:.1f}s ({tensor_path})", flush=True)
             sync_split_cache_to_drive(active, persistent)
             return payload
-        if version_ok and old_limit is not None and limit is not None and limit > old_limit:
+        if version_ok and limit > old_limit:
             existing = torch.load(tensor_path, map_location="cpu", weights_only=False)
             if isinstance(existing, Split) and existing.count == old_limit:
                 build_started = time.perf_counter()
@@ -1638,7 +1874,7 @@ def cached_split(active: Path, persistent: Path, raw: Path, name: str, limit: in
                 stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
                 sync_split_cache_to_drive(active, persistent)
                 return split
-        if version_ok and old_limit is not None and limit is not None and limit < old_limit:
+        if version_ok and limit < old_limit:
             print(
                 f"Shrinking {name} data prefix {old_limit} -> {limit}; rebuilding split cache.",
                 flush=True,
@@ -1896,6 +2132,7 @@ def evaluate_pbl(
     networks: list[Network],
     device: torch.device,
     batch_size: int = EVAL_BATCH_SIZE,
+    per_network_out: dict[int, list[float]] | None = None,
 ) -> float:
     model.eval()
     clear_pair_embed_cache(networks)
@@ -1904,8 +2141,13 @@ def evaluate_pbl(
     with torch.no_grad():
         for network_id, index in iterate_indexes(split, seed=0, epoch=0, shuffle=False, batch_size=batch_size):
             _breakdown, score = run_batch(model, split, networks[network_id], index, device)
-            total += float(score) * len(index)
+            weighted = float(score) * len(index)
+            total += weighted
             seen += len(index)
+            if per_network_out is not None:
+                bucket = per_network_out.setdefault(network_id, [0.0, 0.0])
+                bucket[0] += weighted
+                bucket[1] += len(index)
     if seen != split.count:
         raise RuntimeError(f"Evaluated {seen} of {split.count} scenarios in {split.name}.")
     return total / seen
@@ -2037,6 +2279,7 @@ def restore_checkpoint_payload(
             "best_val": float(payload["best_val"]),
             "wait": int(payload["wait"]),
             "best_state": best_state,
+            "data_fraction": payload.get("data_fraction"),
         },
         None,
     )
@@ -2110,6 +2353,7 @@ def train_seed(
     grad_scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     train_networks = [move_to(network, device) for network in train_split.networks]
     val_networks = [move_to(network, device) for network in val_split.networks]
+    train_probe = train_probe_split(train_split, min(val_split.count, TRAIN_PROBE_CASES))
     start_epoch = 0
     best_val = float("inf")
     wait = 0
@@ -2121,6 +2365,17 @@ def train_seed(
         best_val = restored["best_val"]
         wait = restored["wait"]
         best_state = restored["best_state"]
+        saved_fraction = restored["data_fraction"]
+        if saved_fraction is None or float(saved_fraction) != DATA_FRACTION:
+            previous = "unknown" if saved_fraction is None else f"{float(saved_fraction):g}"
+            print(
+                f"Seed {seed}: checkpoint data fraction {previous} != current {DATA_FRACTION:g}; "
+                "keeping weights and optimizer, resetting best-val tracking (val set changed).",
+                flush=True,
+            )
+            best_val = float("inf")
+            wait = 0
+            best_state = None
     else:
         obsolete_reason = restore_obsolete or load_obsolete
         if obsolete_reason is not None:
@@ -2152,6 +2407,7 @@ def train_seed(
             "best_val": best_val,
             "wait": wait,
             "best_state": best_state,
+            "data_fraction": DATA_FRACTION,
         }
         torch.save(payload, epoch_path)
         torch.save(payload, checkpoint_path)
@@ -2263,7 +2519,17 @@ def train_seed(
                     device,
                     batch_size=eval_batch_size,
                 )
-                val_display = f"{val_score:.6f}"
+                train_probe_score = evaluate_pbl(
+                    model,
+                    train_probe,
+                    train_networks,
+                    device,
+                    batch_size=eval_batch_size,
+                )
+                val_display = (
+                    f"{val_score:.6f}  train_pbl {train_probe_score:.6f}  "
+                    f"gap {val_score - train_probe_score:+.4f}"
+                )
                 if val_score < best_val:
                     best_val = val_score
                     wait = 0
@@ -2285,16 +2551,17 @@ def train_seed(
                 ),
                 flush=True,
             )
-            if debug_diagnostics:
-                sample = debug_sample_index(val_split)
+            if debug_diagnostics and saves_checkpoint_epoch(epoch + 1):
+                val_net = dominant_network_id(val_split)
+                sample = debug_sample_index(val_split, network_id=val_net)
                 print_forward_diagnostics(
                     model,
                     val_split,
-                    val_networks[0],
+                    val_networks[val_net],
                     sample,
                     device,
-                    tag=f"seed {seed} epoch {epoch + 1} ({len(sample)} valid cases, network 0)",
-                    rpe_ablation=wants_rpe_ablation(default=False),
+                    tag=f"seed {seed} epoch {epoch + 1} ({len(sample)} valid cases, network {val_net})",
+                    rpe_ablation=wants_rpe_ablation(default=True),
                 )
             start_epoch = epoch + 1
             finish_checkpoint_epoch(start_epoch)
@@ -2462,6 +2729,7 @@ def test_model(
     active_cache: Path,
     persistent_cache: Path,
     eval_batch_size: int = EVAL_BATCH_SIZE,
+    after_split: Callable[[str, Split, list[Network], dict[int, list[float]]], None] | None = None,
 ) -> tuple[dict[str, float], dict[str, int]]:
     scores = {}
     counts = {}
@@ -2475,9 +2743,14 @@ def test_model(
         )
         networks = [move_to(network, device) for network in split.networks]
         clear_pair_embed_cache(networks)
-        scores[label] = evaluate_pbl(model, split, networks, device, batch_size=eval_batch_size)
+        per_network: dict[int, list[float]] = {}
+        scores[label] = evaluate_pbl(
+            model, split, networks, device, batch_size=eval_batch_size, per_network_out=per_network
+        )
         counts[label] = split.count
         print(f"test {label}: PBL {scores[label]:.6g} on {split.count} scenarios", flush=True)
+        if after_split is not None:
+            after_split(label, split, networks, per_network)
     return scores, counts
 
 
@@ -2559,6 +2832,14 @@ def main() -> None:
         f"({train_split.count} train, {val_split.count} valid cases)",
         flush=True,
     )
+    debug_diagnostics = wants_debug_diagnostics()
+    print(
+        "Debug diagnostics ON at checkpoint epochs (disable with GENCO_TPGT_DEBUG=0 or --no-debug)."
+        if debug_diagnostics
+        else "Debug diagnostics OFF.",
+        flush=True,
+    )
+    reference_rpe = train_split.networks[dominant_network_id(train_split)].rpe
     for seed in SEEDS:
         seed_dir = checkpoints / f"seed_{seed}"
         if (seed_dir / "complete.json").exists() and read_completed_epochs(seed_dir / "complete.json") >= EPOCHS:
@@ -2566,6 +2847,23 @@ def main() -> None:
             continue
 
         def on_epoch_end(model: TPGT, epoch_number: int, seed: int = seed) -> tuple[dict[str, float], dict[str, int]]:
+            def contingency_hook(
+                label: str,
+                split: Split,
+                networks: list[Network],
+                per_network: dict[int, list[float]],
+            ) -> None:
+                if label in CONTINGENCY_DIAGNOSTIC_LABELS:
+                    print_contingency_diagnostics(
+                        model,
+                        f"test {label} seed {seed} epoch {epoch_number}",
+                        split,
+                        networks,
+                        device,
+                        reference_rpe,
+                        per_network,
+                    )
+
             scores, counts = test_model(
                 model,
                 data,
@@ -2573,6 +2871,7 @@ def main() -> None:
                 active_cache,
                 persistent_cache,
                 eval_batch_size=EVAL_BATCH_SIZE,
+                after_split=contingency_hook if debug_diagnostics else None,
             )
             c2i_counts = {
                 "C2I-N": counts["C2I-N"],
@@ -2606,7 +2905,7 @@ def main() -> None:
             device,
             eval_batch_size=EVAL_BATCH_SIZE,
             val_every=VAL_EVERY,
-            debug_diagnostics=wants_debug_diagnostics(),
+            debug_diagnostics=debug_diagnostics,
             on_epoch_end=on_epoch_end,
             after_periodic_checkpoint=publish_checkpoint,
         )
@@ -2618,6 +2917,7 @@ def cli_diagnose(
     cases: int = 32,
     *,
     rpe_ablation: bool | None = None,
+    contingency: bool = True,
 ) -> None:
     global DATA_FRACTION
     ensure_runtime_packages()
@@ -2639,7 +2939,8 @@ def cli_diagnose(
         raw_dir(data, "valid", "n", "feasible"),
         "valid_n_feasible",
     )
-    network = move_to(val_split.networks[0], device)
+    val_net = dominant_network_id(val_split)
+    network = move_to(val_split.networks[val_net], device)
     model = TPGT().to(device)
     seed_dir = checkpoints / f"seed_{seed}"
     ckpt = checkpoint or (seed_dir / "last.pt")
@@ -2656,7 +2957,7 @@ def cli_diagnose(
             print(f"Could not load {ckpt}; random init.", flush=True)
     else:
         print(f"No checkpoint at {ckpt}; random init.", flush=True)
-    sample = debug_sample_index(val_split, count=cases)
+    sample = debug_sample_index(val_split, network_id=val_net, count=cases)
     if rpe_ablation is None:
         rpe_ablation = wants_rpe_ablation(default=True)
     print_forward_diagnostics(
@@ -2668,6 +2969,30 @@ def cli_diagnose(
         tag=f"diagnose seed {seed} ({len(sample)} valid cases)",
         rpe_ablation=rpe_ablation,
     )
+    if not contingency:
+        return
+    for label, topology, condition in TEST_PARTS:
+        if label not in CONTINGENCY_DIAGNOSTIC_LABELS:
+            continue
+        split = cached_split(
+            active_cache,
+            persistent_cache,
+            raw_dir(data, "test", topology, condition),
+            f"test_{topology}_{condition}",
+        )
+        networks = [move_to(item, device) for item in split.networks]
+        per_network: dict[int, list[float]] = {}
+        score = evaluate_pbl(model, split, networks, device, per_network_out=per_network)
+        print(f"test {label}: PBL {score:.6g} on {split.count} scenarios", flush=True)
+        print_contingency_diagnostics(
+            model,
+            f"test {label} diagnose seed {seed}",
+            split,
+            networks,
+            device,
+            val_split.networks[val_net].rpe,
+            per_network,
+        )
 
 
 def verify_task11_splits(data_root: Path) -> None:
@@ -2724,6 +3049,7 @@ if __name__ == "__main__":
         ckpt: Path | None = None
         seed = 0
         cases = 32
+        contingency = True
         args = sys.argv[2:]
         index = 0
         while index < len(args):
@@ -2736,9 +3062,16 @@ if __name__ == "__main__":
             elif args[index] == "--cases" and index + 1 < len(args):
                 cases = int(args[index + 1])
                 index += 2
+            elif args[index] == "--data-fraction" and index + 1 < len(args):
+                index += 2
+            elif args[index].startswith("--data-fraction=") or args[index] in ("--rpe-ablation", "--no-rpe-ablation"):
+                index += 1
+            elif args[index] == "--no-contingency":
+                contingency = False
+                index += 1
             else:
                 raise SystemExit(f"Unknown diagnose argument: {args[index]}")
-        cli_diagnose(checkpoint=ckpt, seed=seed, cases=cases)
+        cli_diagnose(checkpoint=ckpt, seed=seed, cases=cases, contingency=contingency)
     elif len(sys.argv) > 1 and sys.argv[1] == "--verify-splits":
         cli_verify_splits()
     elif len(sys.argv) > 1 and sys.argv[1] == "--sanity-rpe":
