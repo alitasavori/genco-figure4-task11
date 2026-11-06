@@ -18,7 +18,10 @@ from train_tpgt_task11 import (  # noqa: E402
     Split,
     audit_residual_correctness,
     audit_rpe_correctness,
+    contingency_class,
     evaluate_pbl,
+    nodal_residual,
+    pack_case,
     format_rpe_effectiveness_diagnostics,
     meshed_rpe,
     pair_encoder_input_weight_norms,
@@ -143,10 +146,32 @@ def test_contingency_diagnostics_report(capsys):
     evaluate_pbl(model, split, [network], torch.device("cpu"), batch_size=4, per_network_out=per_network)
     assert per_network[0][1] == 6
     print_contingency_diagnostics(
-        model, "tiny", split, [network], torch.device("cpu"), network.rpe, per_network
+        model, "tiny", split, [network], torch.device("cpu"), network, per_network
     )
     text = capsys.readouterr().out
     assert "Per-topology PBL" in text
+    assert "unchanged" in text
     assert "RPE correctness on 1 topologies: OK" in text
     assert "Residual correctness on 1 topologies: OK" in text
     assert "shift 0" in text
+
+
+def test_contingency_class_separates_line_and_generator_outages():
+    _split, base = tiny_consistent_split()
+    line = Network(
+        ybus=base.ybus * 0.5, rpe=base.rpe, component=base.component, types=base.types
+    )
+    generator = Network(
+        ybus=base.ybus, rpe=base.rpe, component=base.component, types=torch.tensor([0, 0, 2])
+    )
+    assert contingency_class(base, base) == "unchanged"
+    assert contingency_class(line, base) == "line outage"
+    assert contingency_class(generator, base) == "generator outage"
+
+
+def test_nodal_residual_returns_float32_and_is_exact_on_labels():
+    split, network = tiny_consistent_split()
+    specified, target = pack_case(split.power_p, split.power_q, split.voltage, split.angle, network.types)
+    residual = nodal_residual(specified, target, network.types, network.ybus)
+    assert residual.dtype == torch.float32
+    assert float(residual.abs().max()) < 1e-5

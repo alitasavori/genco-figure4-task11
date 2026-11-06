@@ -461,13 +461,18 @@ def nodal_residual(
     types: torch.Tensor,
     ybus: torch.Tensor,
 ) -> torch.Tensor:
-    """AC mismatch in per unit. Ybus is already per unit, so this does not divide by baseMVA again."""
+    """AC mismatch in per unit. Ybus is already per unit, so this does not divide by baseMVA again.
+
+    Evaluated in complex128: with TF32 enabled, a complex64 Ybus matmul on CUDA has a ~0.02 p.u. mean
+    error floor on case118 (|Y| up to ~390 with heavy cancellation), 10^4 x the label accuracy.
+    """
     physical = constrain_unknown(unknown, types)
     power_p, power_q, voltage, angle = assemble(specified, physical, types)
-    voltage_complex = voltage.to(torch.complex64) * torch.exp(1j * angle.to(torch.complex64))
-    current = torch.matmul(ybus, voltage_complex.transpose(0, 1)).transpose(0, 1)
+    voltage_complex = voltage.double() * torch.exp(1j * angle.double())
+    current = torch.matmul(ybus.to(torch.complex128), voltage_complex.transpose(0, 1)).transpose(0, 1)
     flow = voltage_complex * torch.conj(current)
-    return torch.stack((power_p - flow.real, power_q - flow.imag), dim=-1)
+    residual = torch.stack((power_p.double() - flow.real, power_q.double() - flow.imag), dim=-1)
+    return residual.float()
 
 
 @dataclass
@@ -975,20 +980,39 @@ def rpe_shift_from_reference(rpe: torch.Tensor, reference: torch.Tensor) -> list
     return [float(diff[..., channel][off].mean()) for channel in range(diff.shape[-1])]
 
 
+CONTINGENCY_CLASSES = ("line outage", "generator outage", "line+generator", "unchanged")
+
+
+def contingency_class(network: Network, reference: Network) -> str:
+    """Line outages change Ybus (and so the RPE); generator outages only change bus types (PV -> PQ)."""
+    line = not torch.allclose(
+        network.ybus.detach().cpu(), reference.ybus.detach().cpu(), rtol=1e-5, atol=1e-6
+    )
+    generator = not torch.equal(network.types.detach().cpu(), reference.types.detach().cpu())
+    if line and generator:
+        return "line+generator"
+    if line:
+        return "line outage"
+    if generator:
+        return "generator outage"
+    return "unchanged"
+
+
 def print_contingency_diagnostics(
     model: TPGT,
     label: str,
     split: Split,
     networks: list[Network],
     device: torch.device,
-    reference_rpe: torch.Tensor,
+    reference: Network,
     per_network_pbl: dict[int, list[float]],
     *,
-    max_networks: int = 6,
+    networks_per_class: int = 3,
     cases_per_network: int = 8,
 ) -> None:
-    """Per-topology PBL spread, plus RPE/residual audits and RPE ablation on the largest outage topologies."""
+    """PBL by contingency class, plus RPE/residual audits and RPE ablation on the largest groups of each class."""
     lines = [f"=== Contingency diagnostics {label} ({split.count} cases, {len(networks)} topologies) ==="]
+    classes = [contingency_class(network, reference) for network in networks]
     scored = sorted(
         ((total / count, net, int(count)) for net, (total, count) in per_network_pbl.items() if count > 0),
         reverse=True,
@@ -998,35 +1022,45 @@ def print_contingency_diagnostics(
         worst_score, worst_net, worst_count = scored[0]
         lines.append(
             f"Per-topology PBL: median {np.median(values):.4g}  p90 {np.quantile(values, 0.9):.4g}  "
-            f"best {values.min():.4g}  worst {worst_score:.4g} (topology {worst_net}, {worst_count} cases)"
+            f"best {values.min():.4g}  worst {worst_score:.4g} "
+            f"(topology {worst_net}, {classes[worst_net]}, {worst_count} cases)"
         )
-        lines.append(
-            "  Wide spread => a few outages dominate the mean; narrow spread => uniform topology-shift error."
-        )
+        lines.append("PBL by contingency class (line outage changes Ybus/RPE; generator outage changes bus types):")
+        for name in CONTINGENCY_CLASSES:
+            members = [(score, count) for score, net, count in scored if classes[net] == name]
+            if not members:
+                continue
+            cases = sum(count for _score, count in members)
+            mean = sum(score * count for score, count in members) / cases
+            lines.append(f"  {name:16s} {len(members):4d} topologies  {cases:5d} cases  mean PBL {mean:.4g}")
 
-    chosen = network_case_counts(split)[:max_networks]
-    weight_total = 0
-    baseline_sum = 0.0
-    delta_sums = np.zeros(RPE_DIM, dtype=np.float64)
-    shift_sums = np.zeros(RPE_DIM, dtype=np.float64)
+    chosen: list[tuple[int, str]] = []
+    for name in CONTINGENCY_CLASSES:
+        picked = [net for net, _count in network_case_counts(split) if classes[net] == name][:networks_per_class]
+        chosen.extend((net, name) for net in picked)
+
+    deltas: dict[str, np.ndarray] = {}
+    shifts: dict[str, np.ndarray] = {}
+    weights: dict[str, int] = {}
     rpe_failures: dict[str, int] = {}
     residual_failures: dict[str, int] = {}
-    worst_oracle = 0.0
-    for net, _count in chosen:
+    worst_values: dict[str, float] = {}
+    for net, name in chosen:
         network = networks[net]
         index = debug_sample_index(split, network_id=net, count=cases_per_network)
         weight = len(index)
-        baseline, rows = collect_rpe_channel_ablation(model, split, network, index, device)
-        baseline_sum += baseline["pbl_mean"] * weight
-        delta_sums += np.array([row["delta_pbl_mean"] for row in rows]) * weight
-        shift_sums += np.array(rpe_shift_from_reference(network.rpe, reference_rpe)) * weight
-        weight_total += weight
+        _baseline, rows = collect_rpe_channel_ablation(model, split, network, index, device)
+        deltas[name] = deltas.get(name, np.zeros(RPE_DIM)) + np.array([row["delta_pbl_mean"] for row in rows]) * weight
+        shifts[name] = shifts.get(name, np.zeros(RPE_DIM)) + np.array(
+            rpe_shift_from_reference(network.rpe, reference.rpe)
+        ) * weight
+        weights[name] = weights.get(name, 0) + weight
         for check in audit_rpe_correctness(network):
             if not check.passed:
                 rpe_failures[check.name] = rpe_failures.get(check.name, 0) + 1
         for check in audit_residual_correctness(model, split, network, index, device):
-            if check.name == "oracle_labels_torch" and check.value is not None:
-                worst_oracle = max(worst_oracle, check.value)
+            if check.value is not None:
+                worst_values[check.name] = max(worst_values.get(check.name, 0.0), check.value)
             if not check.passed:
                 residual_failures[check.name] = residual_failures.get(check.name, 0) + 1
         clear_pair_embed_cache([network])
@@ -1037,26 +1071,36 @@ def print_contingency_diagnostics(
         lines.append(f"RPE correctness on {checked} topologies: FAIL ({detail})")
     else:
         lines.append(f"RPE correctness on {checked} topologies: OK")
+    worst_text = ", ".join(f"worst {name} {value:.3e}" for name, value in sorted(worst_values.items()))
     if residual_failures:
         detail = ", ".join(f"{name} x{count}" for name, count in sorted(residual_failures.items()))
-        lines.append(f"Residual correctness on {checked} topologies: FAIL ({detail})")
+        lines.append(f"Residual correctness on {checked} topologies: FAIL ({detail}; {worst_text})")
     else:
-        lines.append(f"Residual correctness on {checked} topologies: OK (worst oracle PBL {worst_oracle:.3e})")
+        lines.append(f"Residual correctness on {checked} topologies: OK ({worst_text})")
 
-    if weight_total > 0:
+    present = [name for name in CONTINGENCY_CLASSES if weights.get(name)]
+    if present:
+        mean_delta = {name: deltas[name] / weights[name] for name in present}
+        mean_shift = {name: shifts[name] / weights[name] for name in present}
         lines.append(
-            f"RPE zero-ablation averaged over {checked} topologies "
-            f"(baseline PBL {baseline_sum / weight_total:.4g}); shift = mean |RPE - training RPE|:"
+            "RPE zero-ablation by class (ΔPBL when the channel is zeroed; shift = mean |RPE - training RPE|):"
         )
-        deltas = delta_sums / weight_total
-        shifts = shift_sums / weight_total
-        for channel in np.argsort(-deltas):
-            lines.append(
-                f"  {RPE_FEATURE_NAMES[channel]:12s} ΔPBL {deltas[channel]:+.4g}  shift {shifts[channel]:.4g}"
-            )
         lines.append(
-            "  Channels with large shift and large positive ΔPBL are what the model relies on and what "
-            "changes under outages — the likely source of N-1/N-2 instability."
+            "  " + " " * 12 + "".join(
+                f"  {name} ({sum(1 for _net, item in chosen if item == name)} topo)".ljust(32) for name in present
+            )
+        )
+        order = np.argsort(-np.mean([mean_delta[name] for name in present], axis=0))
+        for channel in order:
+            cells = "".join(
+                f"  ΔPBL {mean_delta[name][channel]:+.4g}  shift {mean_shift[name][channel]:.3g}".ljust(32)
+                for name in present
+            )
+            lines.append(f"  {RPE_FEATURE_NAMES[channel]:12s}{cells}")
+        lines.append(
+            "  Generator outages leave the RPE unchanged (shift 0): their error comes from the bus-type change, "
+            "not the pair features. For line outages, large shift plus large ΔPBL marks the channels that "
+            "move under outages and that the model depends on."
         )
     print("\n".join(lines), flush=True)
 
@@ -2839,7 +2883,7 @@ def main() -> None:
         else "Debug diagnostics OFF.",
         flush=True,
     )
-    reference_rpe = train_split.networks[dominant_network_id(train_split)].rpe
+    reference_network = train_split.networks[dominant_network_id(train_split)]
     for seed in SEEDS:
         seed_dir = checkpoints / f"seed_{seed}"
         if (seed_dir / "complete.json").exists() and read_completed_epochs(seed_dir / "complete.json") >= EPOCHS:
@@ -2860,7 +2904,7 @@ def main() -> None:
                         split,
                         networks,
                         device,
-                        reference_rpe,
+                        reference_network,
                         per_network,
                     )
 
@@ -2990,7 +3034,7 @@ def cli_diagnose(
             split,
             networks,
             device,
-            val_split.networks[val_net].rpe,
+            val_split.networks[val_net],
             per_network,
         )
 
