@@ -1,8 +1,8 @@
-"""Task 1.1 panel of GENCO Figure 4.
+"""Task 1.1 panel of GENCO Figure 4, and TPGT-vs-published bar plots for every PFΔ IEEE 118 task.
 
 Colors, category order, and axis text follow
 gridfm-graphkit scripts/pfdelta/make_pbl_barplots.py.
-The published table is table_a_8_genco_exponent_fixed.tex, Task 1.1.
+The published table is table_a_8_genco_exponent_fixed.tex (``PUBLISHED``; sources in ``PUBLISHED_SOURCES``).
 """
 
 from __future__ import annotations
@@ -28,33 +28,74 @@ PALETTE = {
 PAPER_YLIM = (0.0, 1.8)
 PUBLISHED_YTICKS = [0.0, 0.45, 0.9, 1.35, 1.8]
 
-# Mean ± std from the Task 1.1 rows of the table the authors plot.
-# GNS is labeled GNS-S on the figure.
-PUBLISHED_TASK11 = {
-    "GENCO Base": {
-        "N": (1.4e-3, 0.4e-3),
-        "N-1": (4.2e-2, 2.2e-2),
-        "N-2": (5.0e-2, 2.6e-2),
-        "C2I": (3.0e-1, 0.8e-1),
+TPGT_COLOR = "#1F4B99"
+
+# Mean ± std (p.u., 100 MVA base, three seeds) of mean power-balance loss from the table the authors
+# plot as GENCO Figure 4, keyed by task id ("1.3" is the "1.3, 2.1" row). GNS is labeled GNS-S.
+PUBLISHED = {
+    "1.1": {
+        "GENCO Base": {"N": (1.4e-3, 0.4e-3), "N-1": (4.2e-2, 2.2e-2), "N-2": (5.0e-2, 2.6e-2), "C2I": (3.0e-1, 0.8e-1)},
+        "CANOS-PF": {"N": (2.7e-2, 0.03e-2), "N-1": (7.0e-1, 0.8e-1), "N-2": (5.6e-1, 0.7e-1), "C2I": (1.1, 0.1)},
+        "GNS-S": {"N": (5.3e-1, 2.7e-1), "N-1": (6.8e-1, 2.6e-1), "N-2": (7.1e-1, 2.5e-1), "C2I": (1.0, 0.2)},
+        "PFNet": {"N": (3.2e-1, 0.2e-1), "N-1": (5.2e-1, 0.2e-1), "N-2": (5.3e-1, 0.3e-1), "C2I": (1.4, 0.1)},
     },
-    "CANOS-PF": {
-        "N": (2.7e-2, 0.03e-2),
-        "N-1": (7.0e-1, 0.8e-1),
-        "N-2": (5.6e-1, 0.7e-1),
-        "C2I": (1.1, 0.1),
+    "1.2": {
+        "GENCO Base": {"N": (1.7e-3, 1.3e-3), "N-1": (3.7e-3, 2.5e-3), "N-2": (5.5e-3, 3.7e-3), "C2I": (1.8e-1, 0.4e-1)},
+        "CANOS-PF": {"N": (3.8e-2, 0.2e-2), "N-1": (5.9e-2, 0.2e-2), "N-2": (7.7e-2, 0.3e-2), "C2I": (7.5e-1, 0.5e-1)},
+        "GNS-S": {"N": (3.6e-1, 0.3e-1), "N-1": (4.0e-1, 0.3e-1), "N-2": (4.1e-1, 0.3e-1), "C2I": (8.2e-1, 1.1e-1)},
+        "PFNet": {"N": (3.2e-1, 0.2e-1), "N-1": (4.0e-1, 0.2e-1), "N-2": (4.4e-1, 0.2e-1), "C2I": (1.2, 0.05)},
     },
-    "GNS-S": {
-        "N": (5.3e-1, 2.7e-1),
-        "N-1": (6.8e-1, 2.6e-1),
-        "N-2": (7.1e-1, 2.5e-1),
-        "C2I": (1.0, 0.2),
+    "1.3": {
+        "GENCO Base": {"N": (2.7e-3, 2.2e-3), "N-1": (4.6e-3, 3.4e-3), "N-2": (5.9e-3, 4.3e-3), "C2I": (2.2e-1, 0.8e-1)},
+        "CANOS-PF": {"N": (4.0e-2, 0.4e-2), "N-1": (5.6e-2, 0.5e-2), "N-2": (6.3e-2, 0.5e-2), "C2I": (7.2e-1, 0.9e-1)},
+        "GNS-S": {"N": (3.5e-1, 0.4e-1), "N-1": (3.8e-1, 0.4e-1), "N-2": (3.9e-1, 0.4e-1), "C2I": (7.7e-1, 0.5e-1)},
+        "PFNet": {"N": (3.4e-1, 0.08e-1), "N-1": (4.0e-1, 0.05e-1), "N-2": (4.2e-1, 0.09e-1), "C2I": (1.1, 0.03)},
     },
-    "PFNet": {
-        "N": (3.2e-1, 0.2e-1),
-        "N-1": (5.2e-1, 0.2e-1),
-        "N-2": (5.3e-1, 0.3e-1),
-        "C2I": (1.4, 0.1),
+    "2.3": {
+        "GENCO Base": {"N": (5.0e-3, 2.5e-3), "N-1": (8.1e-3, 3.7e-3), "N-2": (9.9e-3, 4.2e-3), "C2I": (2.5e-1, 0.4e-1)},
+        "CANOS-PF": {"N": (9.0e-2, 1.7e-2), "N-1": (1.2e-1, 0.2e-1), "N-2": (1.3e-1, 0.2e-1), "C2I": (8.3e-1, 0.4e-1)},
+        "GNS-S": {"N": (8.3e-1, 2.6e-1), "N-1": (8.8e-1, 2.7e-1), "N-2": (8.9e-1, 2.7e-1), "C2I": (1.3, 0.3)},
+        "PFNet": {"N": (4.1e-1, 0.6e-1), "N-1": (4.9e-1, 0.7e-1), "N-2": (5.1e-1, 0.7e-1), "C2I": (1.1, 0.08)},
     },
+    "4.1": {
+        "GENCO Base": {"N": (2.7e-2, 1.8e-2), "N-1": (3.6e-2, 2.4e-2), "N-2": (4.2e-2, 2.7e-2), "C2I": (2.1e-1, 1.2e-1)},
+        "CANOS-PF": {"N": (1.6e-1, 0.1e-1), "N-1": (2.0e-1, 0.2e-1), "N-2": (2.1e-1, 0.2e-1), "C2I": (8.0e-1, 0.4e-1)},
+        "GNS-S": {"N": (3.5e-1, 0.1e-1), "N-1": (3.7e-1, 0.2e-1), "N-2": (3.8e-1, 0.2e-1), "C2I": (6.6e-1, 0.3e-1)},
+        "PFNet": {"N": (4.5e-1, 0.4e-1), "N-1": (5.2e-1, 0.09e-1), "N-2": (5.3e-1, 0.07e-1), "C2I": (1.3, 0.04)},
+    },
+    "4.2": {
+        "GENCO Base": {"N": (4.4e-2, 3.8e-2), "N-1": (6.0e-2, 5.0e-2), "N-2": (7.0e-2, 5.7e-2), "C2I": (1.8e-1, 1.2e-1)},
+        "CANOS-PF": {"N": (1.2e-1, 0.02e-1), "N-1": (1.5e-1, 0.02e-1), "N-2": (1.6e-1, 0.03e-1), "C2I": (4.3e-1, 0.1e-1)},
+        "GNS-S": {"N": (4.0e-1, 0.9e-1), "N-1": (4.6e-1, 1.0e-1), "N-2": (4.6e-1, 1.0e-1), "C2I": (6.4e-1, 1.4e-1)},
+        "PFNet": {"N": (5.6e-1, 0.7e-1), "N-1": (6.6e-1, 0.7e-1), "N-2": (6.7e-1, 0.7e-1), "C2I": (1.2, 0.1)},
+    },
+    "4.3": {
+        "GENCO Base": {"N": (1.5e-1, 0.5e-1), "N-1": (2.0e-1, 0.6e-1), "N-2": (2.2e-1, 0.6e-1), "C2I": (1.3e-1, 0.5e-1)},
+        "CANOS-PF": {"N": (4.5e-1, 0.2e-1), "N-1": (5.7e-1, 0.2e-1), "N-2": (6.0e-1, 0.3e-1), "C2I": (3.7e-1, 0.2e-1)},
+        "GNS-S": {"N": (6.3e-1, 2.2e-1), "N-1": (7.3e-1, 2.4e-1), "N-2": (7.3e-1, 2.4e-1), "C2I": (7.0e-1, 2.8e-1)},
+        "PFNet": {"N": (1.2, 0.04), "N-1": (1.4, 0.04), "N-2": (1.5, 0.02), "C2I": (1.1, 0.07)},
+    },
+}
+PUBLISHED_TASK11 = PUBLISHED["1.1"]
+
+_GENCO_TABLE = (
+    "gridfm-graphkit 310e2f989b46058f3e6c5b4a56b7d03de06a3340 scripts/pfdelta/table_a_8_genco_exponent_fixed.tex"
+)
+_PFDELTA_TABLE = "PFΔ arXiv 2510.22048 Table A.8 (Power Balance Loss (Mean))"
+PUBLISHED_SOURCES = {
+    task: (
+        f"GENCO Base: {_GENCO_TABLE}, row {row} (= scripts/pfdelta/results/{task}/metrics_summary.csv rounded); "
+        f"CANOS-PF, GNS-S (GNS), PFNet: same table, identical to {_PFDELTA_TABLE}, row {row}"
+    )
+    for task, row in (
+        ("1.1", "1.1"),
+        ("1.2", "1.2"),
+        ("1.3", "1.3, 2.1"),
+        ("2.3", "2.3"),
+        ("4.1", "4.1"),
+        ("4.2", "4.2"),
+        ("4.3", "4.3"),
+    )
 }
 
 
@@ -171,6 +212,47 @@ def _ylim_for(grouped: dict) -> tuple[tuple[float, float], list[float]]:
     magnitude = 10 ** np.floor(np.log10(ymax))
     ymax = float(np.ceil(ymax / magnitude * 4) / 4 * magnitude)
     return (0.0, ymax), [i * ymax / 4 for i in range(5)]
+
+
+def plot_tpgt_comparison(
+    task: str,
+    label: str,
+    tpgt: dict[str, tuple[float, float]],
+    output: Path,
+    tpgt_label: str = "TPGT (this run)",
+) -> list[Path]:
+    """Mean PBL per test category: published models of ``task`` next to TPGT; writes ``output`` (SVG) and PNG."""
+    published = PUBLISHED.get(task, {})
+    models = [model for model in MODELS if model in published]
+    labels = [f"{model} (published)" for model in models] + [tpgt_label]
+    colors = [PALETTE[model] for model in models] + [TPGT_COLOR]
+    means = [[published[model][category][0] for category in CATEGORIES] for model in models]
+    stds = [[published[model][category][1] for category in CATEGORIES] for model in models]
+    means.append([tpgt[category][0] for category in CATEGORIES])
+    stds.append([tpgt[category][1] for category in CATEGORIES])
+    top = max(mean + std for row_mean, row_std in zip(means, stds) for mean, std in zip(row_mean, row_std))
+    plt.rcParams["svg.fonttype"] = "path"
+    figure, axis = plt.subplots(figsize=(10, 8))
+    positions = np.arange(len(CATEGORIES))
+    width = 0.75 / len(labels)
+    for index, name in enumerate(labels):
+        offset = (index - (len(labels) - 1) / 2) * width
+        axis.bar(positions + offset, means[index], width, yerr=stds[index], label=name, color=colors[index], capsize=2)
+    axis.set_xticks(positions)
+    axis.set_xticklabels(list(CATEGORIES))
+    axis.set_ylabel("Power Balance Loss (Mean) [p.u.]")
+    axis.set_ylim(0, max(PAPER_YLIM[1], 1.1 * top))
+    axis.yaxis.grid(True)
+    axis.legend(frameon=False, fontsize=9)
+    axis.set_title(f"Task {label}")
+    figure.tight_layout()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    png = output.with_suffix(".png")
+    figure.savefig(output, format="svg", bbox_inches="tight")
+    figure.savefig(png, format="png", dpi=120, bbox_inches="tight")
+    plt.close(figure)
+    print(f"wrote {output} and {png.name}", flush=True)
+    return [output, png]
 
 
 def plot_task11(results_dir: Path | None = None) -> list[Path]:

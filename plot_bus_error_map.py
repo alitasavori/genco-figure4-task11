@@ -15,6 +15,9 @@ Example (Colab):
       --cache-dir /content/tpgt_task11_cache
 Use ``--module`` / ``--module-path`` to import a different copy of the training module
 (it must match the checkpoint's architecture).
+
+In-process (training checkpoints): ``compute_from_model`` evaluates an already-loaded model on
+already-loaded splits and ``render`` writes the maps; ``write_bus_maps`` does both.
 """
 
 from __future__ import annotations
@@ -213,7 +216,7 @@ def legend_handles(*, outage_line=False, outage_gen=False, weakened=False):
     return handles
 
 
-def save_map(path, xy, pairs, ybus, types, values, norm, cmap, title, dpi, cbar_label, **kwargs):
+def save_map(path, xy, pairs, ybus, types, values, norm, cmap, title, dpi, cbar_label, verbose=True, **kwargs):
     import matplotlib.pyplot as plt
     from matplotlib.cm import ScalarMappable
 
@@ -230,7 +233,8 @@ def save_map(path, xy, pairs, ybus, types, values, norm, cmap, title, dpi, cbar_
     fig.tight_layout()
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
-    print(f"wrote {path}")
+    if verbose:
+        print(f"wrote {path}")
 
 
 def hop_table(label: str, hops: np.ndarray, values: np.ndarray, baseline: np.ndarray) -> None:
@@ -282,18 +286,42 @@ def compute(args: argparse.Namespace) -> dict:
     model.eval()
     epoch = payload.get("epoch", "?")
     print(f"checkpoint {args.checkpoint} epoch {epoch} on {device}", flush=True)
-
     val = torch.load(args.cache_dir / args.val_cache, map_location="cpu", weights_only=False)
+    n1 = torch.load(args.cache_dir / args.n1_cache, map_location="cpu", weights_only=False)
+    return compute_from_model(
+        t, model, val, n1, device, epoch=epoch, checkpoint_name=args.checkpoint.name,
+        val_cases=args.val_cases, batch=batch,
+    )
+
+
+def compute_from_model(
+    t,
+    model,
+    val,
+    n1,
+    device,
+    *,
+    epoch,
+    checkpoint_name: str,
+    val_cases: int = 256,
+    batch: int = 64,
+    progress: bool = True,
+) -> dict:
+    """Per-bus arrays for ``model`` on the dominant validation topology and every test N-1 topology.
+
+    ``t`` provides move_to, pair_features, pack_case, dominant_network_id, network_case_counts and
+    contingency_class (the training module or a namespace with those functions).
+    """
+    model.eval()
     ref_id = t.dominant_network_id(val)
     reference = val.networks[ref_id]
     pairs = branch_pairs(reference.ybus.detach().cpu().numpy())
     on_ref = np.nonzero(val.network_index.numpy() == ref_id)[0]
-    take = np.unique(np.linspace(0, len(on_ref) - 1, min(args.val_cases, len(on_ref))).round().astype(int))
+    take = np.unique(np.linspace(0, len(on_ref) - 1, min(val_cases, len(on_ref))).round().astype(int))
     val_res = per_bus_residual(t, model, val, ref_id, on_ref[take], device, batch)
-    del val
-    print(f"validation N: {len(take)} cases done", flush=True)
+    if progress:
+        print(f"validation N: {len(take)} cases done", flush=True)
 
-    n1 = torch.load(args.cache_dir / args.n1_cache, map_location="cpu", weights_only=False)
     counts = dict(t.network_case_counts(n1))
     net_index = n1.network_index.numpy()
     ids = np.array(sorted(counts), dtype=np.int64)
@@ -301,11 +329,11 @@ def compute(args: argparse.Namespace) -> dict:
     for row, net_id in enumerate(ids):
         idx = np.nonzero(net_index == net_id)[0]
         topo_pbl[row] = pbl(per_bus_residual(t, model, n1, int(net_id), idx, device, batch)).mean(axis=0)
-        if (row + 1) % 25 == 0:
+        if progress and (row + 1) % 25 == 0:
             print(f"test N-1: {row + 1}/{len(ids)} topologies", flush=True)
     return {
         "epoch": str(epoch),
-        "checkpoint": args.checkpoint.name,
+        "checkpoint": checkpoint_name,
         "val_cases": len(take),
         "val_pbl": pbl(val_res).mean(axis=0),
         "val_dp": np.abs(val_res[..., 0]).mean(axis=0),
@@ -330,12 +358,20 @@ def set_log_ticks(cbar, norm) -> None:
     cbar.ax.minorticks_off()
 
 
+MAP_FILES = (
+    "val_N_mean_pbl.png",
+    "val_N_dP_dQ.png",
+    "test_N1_gen_outage_worst.png",
+    "test_N1_line_outage_worst.png",
+    "test_N1_line_outage_median.png",
+)
+
+
 def main() -> None:
     args = parse_args()
     import matplotlib
 
     matplotlib.use("Agg")
-    from matplotlib.colors import LogNorm
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     if args.from_npz:
@@ -345,12 +381,32 @@ def main() -> None:
             raise SystemExit("--checkpoint and --cache-dir are required unless --from-npz is given")
         data = compute(args)
         np.savez_compressed(args.out_dir / "per_bus_pbl.npz", **data)
+    print(render(data, args.out_dir, layout_kind=args.layout, min_cases=args.min_cases, dpi=args.dpi))
+
+
+def write_bus_maps(t, model, val, n1, device, out_dir: Path, *, epoch, checkpoint_name: str,
+                   val_cases: int = 256, batch: int = 64) -> list[Path]:
+    """Evaluate ``model`` in-process and write the maps, ``per_bus_pbl.npz`` and ``summary.txt`` to ``out_dir``."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data = compute_from_model(t, model, val, n1, device, epoch=epoch, checkpoint_name=checkpoint_name,
+                              val_cases=val_cases, batch=batch, progress=False)
+    np.savez_compressed(out_dir / "per_bus_pbl.npz", **data)
+    render(data, out_dir, verbose=False)
+    return [out_dir / name for name in MAP_FILES if (out_dir / name).is_file()]
+
+
+def render(data: dict, out_dir: Path, *, layout_kind: str = "geodata", min_cases: int = 5, dpi: int = 150,
+           verbose: bool = True) -> str:
+    """Draw every map from ``data`` (see ``compute_from_model``) into ``out_dir``; returns the summary text."""
+    from matplotlib.colors import LogNorm
+
+    out_dir.mkdir(parents=True, exist_ok=True)
     epoch = str(data["epoch"])
     val_pbl, val_dp, val_dq = data["val_pbl"], data["val_dp"], data["val_dq"]
     ref_y, ref_types = data["ref_ybus"], data["ref_types"]
     val_cases = int(data["val_cases"])
     pairs = branch_pairs(ref_y)
-    xy, layout_name = layout(args.layout, pairs)
+    xy, layout_name = layout(layout_kind, pairs)
 
     row_of = {int(n): row for row, n in enumerate(data["topo_ids"])}
     counts = {int(n): int(c) for n, c in zip(data["topo_ids"], data["topo_counts"])}
@@ -360,7 +416,7 @@ def main() -> None:
 
     def ranked(name):
         return sorted(
-            (float(per_topology[n].mean()), n) for n in counts if classes[n] == name and counts[n] >= args.min_cases
+            (float(per_topology[n].mean()), n) for n in counts if classes[n] == name and counts[n] >= min_cases
         )
 
     gens = ranked("generator outage")
@@ -392,9 +448,9 @@ def main() -> None:
 
     cmap = "magma"
     title_tail = f"\nepoch {epoch} | {layout_name} | {scale}"
-    save_map(args.out_dir / "val_N_mean_pbl.png", xy, pairs, ref_y, ref_types, val_pbl, norm, cmap,
+    save_map(out_dir / "val_N_mean_pbl.png", xy, pairs, ref_y, ref_types, val_pbl, norm, cmap,
              f"Validation N ({val_cases} cases): mean per-bus PBL {val_pbl.mean():.4f} p.u.{title_tail}",
-             args.dpi, "mean per-bus PBL (p.u.)")
+             dpi, "mean per-bus PBL (p.u.)", verbose=verbose)
 
     import matplotlib.pyplot as plt
     from matplotlib.cm import ScalarMappable
@@ -409,9 +465,10 @@ def main() -> None:
                         label="mean |mismatch| (p.u., log)")
     set_log_ticks(cbar, pq_norm)
     fig.suptitle(f"Validation N ({val_cases} cases), epoch {epoch} | {layout_name}", fontsize=11)
-    fig.savefig(args.out_dir / "val_N_dP_dQ.png", dpi=args.dpi, bbox_inches="tight")
+    fig.savefig(out_dir / "val_N_dP_dQ.png", dpi=dpi, bbox_inches="tight")
     plt.close(fig)
-    print(f"wrote {args.out_dir / 'val_N_dP_dQ.png'}")
+    if verbose:
+        print(f"wrote {out_dir / 'val_N_dP_dQ.png'}")
 
     for key, label, net_id in picks:
         types = data["topo_types"][row_of[net_id]]
@@ -426,10 +483,11 @@ def main() -> None:
         if lost_gens:
             what.append("generator at bus " + ", ".join(str(b + 1) for b in lost_gens))
         outage = "; ".join(what) or "no visible change"
-        save_map(args.out_dir / f"test_N1_{key}.png", xy, pairs, ref_y, types, values, norm, cmap,
+        save_map(out_dir / f"test_N1_{key}.png", xy, pairs, ref_y, types, values, norm, cmap,
                  f"Test N-1 {label}: topology {net_id} ({counts[net_id]} cases), out: {outage}\n"
                  f"mean PBL {values.mean():.4f} p.u.{title_tail}",
-                 args.dpi, "mean per-bus PBL (p.u.)", removed=removed, weakened=weakened, rings=lost_gens)
+                 dpi, "mean per-bus PBL (p.u.)", removed=removed, weakened=weakened, rings=lost_gens,
+                 verbose=verbose)
         with redirect_stdout(report):
             print(f"\n{label}: topology {net_id}, {counts[net_id]} cases, out: {outage}, mean PBL {values.mean():.4f}")
             print("  worst 10 buses:", ", ".join(f"{b + 1}({values[b]:.3f})" for b in np.argsort(-values)[:10]))
@@ -437,8 +495,8 @@ def main() -> None:
                 hop_table(label, hop_distances(pairs, sources), values, val_pbl)
 
     text = report.getvalue()
-    print(text)
-    (args.out_dir / "summary.txt").write_text(text, encoding="utf-8")
+    (out_dir / "summary.txt").write_text(text, encoding="utf-8")
+    return text
 
 
 if __name__ == "__main__":

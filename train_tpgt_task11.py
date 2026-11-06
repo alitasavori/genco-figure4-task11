@@ -1,6 +1,18 @@
-"""Train the unshared type-pair graph Transformer on IEEE 118-bus Task 1.1.
+"""Train the unshared type-pair graph Transformer on IEEE 118-bus PFΔ tasks (default Task 1.1).
 
 Option II from the draft: each correction stage has its own weights.
+
+Tasks (``--task`` or ``GENCO_TPGT_TASK``; see ``TASKS``)
+----------------------------------------------------
+1.1 (default), 1.2, 1.3 (alias 2.1), 2.3, 4.1, 4.2, 4.3. Data: ``Foundation Model/vendor/pfdelta_task<id>``
+(override ``GENCO_PFDELTA_TASK<id without dot>``, e.g. ``GENCO_PFDELTA_TASK42``), downloaded from
+``gridfm/pfdelta_task<id>`` when missing. Training and validation use the union of the task's
+train/valid folders (each cached and cut to ``DATA_FRACTION`` on its own, then merged); every task
+is tested on N, N-1, N-2 and C2I. Task 1.1 keeps ``tpgt_task11_<RUN_TAG>``; other tasks write to
+``tpgt_task<id>_<RUN_TAG>`` (results inside it). Each optimizer step takes the next 32 cases of
+one global shuffle and runs one forward/backward per topology among them; networks stay on the
+CPU and only those in use are moved to the device (``DeviceNetworks``). Checkpoint epochs also
+write a bar plot against the published numbers and IEEE 118 bus error maps.
 The hidden sizes, depth, batch, and epoch cap below are implementation
 choices so a Colab GPU can finish a run. They are not paper hyperparameters.
 
@@ -66,6 +78,7 @@ Performance notes (Colab / large train split)
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import gc
@@ -75,9 +88,11 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -92,7 +107,7 @@ from common import (
     upsert_csv,
 )
 from metrics import aggregate_c2i, sample_mean, sample_std
-from plot_task1_1 import PALETTE, PUBLISHED_TASK11
+from plot_task1_1 import PUBLISHED, plot_tpgt_comparison
 from storage import ROOT, in_colab, mount_drive
 
 # Implementation choices, not values from the draft.
@@ -161,6 +176,15 @@ TEST_PARTS = (
     ("C2I-N-2", "n-2", "nose"),
 )
 CONTINGENCY_DIAGNOSTIC_LABELS = ("N-1", "N-2")
+TOPOLOGIES = ("n", "n-1", "n-2")
+CONDITIONS = ("feasible", "nose", "around_nose")
+PARQUET_FILES = ("bus_data.parquet", "branch_data.parquet", "gen_data.parquet", "y_bus_data.parquet")
+# Train/valid splits with at least this many topologies keep non-dominant RPEs in float16 on CPU.
+COMPACT_MIN_NETWORKS = 512
+# Device copies of networks kept per split (least recently used are dropped).
+DEVICE_NETWORK_CACHE = 64
+# Bus error maps at checkpoint epochs: validation cases on the dominant topology.
+BUS_MAP_VAL_CASES = 256
 EXPECTED_COUNTS = {
     ("train", "n", "feasible"): 48600,
     ("valid", "n", "feasible"): 5400,
@@ -181,9 +205,80 @@ EVAL_BATCH_SIZE = 64
 VAL_EVERY = 1
 
 
+@dataclass(frozen=True)
+class TaskSpec:
+    """A PFΔ IEEE 118 task: ``data_id`` names the HF dataset, ``task_id`` the run folder and tables."""
+
+    task_id: str
+    data_id: str
+    label: str
+    description: str
+    folders: tuple[tuple[str, str], ...]
+
+    @property
+    def is_task11(self) -> bool:
+        return self.task_id == "1.1"
+
+    @property
+    def run_dir_name(self) -> str:
+        return RUN_DIR_NAME if self.is_task11 else f"tpgt_task{self.task_id}_{RUN_TAG}"
+
+    @property
+    def file_tag(self) -> str:
+        return self.task_id.replace(".", "_")
+
+    @property
+    def dataset_repo(self) -> str:
+        return f"gridfm/pfdelta_task{self.data_id}"
+
+    @property
+    def dataset_env(self) -> str:
+        return "GENCO_PFDELTA_TASK" + self.data_id.replace(".", "")
+
+
+def _folders(topologies: tuple[str, ...], conditions: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    return tuple((topology, condition) for topology in topologies for condition in conditions)
+
+
+# Train/valid folders per task as published on Hugging Face (gridfm/pfdelta_task<id>, case118).
+TASKS = {
+    "1.1": TaskSpec("1.1", "1.1", "1.1", "train N", _folders(("n",), ("feasible",))),
+    "1.2": TaskSpec("1.2", "1.2", "1.2", "train N + N-1", _folders(("n", "n-1"), ("feasible",))),
+    "1.3": TaskSpec("1.3", "1.3", "1.3/2.1", "train N + N-1 + N-2", _folders(TOPOLOGIES, ("feasible",))),
+    "2.3": TaskSpec(
+        "2.3", "2.3", "2.3", "train N + N-1 + N-2 with 3x less data", _folders(TOPOLOGIES, ("feasible",))
+    ),
+    "4.1": TaskSpec("4.1", "4.1", "4.1", "90% feasible + 10% C2I", _folders(TOPOLOGIES, ("feasible", "nose"))),
+    "4.2": TaskSpec(
+        "4.2", "4.2", "4.2", "50% feasible + 10% C2I + 40% approaching infeasibility", _folders(TOPOLOGIES, CONDITIONS)
+    ),
+    "4.3": TaskSpec(
+        "4.3", "4.3", "4.3", "20% C2I + 80% approaching infeasibility", _folders(TOPOLOGIES, ("nose", "around_nose"))
+    ),
+}
+TASK_ALIASES = {"2.1": "1.3", "1.3/2.1": "1.3"}
+
+
+def task_spec(name: str) -> TaskSpec:
+    key = TASK_ALIASES.get(name.strip(), name.strip())
+    if key not in TASKS:
+        allowed = ", ".join([*TASKS, *TASK_ALIASES])
+        raise ValueError(f"unknown PFΔ task {name!r}; choose one of {allowed}")
+    return TASKS[key]
+
+
+def parse_task() -> TaskSpec:
+    for index, arg in enumerate(sys.argv):
+        if arg == "--task" and index + 1 < len(sys.argv):
+            return task_spec(sys.argv[index + 1])
+        if arg.startswith("--task="):
+            return task_spec(arg.split("=", 1)[1])
+    return task_spec(os.environ.get("GENCO_TPGT_TASK", "").strip() or "1.1")
+
+
 def ensure_runtime_packages() -> None:
     missing = []
-    for name in ("pyarrow", "huggingface_hub", "matplotlib"):
+    for name in ("pyarrow", "huggingface_hub", "matplotlib", "scipy", "networkx"):
         try:
             __import__(name)
         except ImportError:
@@ -1079,7 +1174,7 @@ def print_contingency_diagnostics(
     model: TPGT,
     label: str,
     split: Split,
-    networks: list[Network],
+    networks: list[Network] | DeviceNetworks,
     device: torch.device,
     reference: Network,
     per_network_pbl: dict[int, list[float]],
@@ -1089,7 +1184,7 @@ def print_contingency_diagnostics(
 ) -> None:
     """PBL by contingency class, plus RPE/residual audits and RPE ablation on the largest groups of each class."""
     lines = [f"=== Contingency diagnostics {label} ({split.count} cases, {len(networks)} topologies) ==="]
-    classes = [contingency_class(network, reference) for network in networks]
+    classes = [contingency_class(network, reference) for network in split.networks]
     scored = sorted(
         ((total / count, net, int(count)) for net, (total, count) in per_network_pbl.items() if count > 0),
         reverse=True,
@@ -1222,58 +1317,39 @@ def meshed_rpe(
     For a non-adjacent pair, Y_ij is zero but hop and effective resistance
     are positive. That is expected: direct admittance is local, while hop
     and resistance summarize the full meshed graph. They are not contradictory.
+
+    Components are numbered in order of their lowest bus index; buses with no
+    in-service branch form singleton components with zero hop and resistance.
     """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components, shortest_path
+
     y = ybus.astype(np.complex128)
     y_abs = np.abs(y)
-    adjacency: list[set[int]] = [set() for _ in range(bus_count)]
     weight = np.zeros((bus_count, bus_count), dtype=np.float64)
-    for origin, destination, resistance, reactance in branches:
-        magnitude = math.hypot(resistance, reactance)
-        if magnitude <= 0:
-            continue
-        branch_weight = 1.0 / magnitude
-        weight[origin, destination] += branch_weight
-        weight[destination, origin] += branch_weight
-        adjacency[origin].add(destination)
-        adjacency[destination].add(origin)
+    adjacency = np.zeros((bus_count, bus_count), dtype=bool)
+    table = np.asarray(branches, dtype=np.float64).reshape(-1, 4)
+    magnitude = np.hypot(table[:, 2], table[:, 3])
+    table = table[magnitude > 0]
+    if table.shape[0]:
+        origin = table[:, 0].astype(np.int64)
+        destination = table[:, 1].astype(np.int64)
+        branch_weight = 1.0 / magnitude[magnitude > 0]
+        rows = np.stack((origin, destination), axis=1).ravel()
+        columns = np.stack((destination, origin), axis=1).ravel()
+        np.add.at(weight, (rows, columns), np.repeat(branch_weight, 2))
+        adjacency[rows, columns] = True
 
-    component = np.full(bus_count, -1, dtype=np.int64)
-    component_id = 0
-    for start in range(bus_count):
-        if component[start] >= 0:
-            continue
-        queue = [start]
-        component[start] = component_id
-        head = 0
-        while head < len(queue):
-            bus = queue[head]
-            head += 1
-            for neighbor in adjacency[bus]:
-                if component[neighbor] >= 0:
-                    continue
-                component[neighbor] = component_id
-                queue.append(neighbor)
-        component_id += 1
+    graph = csr_matrix(adjacency.astype(np.float64))
+    _count, labels = connected_components(graph, directed=False)
+    _unique, first_bus, inverse = np.unique(labels, return_index=True, return_inverse=True)
+    rank = np.empty(first_bus.size, dtype=np.int64)
+    rank[np.argsort(first_bus, kind="stable")] = np.arange(first_bus.size)
+    component = rank[inverse.reshape(-1)].astype(np.int64)
+    component_id = int(first_bus.size)
 
-    hop = np.zeros((bus_count, bus_count), dtype=np.float64)
-    for start in range(bus_count):
-        if not adjacency[start]:
-            continue
-        distances = np.full(bus_count, -1, dtype=np.int64)
-        distances[start] = 0
-        queue = [start]
-        head = 0
-        while head < len(queue):
-            bus = queue[head]
-            head += 1
-            for neighbor in adjacency[bus]:
-                if distances[neighbor] >= 0:
-                    continue
-                distances[neighbor] = distances[bus] + 1
-                queue.append(neighbor)
-        for destination in range(bus_count):
-            if distances[destination] >= 0:
-                hop[start, destination] = float(distances[destination])
+    hop = shortest_path(graph, method="D", directed=False, unweighted=True)
+    hop[~np.isfinite(hop)] = 0.0
 
     scale_y = np.ones(component_id, dtype=np.float64)
     hop_scale = np.ones(component_id, dtype=np.float64)
@@ -1281,51 +1357,29 @@ def meshed_rpe(
     effective = np.zeros((bus_count, bus_count), dtype=np.float64)
     for comp in range(component_id):
         buses = np.flatnonzero(component == comp)
-        if buses.size == 0:
-            continue
         scale_y[comp] = component_admittance_scale(y_abs, component, comp)
-        finite_hop = hop[np.ix_(buses, buses)]
-        max_hop = float(finite_hop.max()) if buses.size else 0.0
+        max_hop = float(hop[np.ix_(buses, buses)].max())
         hop_scale[comp] = max_hop if max_hop > 0 else 1.0
-        sub_weight = weight[np.ix_(buses, buses)]
-        sub_degree = np.sum(sub_weight, axis=1)
-        sub_laplacian = np.diag(sub_degree) - sub_weight
         if buses.size == 1:
             continue
+        sub_weight = weight[np.ix_(buses, buses)]
+        sub_laplacian = np.diag(np.sum(sub_weight, axis=1)) - sub_weight
         pseudoinverse = np.linalg.pinv(sub_laplacian)
-        for local_i, bus_i in enumerate(buses):
-            for local_j, bus_j in enumerate(buses):
-                delta = pseudoinverse[local_i, local_i] + pseudoinverse[local_j, local_j]
-                delta -= 2.0 * pseudoinverse[local_i, local_j]
-                effective[bus_i, bus_j] = max(delta, 0.0)
+        diagonal = np.diag(pseudoinverse)
+        delta = (diagonal[:, None] + diagonal[None, :]) - 2.0 * pseudoinverse
+        effective[np.ix_(buses, buses)] = np.maximum(delta, 0.0)
         max_resistance = float(effective[np.ix_(buses, buses)].max())
         resistance_scale[comp] = max_resistance if max_resistance > 0 else 1.0
 
-    adjacency_flag = np.zeros((bus_count, bus_count), dtype=np.float32)
-    for origin in range(bus_count):
-        for destination in adjacency[origin]:
-            adjacency_flag[origin, destination] = 1.0
-
+    same = component[:, None] == component[None, :]
+    off_diagonal = same & ~np.eye(bus_count, dtype=bool)
     features = np.zeros((bus_count, bus_count, RPE_DIM), dtype=np.float32)
-    for origin in range(bus_count):
-        comp = int(component[origin])
-        if comp < 0:
-            continue
-        y_scale = scale_y[comp]
-        h_scale = hop_scale[comp]
-        r_scale = resistance_scale[comp]
-        for destination in range(bus_count):
-            if component[destination] != comp:
-                continue
-            features[origin, destination, 0] = y.real[origin, destination] / y_scale
-            features[origin, destination, 1] = y.imag[origin, destination] / y_scale
-            features[origin, destination, 2] = adjacency_flag[origin, destination]
-            if origin == destination:
-                features[origin, destination, 3] = 0.0
-                features[origin, destination, 4] = 0.0
-            else:
-                features[origin, destination, 3] = hop[origin, destination] / h_scale
-                features[origin, destination, 4] = effective[origin, destination] / r_scale
+    y_scale = scale_y[component][:, None]
+    features[..., 0] = np.where(same, y.real / y_scale, 0.0)
+    features[..., 1] = np.where(same, y.imag / y_scale, 0.0)
+    features[..., 2] = np.where(same, adjacency, False)
+    features[..., 3] = np.where(off_diagonal, hop / hop_scale[component][:, None], 0.0)
+    features[..., 4] = np.where(off_diagonal, effective / resistance_scale[component][:, None], 0.0)
 
     hop_symmetry = np.max(np.abs(hop - hop.T))
     if hop_symmetry > 1e-5:
@@ -1586,31 +1640,78 @@ def networks_match(left: Network, right: Network) -> bool:
     )
 
 
-def merge_splits(base: Split, extra: Split) -> Split:
-    """Append ``extra`` scenarios after ``base``; reuse matching ``Network`` objects."""
-    network_map: dict[int, int] = {}
-    merged_networks = list(base.networks)
-    for local_id, network in enumerate(extra.networks):
-        matched = next(
-            (index for index, existing in enumerate(merged_networks) if networks_match(existing, network)),
-            None,
-        )
-        if matched is None:
-            matched = len(merged_networks)
-            merged_networks.append(network)
-        network_map[local_id] = matched
-    extra_index = extra.network_index.numpy()
-    mapped = np.array([network_map[int(value)] for value in extra_index], dtype=np.int64)
+def network_key(network: Network) -> tuple[bytes, bytes]:
+    """Hash key of (bus types, Ybus rounded to 1e-6); equal keys are confirmed with ``networks_match``."""
+    types = network.types.detach().cpu().numpy().astype(np.int64)
+    ybus = network.ybus.detach().cpu().numpy()
+    packed = np.round(np.stack((ybus.real, ybus.imag)).astype(np.float64), 6) + 0.0
+    return types.tobytes(), hashlib.blake2b(packed.tobytes(), digest_size=16).digest()
+
+
+# Below this many networks a hash miss falls back to the pairwise allclose scan.
+NETWORK_SCAN_LIMIT = 64
+
+
+def merge_many(splits: list[Split], name: str | None = None) -> Split:
+    """Concatenate ``splits`` in order; later topologies reuse a matching earlier ``Network``.
+
+    The first split's networks are kept as they are, so its network ids do not change.
+    """
+    if not splits:
+        raise ValueError("merge_many needs at least one split")
+    merged_networks: list[Network] = []
+    by_key: dict[tuple[bytes, bytes], list[int]] = {}
+
+    def place(network: Network, reuse: bool) -> int:
+        key = network_key(network)
+        if reuse:
+            for index in by_key.get(key, ()):
+                if networks_match(merged_networks[index], network):
+                    return index
+            if len(merged_networks) <= NETWORK_SCAN_LIMIT:
+                for index, existing in enumerate(merged_networks):
+                    if networks_match(existing, network):
+                        return index
+        merged_networks.append(network)
+        by_key.setdefault(key, []).append(len(merged_networks) - 1)
+        return len(merged_networks) - 1
+
+    mapped_index = []
+    for position, split in enumerate(splits):
+        network_map = np.array([place(network, position > 0) for network in split.networks], dtype=np.int64)
+        mapped_index.append(torch.from_numpy(network_map[split.network_index.numpy()]))
     return Split(
-        name=base.name,
-        count=base.count + extra.count,
-        power_p=torch.cat([base.power_p, extra.power_p]),
-        power_q=torch.cat([base.power_q, extra.power_q]),
-        voltage=torch.cat([base.voltage, extra.voltage]),
-        angle=torch.cat([base.angle, extra.angle]),
-        network_index=torch.cat([base.network_index, torch.from_numpy(mapped)]),
+        name=splits[0].name if name is None else name,
+        count=sum(split.count for split in splits),
+        power_p=torch.cat([split.power_p for split in splits]),
+        power_q=torch.cat([split.power_q for split in splits]),
+        voltage=torch.cat([split.voltage for split in splits]),
+        angle=torch.cat([split.angle for split in splits]),
+        network_index=torch.cat(mapped_index),
         networks=merged_networks,
     )
+
+
+def merge_splits(base: Split, extra: Split) -> Split:
+    """Append ``extra`` scenarios after ``base``; reuse matching ``Network`` objects."""
+    return merge_many([base, extra])
+
+
+def compact_networks(split: Split, min_networks: int | None = None) -> int:
+    """Store RPEs of all but the dominant topology as float16 when ``split`` has many topologies.
+
+    Under CUDA autocast the pair encoder sees float16 inputs anyway; ``move_to`` casts back to float32.
+    Returns the number of networks converted.
+    """
+    if len(split.networks) < (COMPACT_MIN_NETWORKS if min_networks is None else min_networks):
+        return 0
+    keep = dominant_network_id(split)
+    converted = 0
+    for index, network in enumerate(split.networks):
+        if index != keep and network.rpe.dtype != torch.float16:
+            network.rpe = network.rpe.to(torch.float16)
+            converted += 1
+    return converted
 
 
 def extend_split_prefix(raw: Path, name: str, existing: Split, new_prefix_end: int) -> Split:
@@ -1805,7 +1906,47 @@ def read_split(
         flush=True,
     )
 
-    representatives = [int(np.flatnonzero(network_ids == net)[0]) for net in range(int(network_ids.max()) + 1)]
+    _ids, first_local = np.unique(network_ids, return_index=True)
+    representatives = [int(local) for local in first_local]
+    with blas_single_thread():
+        networks = _representative_networks(
+            name, representatives, scenario_ids, type_code, y_by_scenario, status, origin, destination,
+            resistance, reactance, branch_count,
+        )
+    return Split(
+        name=name,
+        count=count,
+        power_p=torch.from_numpy(power_p.astype(np.float32)),
+        power_q=torch.from_numpy(power_q.astype(np.float32)),
+        voltage=torch.from_numpy(voltage.astype(np.float32)),
+        angle=torch.from_numpy(angle.astype(np.float32)),
+        network_index=torch.from_numpy(network_ids.astype(np.int64)),
+        networks=networks,
+    )
+
+
+def blas_single_thread():
+    """Single-threaded BLAS while building many 118x118 RPEs (thread start-up dominates such small SVDs)."""
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        return contextlib.nullcontext()
+    return threadpool_limits(limits=1, user_api="blas")
+
+
+def _representative_networks(
+    name: str,
+    representatives: list[int],
+    scenario_ids: list[int],
+    type_code: np.ndarray,
+    y_by_scenario: dict[int, list[YBusEntry]],
+    status: np.ndarray,
+    origin: np.ndarray,
+    destination: np.ndarray,
+    resistance: np.ndarray,
+    reactance: np.ndarray,
+    branch_count: int,
+) -> list[Network]:
     networks: list[Network] = []
     for local in representatives:
         types = type_code[local].astype(np.int64)
@@ -1839,32 +1980,32 @@ def read_split(
                 branches=tuple(branches),
             )
         )
-    return Split(
-        name=name,
-        count=count,
-        power_p=torch.from_numpy(power_p.astype(np.float32)),
-        power_q=torch.from_numpy(power_q.astype(np.float32)),
-        voltage=torch.from_numpy(voltage.astype(np.float32)),
-        angle=torch.from_numpy(angle.astype(np.float32)),
-        network_index=torch.from_numpy(network_ids.astype(np.int64)),
-        networks=networks,
-    )
+    return networks
 
 
-def log_counts(data_root: Path, results: Path) -> dict:
+def log_counts(data_root: Path, results: Path, spec: TaskSpec | None = None) -> dict:
+    spec = spec or TASKS["1.1"]
     report = {}
-    folders = [("train", "n", "feasible"), ("valid", "n", "feasible")]
+    if spec.is_task11:
+        folders = [("train", "n", "feasible"), ("valid", "n", "feasible")]
+    else:
+        folders = [("train", *folder) for folder in task_folders(data_root, "train")]
+        folders.extend(("valid", *folder) for folder in task_folders(data_root, "valid"))
     folders.extend(("test", topology, condition) for _label, topology, condition in TEST_PARTS)
     for split, topology, condition in folders:
         raw = data_root / "case118" / split / "case118" / topology / condition / "raw"
         count = scenario_count(raw)
-        expected = EXPECTED_COUNTS[(split, topology, condition)]
         key = f"{split}/{topology}/{condition}"
+        if not spec.is_task11:
+            report[key] = {"loaded": count}
+            print(f"count {key}: {count}", flush=True)
+            continue
+        expected = EXPECTED_COUNTS[(split, topology, condition)]
         report[key] = {"loaded": count, "expected": expected}
         print(f"count {key}: {count} (expected {expected})", flush=True)
         if count != expected:
             print(f"  count differs from the PFΔ Task 1.1 split. Using the {count} loaded scenarios.", flush=True)
-    path = results / "task1_1_tpgt_counts.json"
+    path = results / f"task{spec.file_tag}_tpgt_counts.json"
     path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
 
@@ -1873,11 +2014,37 @@ def raw_dir(data_root: Path, split: str, topology: str, condition: str) -> Path:
     return data_root / "case118" / split / "case118" / topology / condition / "raw"
 
 
-def split_cache_dirs(checkpoints: Path) -> tuple[Path, Path]:
+def task_folders(data_root: Path, split: str) -> list[tuple[str, str]]:
+    """(topology, condition) folders of ``split`` that hold a bus_data parquet, in N, N-1, N-2 order."""
+    return [
+        (topology, condition)
+        for topology in TOPOLOGIES
+        for condition in CONDITIONS
+        if (raw_dir(data_root, split, topology, condition) / "bus_data.parquet").is_file()
+    ]
+
+
+def folder_mix_text(parts: list[tuple[tuple[str, str], int]]) -> str:
+    """Per-folder counts with shares, then shares by condition and by topology."""
+    total = max(sum(count for _folder, count in parts), 1)
+    by_folder = ", ".join(f"{t}/{c} {count} ({100 * count / total:.1f}%)" for (t, c), count in parts)
+    by_condition = {}
+    by_topology = {}
+    for (topology, condition), count in parts:
+        by_condition[condition] = by_condition.get(condition, 0) + count
+        by_topology[topology] = by_topology.get(topology, 0) + count
+    conditions = " ".join(f"{name} {100 * count / total:.1f}%" for name, count in by_condition.items())
+    topologies = " ".join(f"{name.upper()} {100 * count / total:.1f}%" for name, count in by_topology.items())
+    return f"{by_folder} | {conditions} | {topologies}"
+
+
+def split_cache_dirs(checkpoints: Path, spec: TaskSpec | None = None) -> tuple[Path, Path]:
     """Return (fast_cache, persistent_cache). On Colab, fast_cache is local SSD."""
     persistent = checkpoints / "cache"
     if in_colab():
-        return COLAB_LOCAL_CACHE, persistent
+        if spec is None or spec.is_task11:
+            return COLAB_LOCAL_CACHE, persistent
+        return Path(f"/content/{spec.run_dir_name}_cache"), persistent
     return persistent, persistent
 
 
@@ -1915,7 +2082,28 @@ def sync_split_cache_to_drive(active: Path, persistent: Path) -> None:
             _mirror_cache_file(path, persistent / path.name)
 
 
-def cached_split(active: Path, persistent: Path, raw: Path, name: str, limit: int | None = None) -> Split:
+def _compact_if(split: Split, name: str, compact: bool) -> Split:
+    if compact:
+        converted = compact_networks(split)
+        if converted:
+            print(f"  {name}: {converted} of {len(split.networks)} topology RPEs stored as float16", flush=True)
+    return split
+
+
+def cached_split(
+    active: Path,
+    persistent: Path,
+    raw: Path,
+    name: str,
+    limit: int | None = None,
+    *,
+    compact: bool = False,
+) -> Split:
+    """Load ``name`` from the split cache or build it from parquet.
+
+    ``compact`` (train/valid folders of multi-topology tasks) stores RPEs as float16 once the
+    folder has ``COMPACT_MIN_NETWORKS`` topologies; small folders are unaffected.
+    """
     sync_split_cache_from_drive(persistent, active)
     full = scenario_count(raw)
     if limit is None:
@@ -1947,7 +2135,7 @@ def cached_split(active: Path, persistent: Path, raw: Path, name: str, limit: in
             elapsed = time.perf_counter() - load_started
             print(f"  loaded {name} split in {elapsed:.1f}s ({tensor_path})", flush=True)
             sync_split_cache_to_drive(active, persistent)
-            return payload
+            return _compact_if(payload, name, compact)
         if version_ok and limit > old_limit:
             existing = torch.load(tensor_path, map_location="cpu", weights_only=False)
             if isinstance(existing, Split) and existing.count == old_limit:
@@ -1957,6 +2145,7 @@ def cached_split(active: Path, persistent: Path, raw: Path, name: str, limit: in
                     f"  extended {name} split in {time.perf_counter() - build_started:.1f}s",
                     flush=True,
                 )
+                _compact_if(split, name, compact)
                 torch.save(split, tensor_path)
                 stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
                 sync_split_cache_to_drive(active, persistent)
@@ -1970,12 +2159,48 @@ def cached_split(active: Path, persistent: Path, raw: Path, name: str, limit: in
     build_started = time.perf_counter()
     split = read_split(raw, name, prefix_end=limit)
     print(f"  built {name} split from parquet in {time.perf_counter() - build_started:.1f}s", flush=True)
+    _compact_if(split, name, compact)
     save_started = time.perf_counter()
     torch.save(split, tensor_path)
     stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
     print(f"  saved {name} cache in {time.perf_counter() - save_started:.1f}s", flush=True)
     sync_split_cache_to_drive(active, persistent)
     return split
+
+
+def load_task_split(data_root: Path, split_name: str, active: Path, persistent: Path) -> Split:
+    """Union of every ``split_name`` folder of the task (each cached on its own, DATA_FRACTION per folder).
+
+    A task with a single folder (Task 1.1) returns that folder's split unchanged.
+    """
+    folders = task_folders(data_root, split_name)
+    if not folders:
+        raise FileNotFoundError(f"No {split_name} folders under {data_root / 'case118' / split_name}")
+    multi = len(folders) > 1
+    parts = [
+        cached_split(
+            active,
+            persistent,
+            raw_dir(data_root, split_name, topology, condition),
+            f"{split_name}_{topology}_{condition}",
+            compact=multi,
+        )
+        for topology, condition in folders
+    ]
+    print(
+        f"{split_name} mix: " + folder_mix_text([(folder, part.count) for folder, part in zip(folders, parts)]),
+        flush=True,
+    )
+    if not multi:
+        return parts[0]
+    merge_started = time.perf_counter()
+    merged = merge_many(parts, name=split_name)
+    print(
+        f"{split_name}: merged {len(parts)} folders into {merged.count} cases, {len(merged.networks)} topologies "
+        f"in {time.perf_counter() - merge_started:.1f}s",
+        flush=True,
+    )
+    return merged
 
 
 DATASET_RELATIVE = Path("Foundation Model") / "vendor" / "pfdelta_task1.1"
@@ -1985,8 +2210,16 @@ COLAB_DRIVE = Path("/content/drive/MyDrive")
 COLAB_LOCAL_CACHE = Path(f"/content/{RUN_DIR_NAME}_cache")
 
 
-def dataset_request() -> Path:
-    return Path(os.environ.get("GENCO_PFDELTA_TASK11", str(DATASET_RELATIVE)))
+def dataset_relative(spec: TaskSpec | None = None) -> Path:
+    spec = spec or TASKS["1.1"]
+    if spec.is_task11:
+        return DATASET_RELATIVE
+    return Path("Foundation Model") / "vendor" / f"pfdelta_task{spec.data_id}"
+
+
+def dataset_request(spec: TaskSpec | None = None) -> Path:
+    spec = spec or TASKS["1.1"]
+    return Path(os.environ.get(spec.dataset_env, str(dataset_relative(spec))))
 
 
 def google_drive_root() -> Path | None:
@@ -1998,24 +2231,43 @@ def google_drive_root() -> Path | None:
     return None
 
 
-def drive_dataset(drive: Path | None) -> Path | None:
-    """Return the saved Task 1.1 root when case118 is already on Drive.
-
-    This only checks directory names. It does not copy the dataset.
-    """
-    requested = dataset_request()
+def dataset_candidates(drive: Path | None, spec: TaskSpec | None = None) -> list[Path]:
+    spec = spec or TASKS["1.1"]
+    requested = dataset_request(spec)
+    relative = dataset_relative(spec)
     candidates: list[Path] = []
     if requested.is_absolute():
         candidates.append(requested)
     elif drive is not None:
         candidates.append(drive / requested)
-    for extra in (WINDOWS_DRIVE / DATASET_RELATIVE, COLAB_DRIVE / DATASET_RELATIVE):
+    for extra in (WINDOWS_DRIVE / relative, COLAB_DRIVE / relative):
         if extra not in candidates:
             candidates.append(extra)
-    for candidate in candidates:
+    return candidates
+
+
+def drive_dataset(drive: Path | None, spec: TaskSpec | None = None) -> Path | None:
+    """Return the saved dataset root of ``spec`` (default Task 1.1) when case118 is already on Drive.
+
+    This only checks directory names. It does not copy the dataset.
+    """
+    for candidate in dataset_candidates(drive, spec):
         if (candidate / "case118").is_dir():
             return candidate
     return None
+
+
+def dataset_missing_files(data_root: Path, spec: TaskSpec) -> list[Path]:
+    """Parquet files of ``spec``'s published train/valid/test folders that are absent under ``data_root``."""
+    folders = [("test", topology, condition) for _label, topology, condition in TEST_PARTS]
+    for split in ("train", "valid"):
+        folders.extend((split, *folder) for folder in spec.folders)
+    return [
+        raw_dir(data_root, *folder) / name
+        for folder in folders
+        for name in PARQUET_FILES
+        if not (raw_dir(data_root, *folder) / name).is_file()
+    ]
 
 
 def legacy_locations(drive: Path | None) -> tuple[Path, Path]:
@@ -2031,25 +2283,39 @@ def legacy_locations(drive: Path | None) -> tuple[Path, Path]:
     return work, results
 
 
-def drive_output_dirs(drive: Path | None) -> tuple[Path, Path] | None:
-    """Checkpoint directory and TPGT result directory on Drive, both versioned by ``RUN_DIR_NAME``.
+def task_results_dir(checkpoints: Path, results_root: Path, spec: TaskSpec | None = None) -> Path:
+    """Task 1.1 keeps ``<results_root>/<RUN_DIR_NAME>``; other tasks write ``<task folder>/results``."""
+    spec = spec or TASKS["1.1"]
+    if spec.is_task11:
+        return results_root / RUN_DIR_NAME
+    return checkpoints / "results"
+
+
+def drive_output_dirs(drive: Path | None, spec: TaskSpec | None = None) -> tuple[Path, Path] | None:
+    """Checkpoint directory and TPGT result directory on Drive, both versioned by ``RUN_TAG``.
 
     Colab writes under MyDrive/Foundation Model once Drive is mounted.
     Windows writes under K:\\My Drive\\Foundation Model when that folder exists.
+    Task 1.1: ``tpgt_task11_<RUN_TAG>`` and ``results/tpgt_task11_<RUN_TAG>``; other tasks:
+    ``tpgt_task<id>_<RUN_TAG>`` with ``results`` inside it.
     """
+    spec = spec or TASKS["1.1"]
     if drive is None:
         return None
     foundation = drive / "Foundation Model"
     if not in_colab() and not foundation.is_dir():
         return None
-    checkpoints = foundation / RUN_DIR_NAME
-    results = foundation / "results" / RUN_DIR_NAME
+    checkpoints = foundation / spec.run_dir_name
+    results = task_results_dir(checkpoints, foundation / "results", spec)
     checkpoints.mkdir(parents=True, exist_ok=True)
     results.mkdir(parents=True, exist_ok=True)
     return checkpoints, results
 
 
-def ensure_dataset(work: Path, drive: Path | None = None) -> Path:
+def ensure_dataset(work: Path, drive: Path | None = None, spec: TaskSpec | None = None) -> Path:
+    spec = spec or TASKS["1.1"]
+    if not spec.is_task11:
+        return ensure_task_dataset(work, drive, spec)
     saved = drive_dataset(drive)
     if saved is not None:
         print(f"Dataset already present: {saved}", flush=True)
@@ -2069,6 +2335,36 @@ def ensure_dataset(work: Path, drive: Path | None = None) -> Path:
     return data
 
 
+def ensure_task_dataset(work: Path, drive: Path | None, spec: TaskSpec) -> Path:
+    """Dataset root of ``spec``: the Drive copy when complete, else (resume) download into it."""
+    saved = drive_dataset(drive, spec)
+    if saved is not None and not dataset_missing_files(saved, spec):
+        print(f"Dataset already present: {saved}", flush=True)
+        return saved
+    if saved is not None:
+        data = saved
+    else:
+        requested = dataset_request(spec)
+        if requested.is_absolute():
+            data = requested
+        elif drive is not None and (in_colab() or (drive / "Foundation Model").is_dir()):
+            data = drive / requested
+        else:
+            data = work / f"pfdelta_task{spec.data_id}"
+    if data.joinpath("case118").is_dir() and not dataset_missing_files(data, spec):
+        print(f"Dataset already present: {data}", flush=True)
+        return data
+    from huggingface_hub import snapshot_download
+
+    print(f"Downloading {spec.dataset_repo} to {data}", flush=True)
+    data.mkdir(parents=True, exist_ok=True)
+    snapshot_download(repo_id=spec.dataset_repo, repo_type="dataset", local_dir=str(data))
+    missing = dataset_missing_files(data, spec)
+    if missing:
+        raise FileNotFoundError(f"Download of {spec.dataset_repo} finished without {missing[:3]}")
+    return data
+
+
 def move_to(network: Network, device: torch.device) -> Network:
     types = network.types.to(device)
     component = network.component.to(device)
@@ -2080,7 +2376,7 @@ def move_to(network: Network, device: torch.device) -> Network:
         masks = masks.to(device)
     return Network(
         ybus=network.ybus.to(device),
-        rpe=network.rpe.to(device),
+        rpe=network.rpe.to(device, dtype=torch.float32),
         component=component,
         types=types,
         pair_type_masks=masks,
@@ -2089,8 +2385,39 @@ def move_to(network: Network, device: torch.device) -> Network:
     )
 
 
-def clear_pair_embed_cache(networks: list[Network]) -> None:
-    for network in networks:
+class DeviceNetworks:
+    """Device copies of ``networks`` made on first use; the ``capacity`` most recently used are kept.
+
+    Indexing mirrors a list of moved networks, so thousands of topologies never sit on the GPU at once.
+    """
+
+    def __init__(self, networks: list[Network], device: torch.device, capacity: int | None = None) -> None:
+        self.networks = networks
+        self.device = device
+        self.capacity = max(1, int(DEVICE_NETWORK_CACHE if capacity is None else capacity))
+        self._moved: OrderedDict[int, Network] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self.networks)
+
+    def __getitem__(self, network_id: int) -> Network:
+        network_id = int(network_id)
+        moved = self._moved.get(network_id)
+        if moved is None:
+            moved = move_to(self.networks[network_id], self.device)
+            self._moved[network_id] = moved
+            while len(self._moved) > self.capacity:
+                self._moved.popitem(last=False)
+        else:
+            self._moved.move_to_end(network_id)
+        return moved
+
+    def resident(self) -> list[Network]:
+        return list(self._moved.values())
+
+
+def clear_pair_embed_cache(networks: list[Network] | DeviceNetworks) -> None:
+    for network in networks.resident() if isinstance(networks, DeviceNetworks) else networks:
         network.pair_embed = None
 
 
@@ -2153,12 +2480,71 @@ def _weighted_loss_breakdown(
     )
 
 
-def rpe_channel_dropout(rpe: torch.Tensor, probability: float, training: bool) -> torch.Tensor:
+def rpe_channel_keep(channels: int, probability: float, training: bool, device: torch.device) -> torch.Tensor | None:
+    """Per-step channel keep mask (one draw shared by every topology in the step); None when inactive."""
+    if not training or probability <= 0.0:
+        return None
+    return torch.rand(channels, device=device) >= probability
+
+
+def rpe_channel_dropout(
+    rpe: torch.Tensor,
+    probability: float,
+    training: bool,
+    keep: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Zero whole RPE channels independently with ``probability`` (no rescaling); identity unless training."""
     if not training or probability <= 0.0:
         return rpe
-    keep = torch.rand(rpe.shape[-1], device=rpe.device) >= probability
+    if keep is None:
+        keep = rpe_channel_keep(rpe.shape[-1], probability, training, rpe.device)
     return rpe * keep.to(rpe.dtype)
+
+
+def train_step(
+    model: TPGT,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler | None,
+    split: Split,
+    groups: list[tuple[Network, np.ndarray]],
+    device: torch.device,
+) -> TaskLossBreakdown:
+    """One optimizer step over all ``groups`` (topology, case index), each forwarded on its own network.
+
+    Each micro-batch loss is weighted by its share of the step's cases, so the gradient is the mean over
+    every case of the step, exactly as for a single-topology batch.
+    """
+    n = sum(len(index) for _network, index in groups)
+    micro = min(MICRO_BATCH_SIZE, n)
+    use_amp = device.type == "cuda"
+    optimizer.zero_grad(set_to_none=True)
+    logged_parts: list[tuple[TaskLossBreakdown, float]] = []
+    keep = rpe_channel_keep(RPE_DIM, RPE_CHANNEL_DROPOUT, model.training, groups[0][0].rpe.device)
+    for network, index in groups:
+        cases = np.asarray(index)
+        rpe = rpe_channel_dropout(network.rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
+        with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
+            pair_embed = model.pair_encoder(rpe)
+        for start in range(0, len(cases), micro):
+            chunk = cases[start : start + micro]
+            weight = len(chunk) / n
+            retain = start + micro < len(cases)
+            with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
+                breakdown, _score = run_batch(model, split, network, chunk, device, pair=pair_embed)
+            scaled = breakdown.total * weight
+            if scaler is not None:
+                scaler.scale(scaled).backward(retain_graph=retain)
+            else:
+                scaled.backward(retain_graph=retain)
+            logged_parts.append((breakdown, weight))
+            if device.type == "cuda":
+                del breakdown, scaled
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    return _weighted_loss_breakdown(logged_parts)
 
 
 def train_batch(
@@ -2170,35 +2556,33 @@ def train_batch(
     index: np.ndarray,
     device: torch.device,
 ) -> TaskLossBreakdown:
-    """One optimizer step over ``index`` (up to BATCH_SIZE cases), using micro-batches on CUDA."""
-    cases = np.asarray(index)
-    n = len(cases)
-    micro = min(MICRO_BATCH_SIZE, n)
-    use_amp = device.type == "cuda"
-    optimizer.zero_grad(set_to_none=True)
-    logged_parts: list[tuple[TaskLossBreakdown, float]] = []
-    rpe = rpe_channel_dropout(network.rpe, RPE_CHANNEL_DROPOUT, model.training)
-    with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
-        pair_embed = model.pair_encoder(rpe)
-    for start in range(0, n, micro):
-        chunk = cases[start : start + micro]
-        weight = len(chunk) / n
-        with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
-            breakdown, _score = run_batch(model, split, network, chunk, device, pair=pair_embed)
-        scaled = breakdown.total * weight
-        if scaler is not None:
-            scaler.scale(scaled).backward()
-        else:
-            scaled.backward()
-        logged_parts.append((breakdown, weight))
-        if device.type == "cuda":
-            del breakdown, scaled
-    if scaler is not None:
-        scaler.step(optimizer)
-        scaler.update()
+    """One optimizer step over ``index`` (up to BATCH_SIZE cases) on one topology."""
+    return train_step(model, optimizer, scaler, split, [(network, index)], device)
+
+
+def iterate_steps(
+    split: Split,
+    seed: int,
+    epoch: int,
+    batch_size: int = BATCH_SIZE,
+):
+    """Training steps: one global shuffle per epoch, ``batch_size`` cases per step, split by topology.
+
+    Yields lists of (network_id, case index) in order of first appearance within the step. With one
+    topology this is the same permutation and the same batches as shuffling that topology alone.
+    """
+    generator = torch.Generator()
+    generator.manual_seed(seed * 1000 + epoch)
+    if split.count > 1:
+        order = torch.randperm(split.count, generator=generator).numpy()
     else:
-        optimizer.step()
-    return _weighted_loss_breakdown(logged_parts)
+        order = np.arange(split.count)
+    network_index = split.network_index.numpy()
+    for start in range(0, len(order), batch_size):
+        chunk = order[start : start + batch_size]
+        owners = network_index[chunk]
+        _ids, first = np.unique(owners, return_index=True)
+        yield [(int(owners[position]), chunk[owners == owners[position]]) for position in np.sort(first)]
 
 
 def iterate_indexes(
@@ -2208,16 +2592,16 @@ def iterate_indexes(
     shuffle: bool,
     batch_size: int = BATCH_SIZE,
 ):
+    """Batches that never mix topologies: networks in id order, cases in split order unless ``shuffle``."""
     generator = torch.Generator()
     generator.manual_seed(seed * 1000 + epoch)
-    groups = []
+    network_index = split.network_index.numpy()
+    order = np.argsort(network_index, kind="stable")
+    bounds = np.searchsorted(network_index[order], np.arange(len(split.networks) + 1))
     for network_id in range(len(split.networks)):
-        index = torch.nonzero(split.network_index == network_id, as_tuple=False).flatten()
-        if shuffle and index.numel() > 1:
-            order = torch.randperm(index.numel(), generator=generator)
-            index = index[order]
-        groups.append((network_id, index.numpy()))
-    for network_id, index in groups:
+        index = order[bounds[network_id] : bounds[network_id + 1]]
+        if shuffle and index.size > 1:
+            index = index[torch.randperm(index.size, generator=generator).numpy()]
         for start in range(0, len(index), batch_size):
             yield network_id, index[start : start + batch_size]
 
@@ -2469,8 +2853,8 @@ def train_seed(
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = make_lr_scheduler(optimizer)
     grad_scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
-    train_networks = [move_to(network, device) for network in train_split.networks]
-    val_networks = [move_to(network, device) for network in val_split.networks]
+    train_networks = DeviceNetworks(train_split.networks, device)
+    val_networks = DeviceNetworks(val_split.networks, device)
     train_probe = train_probe_split(train_split, min(val_split.count, TRAIN_PROBE_CASES))
     start_epoch = 0
     best_val = float("inf")
@@ -2606,25 +2990,26 @@ def train_seed(
             batches = 0
             logged_first_batch = False
             batch_durations: list[float] = []
-            for network_id, index in iterate_indexes(train_split, seed, epoch, shuffle=True):
+            for step_groups in iterate_steps(train_split, seed, epoch):
                 if not logged_first_batch:
                     first_batch_started = time.perf_counter()
                 step_started = time.perf_counter()
-                breakdown = train_batch(
+                breakdown = train_step(
                     model,
                     optimizer,
                     grad_scaler if device.type == "cuda" else None,
                     train_split,
-                    train_networks[network_id],
-                    index,
+                    [(train_networks[network_id], index) for network_id, index in step_groups],
                     device,
                 )
                 if not logged_first_batch:
                     if device.type == "cuda":
                         torch.cuda.synchronize()
                     elapsed = time.perf_counter() - first_batch_started
+                    cases = sum(len(index) for _network_id, index in step_groups)
+                    topologies = "" if len(step_groups) == 1 else f", {len(step_groups)} topologies"
                     print(
-                        f"  seed {seed} epoch {epoch + 1} first batch ({len(index)} cases) "
+                        f"  seed {seed} epoch {epoch + 1} first batch ({cases} cases{topologies}) "
                         f"forward+backward {elapsed:.2f}s",
                         flush=True,
                     )
@@ -2740,7 +3125,9 @@ def record_seed(
     counts: dict[str, int],
     checkpoint: Path,
     epoch: int,
+    spec: TaskSpec | None = None,
 ) -> None:
+    spec = spec or TASKS["1.1"]
     c2i_counts = {"C2I-N": counts["C2I-N"], "C2I-N-1": counts["C2I-N-1"], "C2I-N-2": counts["C2I-N-2"]}
     scores = dict(scores)
     scores["C2I"] = aggregate_c2i(scores, c2i_counts)
@@ -2750,7 +3137,7 @@ def record_seed(
         rows.append(
             {
                 "model": MODEL_NAME,
-                "task": "1.1",
+                "task": spec.task_id,
                 "test_category": category,
                 "seed": str(seed),
                 "mean_pbl_pu": f"{scores[category]:.8g}",
@@ -2760,16 +3147,17 @@ def record_seed(
             }
         )
     upsert_csv(
-        results / "task1_1_tpgt_seed_metrics.csv",
+        results / f"task{spec.file_tag}_tpgt_seed_metrics.csv",
         columns,
         rows,
         ["model", "task", "test_category", "seed", "epoch"],
     )
 
 
-def write_summary(results: Path) -> list[dict]:
+def write_summary(results: Path, spec: TaskSpec | None = None) -> list[dict]:
+    spec = spec or TASKS["1.1"]
     latest: dict[tuple[str, str], tuple[int, float]] = {}
-    for row in read_csv(results / "task1_1_tpgt_seed_metrics.csv"):
+    for row in read_csv(results / f"task{spec.file_tag}_tpgt_seed_metrics.csv"):
         if row.get("model") != MODEL_NAME:
             continue
         raw_epoch = (row.get("epoch") or "").strip()
@@ -2799,16 +3187,17 @@ def write_summary(results: Path) -> list[dict]:
                 "n_seeds": str(len(values)),
             }
         )
-    path = results / "task1_1_tpgt_summary.csv"
+    path = results / f"task{spec.file_tag}_tpgt_summary.csv"
     if summary:
         upsert_csv(path, SUMMARY_COLUMNS, summary, ["model", "test_category"])
     return summary
 
 
-def print_comparison(summary: list[dict]) -> None:
-    print("\nTask 1.1 mean power-balance loss (per unit)", flush=True)
+def print_comparison(summary: list[dict], spec: TaskSpec | None = None) -> None:
+    spec = spec or TASKS["1.1"]
+    print(f"\nTask {spec.label} mean power-balance loss (per unit)", flush=True)
     print("PUBLISHED", flush=True)
-    for model, scores in PUBLISHED_TASK11.items():
+    for model, scores in PUBLISHED.get(spec.task_id, {}).items():
         parts = [f"{category} {scores[category][0]:.4g} ± {scores[category][1]:.4g}" for category in CATEGORIES]
         print(f"  {model}: " + "; ".join(parts), flush=True)
     print("TPGT this run", flush=True)
@@ -2825,52 +3214,79 @@ def print_comparison(summary: list[dict]) -> None:
     print("  TPGT: " + "; ".join(parts), flush=True)
 
 
-def plot_comparison(results: Path, summary: list[dict]) -> None:
+def comparison_figure_path(results: Path, spec: TaskSpec | None = None) -> Path:
+    spec = spec or TASKS["1.1"]
+    return results / f"figure4_task{spec.task_id}_tpgt.svg"
+
+
+def plot_comparison(results: Path, summary: list[dict], spec: TaskSpec | None = None) -> None:
+    """Bar plot (SVG + PNG) of TPGT mean ± std over the seeds scored so far against the published models."""
+    spec = spec or TASKS["1.1"]
     by_category = {row["test_category"]: row for row in summary}
     if any(category not in by_category for category in CATEGORIES):
         return
     if any(int(by_category[category]["n_seeds"]) < 1 for category in CATEGORIES):
         return
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    plt.rcParams["svg.fonttype"] = "path"
-
-    labels = [f"{model} (published)" for model in ("GENCO Base", "CANOS-PF", "GNS-S", "PFNet")] + ["TPGT (this run)"]
-    colors = [PALETTE[model] for model in ("GENCO Base", "CANOS-PF", "GNS-S", "PFNet")] + ["#1F4B99"]
-    means = []
-    stds = []
-    for model in ("GENCO Base", "CANOS-PF", "GNS-S", "PFNet"):
-        means.append([PUBLISHED_TASK11[model][category][0] for category in CATEGORIES])
-        stds.append([PUBLISHED_TASK11[model][category][1] for category in CATEGORIES])
-    means.append([float(by_category[category]["mean_across_seeds"]) for category in CATEGORIES])
-    stds.append([float(by_category[category]["std_across_seeds"]) for category in CATEGORIES])
-    figure, axis = plt.subplots(figsize=(10, 8))
-    positions = np.arange(len(CATEGORIES))
-    width = 0.15
-    for index, label in enumerate(labels):
-        offset = (index - (len(labels) - 1) / 2) * width
-        axis.bar(positions + offset, means[index], width, yerr=stds[index], label=label, color=colors[index], capsize=2)
-    axis.set_xticks(positions)
-    axis.set_xticklabels(list(CATEGORIES))
-    axis.set_ylabel("Power Balance Loss (Mean) [p.u.]")
-    axis.set_ylim(0, 1.8)
-    axis.yaxis.grid(True)
-    axis.legend(frameon=False, fontsize=9)
-    axis.set_title("Task 1.1")
-    figure.tight_layout()
-    output = results / "figure4_task1.1_tpgt.svg"
-    figure.savefig(output, format="svg", bbox_inches="tight")
-    plt.close(figure)
-    print(f"wrote {output}", flush=True)
+    tpgt = {
+        category: (float(by_category[category]["mean_across_seeds"]), float(by_category[category]["std_across_seeds"]))
+        for category in CATEGORIES
+    }
+    seeds = min(int(by_category[category]["n_seeds"]) for category in CATEGORIES)
+    output = comparison_figure_path(results, spec)
+    plot_tpgt_comparison(spec.task_id, spec.label, tpgt, output, tpgt_label=f"TPGT (this run, {seeds} seed(s))")
     try:
         from IPython.display import SVG, display
 
         display(SVG(filename=str(output)))
     except Exception:
         pass
+
+
+def bus_map_api() -> SimpleNamespace:
+    """Functions ``plot_bus_error_map`` needs from this module (works when run as a script or via %run)."""
+    return SimpleNamespace(
+        move_to=move_to,
+        pair_features=pair_features,
+        pack_case=pack_case,
+        dominant_network_id=dominant_network_id,
+        network_case_counts=network_case_counts,
+        contingency_class=contingency_class,
+    )
+
+
+def write_checkpoint_bus_maps(
+    model: TPGT,
+    val_split: Split,
+    n1_split: Split,
+    device: torch.device,
+    out_dir: Path,
+    epoch_number: int,
+    checkpoint: Path,
+) -> None:
+    """IEEE 118 per-bus PBL maps for this checkpoint; any failure is logged and training continues."""
+    started = time.perf_counter()
+    try:
+        from plot_bus_error_map import write_bus_maps
+
+        with torch.no_grad():
+            written = write_bus_maps(
+                bus_map_api(),
+                model,
+                val_split,
+                n1_split,
+                device,
+                out_dir,
+                epoch=epoch_number,
+                checkpoint_name=checkpoint.name,
+                val_cases=BUS_MAP_VAL_CASES,
+                batch=EVAL_BATCH_SIZE,
+            )
+        print(
+            f"Bus error maps ({len(written)} PNG) written to {out_dir} in {time.perf_counter() - started:.1f}s",
+            flush=True,
+        )
+    except Exception as error:
+        print(f"Bus error maps skipped for epoch {epoch_number}: {type(error).__name__}: {error}", flush=True)
 
 
 def test_model(
@@ -2880,7 +3296,7 @@ def test_model(
     active_cache: Path,
     persistent_cache: Path,
     eval_batch_size: int = EVAL_BATCH_SIZE,
-    after_split: Callable[[str, Split, list[Network], dict[int, list[float]]], None] | None = None,
+    after_split: Callable[[str, Split, DeviceNetworks, dict[int, list[float]]], None] | None = None,
 ) -> tuple[dict[str, float], dict[str, int]]:
     scores = {}
     counts = {}
@@ -2892,8 +3308,7 @@ def test_model(
             raw_dir(data_root, "test", topology, condition),
             f"test_{topology}_{condition}",
         )
-        networks = [move_to(network, device) for network in split.networks]
-        clear_pair_embed_cache(networks)
+        networks = DeviceNetworks(split.networks, device)
         per_network: dict[int, list[float]] = {}
         scores[label] = evaluate_pbl(
             model, split, networks, device, batch_size=eval_batch_size, per_network_out=per_network
@@ -2932,16 +3347,18 @@ def main() -> None:
         raise ValueError(f"data fraction must be <= 1.0, got {DATA_FRACTION}")
     else:
         print(batch_note, flush=True)
+    spec = parse_task()
+    print(f"PFΔ Task {spec.label}: {spec.description} (dataset {spec.dataset_repo})", flush=True)
     drive = google_drive_root()
-    outputs = drive_output_dirs(drive)
+    outputs = drive_output_dirs(drive, spec)
     work, legacy_results = legacy_locations(drive)
     if outputs is not None:
         checkpoints, results = outputs
     else:
         work.mkdir(parents=True, exist_ok=True)
-        checkpoints = work / RUN_DIR_NAME
+        checkpoints = work / spec.run_dir_name
         checkpoints.mkdir(parents=True, exist_ok=True)
-        results = legacy_results / RUN_DIR_NAME
+        results = task_results_dir(checkpoints, legacy_results, spec)
         results.mkdir(parents=True, exist_ok=True)
     os.environ["GENCO_RESULTS_DIR"] = str(results)
     os.environ["GENCO_WORK_ROOT"] = str(checkpoints.parent)
@@ -2951,15 +3368,23 @@ def main() -> None:
     use_selected_results()
     ensure_dirs()
     results.mkdir(parents=True, exist_ok=True)
-    data = ensure_dataset(work, drive)
+    data = ensure_dataset(work, drive, spec)
     print(f"Dataset: {data}", flush=True)
     print(f"Run tag {RUN_TAG} (checkpoint_version {CHECKPOINT_VERSION}, {DEPTH} stages, {RPE_DIM}-channel RPE)", flush=True)
     stage_weight_text = " ".join(f"s{i + 1} {w:g}" for i, w in enumerate(physics_stage_weights(DEPTH)))
     print(f"Physics stage weights (GENCO-style): {stage_weight_text}", flush=True)
     print(f"Checkpoints: {checkpoints}", flush=True)
     print(f"Results directory: {results}", flush=True)
-    log_counts(data, results)
-    active_cache, persistent_cache = split_cache_dirs(checkpoints)
+    for split_name in ("train", "valid"):
+        found = tuple(task_folders(data, split_name))
+        if found != spec.folders:
+            print(
+                f"Note: {split_name} folders {found} differ from the published Task {spec.label} layout {spec.folders}; "
+                "using the folders found.",
+                flush=True,
+            )
+    log_counts(data, results, spec)
+    active_cache, persistent_cache = split_cache_dirs(checkpoints, spec)
     print(f"Split cache (active): {active_cache}", flush=True)
     if persistent_cache != active_cache:
         print(f"Split cache (Drive): {persistent_cache}", flush=True)
@@ -2969,18 +3394,8 @@ def main() -> None:
         gc.collect()
         torch.cuda.empty_cache()
     load_started = time.perf_counter()
-    train_split = cached_split(
-        active_cache,
-        persistent_cache,
-        raw_dir(data, "train", "n", "feasible"),
-        "train_n_feasible",
-    )
-    val_split = cached_split(
-        active_cache,
-        persistent_cache,
-        raw_dir(data, "valid", "n", "feasible"),
-        "valid_n_feasible",
-    )
+    train_split = load_task_split(data, "train", active_cache, persistent_cache)
+    val_split = load_task_split(data, "valid", active_cache, persistent_cache)
     print(
         f"Train+valid splits ready in {time.perf_counter() - load_started:.1f}s "
         f"({train_split.count} train, {val_split.count} valid cases)",
@@ -2994,6 +3409,7 @@ def main() -> None:
         flush=True,
     )
     reference_network = train_split.networks[dominant_network_id(train_split)]
+    held_splits: dict[str, Split] = {}
     for seed in SEEDS:
         seed_dir = checkpoints / f"seed_{seed}"
         if (seed_dir / "complete.json").exists() and read_completed_epochs(seed_dir / "complete.json") >= EPOCHS:
@@ -3001,13 +3417,15 @@ def main() -> None:
             continue
 
         def on_epoch_end(model: TPGT, epoch_number: int, seed: int = seed) -> tuple[dict[str, float], dict[str, int]]:
-            def contingency_hook(
+            def after_test_split(
                 label: str,
                 split: Split,
-                networks: list[Network],
+                networks: DeviceNetworks,
                 per_network: dict[int, list[float]],
             ) -> None:
-                if label in CONTINGENCY_DIAGNOSTIC_LABELS:
+                if label == "N-1":
+                    held_splits["N-1"] = split
+                if debug_diagnostics and label in CONTINGENCY_DIAGNOSTIC_LABELS:
                     print_contingency_diagnostics(
                         model,
                         f"test {label} seed {seed} epoch {epoch_number}",
@@ -3025,7 +3443,7 @@ def main() -> None:
                 active_cache,
                 persistent_cache,
                 eval_batch_size=EVAL_BATCH_SIZE,
-                after_split=contingency_hook if debug_diagnostics else None,
+                after_split=after_test_split,
             )
             c2i_counts = {
                 "C2I-N": counts["C2I-N"],
@@ -3045,11 +3463,25 @@ def main() -> None:
             counts: dict[str, int],
             seed: int = seed,
         ) -> None:
-            # record_seed / summary CSV / plot only on Drive checkpoint epochs (not every epoch).
-            record_seed(results, seed, scores, counts, checkpoint, epoch_number)
-            summary = write_summary(results)
-            print_comparison(summary)
-            plot_comparison(results, summary)
+            # record_seed / summary CSV / plots only on Drive checkpoint epochs (not every epoch).
+            record_seed(results, seed, scores, counts, checkpoint, epoch_number, spec)
+            summary = write_summary(results, spec)
+            print_comparison(summary, spec)
+            try:
+                plot_comparison(results, summary, spec)
+            except Exception as error:
+                print(f"Bar plot skipped for epoch {epoch_number}: {type(error).__name__}: {error}", flush=True)
+            n1_split = held_splits.pop("N-1", None)
+            if n1_split is not None:
+                write_checkpoint_bus_maps(
+                    model,
+                    val_split,
+                    n1_split,
+                    device,
+                    checkpoints / "bus_error_maps" / f"seed_{seed}" / f"epoch_{epoch_number}",
+                    epoch_number,
+                    checkpoint,
+                )
 
         train_seed(
             seed,
@@ -3076,23 +3508,20 @@ def cli_diagnose(
     global DATA_FRACTION
     ensure_runtime_packages()
     DATA_FRACTION = parse_data_fraction()
+    spec = parse_task()
+    print(f"Diagnose PFΔ Task {spec.label}", flush=True)
     drive = google_drive_root()
-    outputs = drive_output_dirs(drive)
+    outputs = drive_output_dirs(drive, spec)
     work, legacy_results = legacy_locations(drive)
     if outputs is not None:
         checkpoints, results = outputs
     else:
-        checkpoints = work / RUN_DIR_NAME
+        checkpoints = work / spec.run_dir_name
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     configure_cuda_training(device)
-    data = ensure_dataset(work, drive)
-    active_cache, persistent_cache = split_cache_dirs(checkpoints)
-    val_split = cached_split(
-        active_cache,
-        persistent_cache,
-        raw_dir(data, "valid", "n", "feasible"),
-        "valid_n_feasible",
-    )
+    data = ensure_dataset(work, drive, spec)
+    active_cache, persistent_cache = split_cache_dirs(checkpoints, spec)
+    val_split = load_task_split(data, "valid", active_cache, persistent_cache)
     val_net = dominant_network_id(val_split)
     network = move_to(val_split.networks[val_net], device)
     model = TPGT().to(device)
@@ -3134,7 +3563,7 @@ def cli_diagnose(
             raw_dir(data, "test", topology, condition),
             f"test_{topology}_{condition}",
         )
-        networks = [move_to(item, device) for item in split.networks]
+        networks = DeviceNetworks(split.networks, device)
         per_network: dict[int, list[float]] = {}
         score = evaluate_pbl(model, split, networks, device, per_network_out=per_network)
         print(f"test {label}: PBL {score:.6g} on {split.count} scenarios", flush=True)
@@ -3216,9 +3645,12 @@ if __name__ == "__main__":
             elif args[index] == "--cases" and index + 1 < len(args):
                 cases = int(args[index + 1])
                 index += 2
-            elif args[index] == "--data-fraction" and index + 1 < len(args):
+            elif args[index] in ("--data-fraction", "--task") and index + 1 < len(args):
                 index += 2
-            elif args[index].startswith("--data-fraction=") or args[index] in ("--rpe-ablation", "--no-rpe-ablation"):
+            elif args[index].startswith(("--data-fraction=", "--task=")) or args[index] in (
+                "--rpe-ablation",
+                "--no-rpe-ablation",
+            ):
                 index += 1
             elif args[index] == "--no-contingency":
                 contingency = False
