@@ -25,16 +25,18 @@ IEEE 118 is meshed, so pair features use the full in-service topology:
 admittance (real, imaginary), adjacency, hop distance, and effective
 resistance (5 channels). See `meshed_rpe`.
 
-Architecture (checkpoint_version ``meshed-rpe-5-d4-v7``)
---------------------------------------------------------
-* **4 correction stages** (``DEPTH``), each with its own weights; the physics
+Architecture (default ``v7``: checkpoint_version ``meshed-rpe-5-d4-v7``)
+------------------------------------------------------------------------
+* **Correction stages** (``DEPTH``), each with its own weights; the physics
   loss sums stage residuals with GENCO weights ``0.5**(K-i)`` (last stage 1).
+  Default ``DEPTH=4``; preset ``v8`` uses ``DEPTH=8`` with wider ``D/D_E/D_A/HEADS``.
 * **5-channel RPE** (random-walk channels removed).
 * **RPE channel dropout**: during training each channel is zeroed with
   probability ``RPE_CHANNEL_DROPOUT`` per optimizer step; never at eval.
 * **Versioned run folder**: checkpoints go to ``Foundation Model/tpgt_task11_<RUN_TAG>``
   and tables/plot to ``Foundation Model/results/tpgt_task11_<RUN_TAG>``, so runs
-  of older architectures (``tpgt_task11/``) are left untouched.
+  of older architectures (``tpgt_task11/``, ``tpgt_task11_v7/``) are left untouched.
+  Select with ``GENCO_TPGT_ARCH=v8`` / ``--arch v8`` (same packing, residual, loss).
 
 Performance notes (Colab / large train split)
 ---------------------------------------------
@@ -169,6 +171,29 @@ CHECKPOINT_VERSION = "meshed-rpe-5-d4-v7"
 # older architecture (e.g. the 2-stage, 10-channel run in tpgt_task11/) are never overwritten.
 RUN_TAG = "v7"
 RUN_DIR_NAME = f"tpgt_task11_{RUN_TAG}"
+# Named width/depth presets (same math/loss/packing). ``GENCO_TPGT_ARCH`` / ``--arch`` selects one;
+# optional ``GENCO_TPGT_D`` / ``DEPTH`` / ``D_E`` / ``D_A`` / ``HEADS`` / ``RUN_TAG`` override fields.
+ARCH_PRESETS: dict[str, dict[str, int | str]] = {
+    "v7": {
+        "D": 48,
+        "D_E": 24,
+        "D_A": 24,
+        "HEADS": 2,
+        "DEPTH": 4,
+        "RUN_TAG": "v7",
+        "CHECKPOINT_VERSION": "meshed-rpe-5-d4-v7",
+    },
+    # Deeper iterative refine + wider type-pair attention; new Drive folder ``tpgt_task11_v8``.
+    "v8": {
+        "D": 96,
+        "D_E": 48,
+        "D_A": 48,
+        "HEADS": 4,
+        "DEPTH": 8,
+        "RUN_TAG": "v8",
+        "CHECKPOINT_VERSION": "meshed-rpe-5-d8-w96-h4-v8",
+    },
+}
 # Fixed training subset scored with val's PBL metric each validation pass (overfitting check).
 TRAIN_PROBE_CASES = 2000
 # Reference labels must satisfy nodal balance within this mean PBL (p.u.) when checked at load.
@@ -1094,6 +1119,11 @@ class BottleneckDiagnostics:
     worst_buses: list[dict[str, float | int | str]]
     angle_rmse_pq_pv: float
     voltage_rmse_pq: float
+    topk_pbl_share: float
+    angle_rmse_high_y: float
+    angle_rmse_rest: float
+    angle_rmse_worst: float
+    genco_n_gap: float
 
 
 @dataclass
@@ -1284,17 +1314,40 @@ def collect_bottleneck_diagnostics(
         )
 
     error = wrap_angle_errors((prediction - target).clone(), layout)
+    angle_bus_mask = (types_np == 0) | (types_np == 1)
     if layout.per_case:
         pq_mask, pv_mask, _slack_mask, angle_mask = layout.masks
         angle_err = error[..., 1][angle_mask]
         volt_err = error[..., 0][pq_mask]
+        # Per-bus mean |angle error| over the batch for PQ/PV buses (shared topology).
+        per_bus_angle = error[..., 1].abs().mean(dim=0).detach().cpu().numpy()
     else:
         pq, pv, _slack = layout.index
         angle_idx = layout.angle_index
         angle_err = error[:, angle_idx, 1].reshape(-1)
         volt_err = error[:, pq, 0].reshape(-1) if layout.present[0] else error.new_zeros(0)
+        per_bus_angle = error[..., 1].abs().mean(dim=0).detach().cpu().numpy()
     angle_rmse = float(torch.sqrt(torch.mean(angle_err * angle_err))) if angle_err.numel() else 0.0
     volt_rmse = float(torch.sqrt(torch.mean(volt_err * volt_err))) if volt_err.numel() else 0.0
+
+    def _rmse_on(mask: np.ndarray) -> float:
+        take = mask & angle_bus_mask
+        if not take.any():
+            return 0.0
+        vals = per_bus_angle[take]
+        return float(np.sqrt(np.mean(vals * vals)))
+
+    high_mask = y_abs_diag >= high_y["threshold_|Yii|"] if mean_bus.size else np.zeros(0, dtype=bool)
+    angle_high = _rmse_on(high_mask) if mean_bus.size else 0.0
+    angle_rest = _rmse_on(~high_mask) if mean_bus.size else 0.0
+    worst_mask = np.zeros(mean_bus.size, dtype=bool)
+    if mean_bus.size:
+        worst_mask[order] = True
+    angle_worst = _rmse_on(worst_mask) if mean_bus.size else 0.0
+    topk_share = float(mean_bus[order].sum() / total_mass) if mean_bus.size else 0.0
+    # Published GENCO Base Task 1.1 N mean PBL (plot_task1_1.PUBLISHED).
+    genco_n = 1.4e-3
+    genco_gap = raw_mean / genco_n if genco_n > 0 else float("inf")
 
     return BottleneckDiagnostics(
         pbl_share_by_type=share_by_type,
@@ -1308,6 +1361,11 @@ def collect_bottleneck_diagnostics(
         worst_buses=worst,
         angle_rmse_pq_pv=angle_rmse,
         voltage_rmse_pq=volt_rmse,
+        topk_pbl_share=topk_share,
+        angle_rmse_high_y=angle_high,
+        angle_rmse_rest=angle_rest,
+        angle_rmse_worst=angle_worst,
+        genco_n_gap=genco_gap,
     )
 
 
@@ -1391,7 +1449,14 @@ def format_bottleneck_diagnostics(bottleneck: BottleneckDiagnostics) -> str:
     )
     lines.append(
         f"  State RMSE drivers: angle(PQ+PV) {bottleneck.angle_rmse_pq_pv:.4g} rad  "
-        f"voltage(PQ) {bottleneck.voltage_rmse_pq:.4g} pu"
+        f"voltage(PQ) {bottleneck.voltage_rmse_pq:.4g} pu  "
+        f"(~{bottleneck.genco_n_gap:.0f}x GENCO published N PBL)"
+    )
+    lines.append(
+        f"  Angle |err| RMSE: high-|Yii| {bottleneck.angle_rmse_high_y:.4g} rad  "
+        f"rest {bottleneck.angle_rmse_rest:.4g}  "
+        f"worst-{len(bottleneck.worst_buses)} buses {bottleneck.angle_rmse_worst:.4g}  "
+        f"(top-{len(bottleneck.worst_buses)} PBL mass {bottleneck.topk_pbl_share:.1%})"
     )
     hy = bottleneck.high_y_vs_rest
     lines.append(
@@ -1406,6 +1471,16 @@ def format_bottleneck_diagnostics(bottleneck: BottleneckDiagnostics) -> str:
                 f"    stage {int(row['stage'])}: mean {row['mean']:.4g}  "
                 f"d_prev {row['reduction_from_prev']:+.1%}  "
                 f"vs stage1 {row['reduction_from_first']:+.1%}"
+            )
+        last = bottleneck.stage_reduction[-1]["reduction_from_prev"]
+        if last >= 0.15:
+            lines.append(
+                "  => Late stages still cut a lot: more DEPTH (iterative angle refine) should help "
+                "before/with width."
+            )
+        elif last < 0.05:
+            lines.append(
+                "  => Late stages nearly stall: prefer wider D / more heads (capacity), not only more stages."
             )
     if bottleneck.hops_to_slack:
         lines.append("  Mean PBL by hops to slack:")
@@ -1424,8 +1499,9 @@ def format_bottleneck_diagnostics(bottleneck: BottleneckDiagnostics) -> str:
                 f"|Yii| {row['|Yii|']:.4g}  hops {row['hops_to_slack']}"
             )
     lines.append(
-        "  If stage d_prev ~0 late and high-|Y| share is large: try more stages / wider D before "
-        "blaming slack. If P_share >> Q_share: prioritize angle accuracy."
+        "  Recipe toward GENCO early: (1) DATA_FRACTION=1.0 (0.1 cannot match full-data GENCO), "
+        "(2) GENCO_TPGT_ARCH=v8 (DEPTH 8, D 96; same residual/loss logic), "
+        "(3) BATCH 64 on L4, (4) do not chase slack_P RMSE."
     )
     return "\n".join(lines)
 
@@ -2120,6 +2196,71 @@ def parse_data_fraction() -> float:
     if env:
         return float(env)
     return 1.0
+
+
+def parse_arch_name() -> str | None:
+    for index, arg in enumerate(sys.argv):
+        if arg == "--arch" and index + 1 < len(sys.argv):
+            return sys.argv[index + 1].strip().lower()
+        if arg.startswith("--arch="):
+            return arg.split("=", 1)[1].strip().lower()
+    env = os.environ.get("GENCO_TPGT_ARCH", "").strip().lower()
+    return env or None
+
+
+def apply_architecture_config() -> str:
+    """Apply ``ARCH_PRESETS`` / per-dim env overrides. Same residual, packing, and loss logic."""
+    global D, D_E, D_A, HEADS, DEPTH, RUN_TAG, RUN_DIR_NAME, CHECKPOINT_VERSION
+    name = parse_arch_name()
+    if name:
+        if name not in ARCH_PRESETS:
+            allowed = ", ".join(sorted(ARCH_PRESETS))
+            raise ValueError(f"unknown arch {name!r}; choose one of {allowed}")
+        preset = ARCH_PRESETS[name]
+        D = int(preset["D"])
+        D_E = int(preset["D_E"])
+        D_A = int(preset["D_A"])
+        HEADS = int(preset["HEADS"])
+        DEPTH = int(preset["DEPTH"])
+        RUN_TAG = str(preset["RUN_TAG"])
+        CHECKPOINT_VERSION = str(preset["CHECKPOINT_VERSION"])
+    else:
+        name = RUN_TAG
+
+    for env_key, global_name in (
+        ("GENCO_TPGT_D", "D"),
+        ("GENCO_TPGT_D_E", "D_E"),
+        ("GENCO_TPGT_D_A", "D_A"),
+        ("GENCO_TPGT_HEADS", "HEADS"),
+        ("GENCO_TPGT_DEPTH", "DEPTH"),
+    ):
+        raw = os.environ.get(env_key, "").strip()
+        if raw:
+            globals()[global_name] = int(raw)
+    run_override = os.environ.get("GENCO_TPGT_RUN_TAG", "").strip()
+    if run_override:
+        RUN_TAG = run_override
+    # Re-read after overrides (globals() assignments above).
+    D = int(globals()["D"])
+    D_E = int(globals()["D_E"])
+    D_A = int(globals()["D_A"])
+    HEADS = int(globals()["HEADS"])
+    DEPTH = int(globals()["DEPTH"])
+    RUN_DIR_NAME = f"tpgt_task11_{RUN_TAG}"
+    if DEPTH < 1 or HEADS < 1 or D < 1 or D_E < 1 or D_A < 1:
+        raise ValueError(f"invalid architecture dims D={D} D_E={D_E} D_A={D_A} HEADS={HEADS} DEPTH={DEPTH}")
+    return name
+
+
+def architecture_summary() -> str:
+    return (
+        f"arch {RUN_TAG}: DEPTH={DEPTH} D={D} D_E={D_E} D_A={D_A} HEADS={HEADS} "
+        f"checkpoint_version={CHECKPOINT_VERSION}"
+    )
+
+
+def count_parameters(model: nn.Module) -> int:
+    return sum(int(param.numel()) for param in model.parameters())
 
 
 def parse_batch_size() -> int:
@@ -4230,6 +4371,7 @@ def test_model(
 def main() -> None:
     global BATCH_SIZE, DATA_FRACTION, MICRO_BATCH_SIZE, EVAL_BATCH_SIZE, VAL_EVERY
     ensure_runtime_packages()
+    apply_architecture_config()
     DATA_FRACTION = parse_data_fraction()
     BATCH_SIZE = parse_batch_size()
     MICRO_BATCH_SIZE = parse_micro_batch_size(default=BATCH_SIZE)
@@ -4280,7 +4422,10 @@ def main() -> None:
     results.mkdir(parents=True, exist_ok=True)
     data = ensure_dataset(work, drive, spec)
     print(f"Dataset: {data}", flush=True)
-    print(f"Run tag {RUN_TAG} (checkpoint_version {CHECKPOINT_VERSION}, {DEPTH} stages, {RPE_DIM}-channel RPE)", flush=True)
+    print(architecture_summary(), flush=True)
+    probe = TPGT()
+    print(f"Model parameters: {count_parameters(probe):,}", flush=True)
+    del probe
     stage_weight_text = " ".join(f"s{i + 1} {w:g}" for i, w in enumerate(physics_stage_weights(DEPTH)))
     print(f"Physics stage weights (GENCO-style): {stage_weight_text}", flush=True)
     print(f"Checkpoints: {checkpoints}", flush=True)
@@ -4417,9 +4562,11 @@ def cli_diagnose(
 ) -> None:
     global DATA_FRACTION
     ensure_runtime_packages()
+    apply_architecture_config()
     DATA_FRACTION = parse_data_fraction()
     spec = parse_task()
     print(f"Diagnose PFΔ Task {spec.label}", flush=True)
+    print(architecture_summary(), flush=True)
     drive = google_drive_root()
     outputs = drive_output_dirs(drive, spec)
     work, legacy_results = legacy_locations(drive)
