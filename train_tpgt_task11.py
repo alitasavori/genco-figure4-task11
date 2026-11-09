@@ -56,11 +56,12 @@ Performance notes (Colab / large train split)
   case's own pairs (the dense masked formulation restricted to those buses).
   Optional ``GENCO_TPGT_COMPILE=1`` or ``--compile`` wraps the model in
   ``torch.compile`` (may differ slightly in numerics).
-* **Batch 32**: Optimizer steps use 32 cases per batch. Default **micro-batch 32**
-  (one forward/backward per step when memory allows). Override with
-  ``GENCO_TPGT_MICRO_BATCH`` or ``--micro-batch``.
+* **Batch / micro-batch**: Optimizer steps use ``BATCH_SIZE`` cases (default 32).
+  Default **micro-batch** matches that (one forward/backward per step when memory
+  allows). Override with ``GENCO_TPGT_BATCH`` / ``--batch`` and
+  ``GENCO_TPGT_MICRO_BATCH`` / ``--micro-batch`` (e.g. both 64 on an L4).
 * **Eval batch 64**: Validation and test use forward-only batches up to 64
-  (``GENCO_TPGT_EVAL_BATCH`` / ``--eval-batch``) — no backward, usually safe
+  (``GENCO_TPGT_EVAL_BATCH`` / ``--eval-batch``); no backward, usually safe
   on the same GPU.
 * **CUDA**: ``cudnn.benchmark``, TF32, and high matmul precision when training
   on GPU. Optional ``torch.compile`` via ``--fast``, ``GENCO_TPGT_FAST=1``, or
@@ -2121,7 +2122,19 @@ def parse_data_fraction() -> float:
     return 1.0
 
 
-def parse_micro_batch_size() -> int:
+def parse_batch_size() -> int:
+    for index, arg in enumerate(sys.argv):
+        if arg == "--batch" and index + 1 < len(sys.argv):
+            return int(sys.argv[index + 1])
+        if arg.startswith("--batch="):
+            return int(arg.split("=", 1)[1])
+    env = os.environ.get("GENCO_TPGT_BATCH", "").strip()
+    if env:
+        return int(env)
+    return BATCH_SIZE
+
+
+def parse_micro_batch_size(*, default: int | None = None) -> int:
     for index, arg in enumerate(sys.argv):
         if arg == "--micro-batch" and index + 1 < len(sys.argv):
             return int(sys.argv[index + 1])
@@ -2130,7 +2143,7 @@ def parse_micro_batch_size() -> int:
     env = os.environ.get("GENCO_TPGT_MICRO_BATCH", "").strip()
     if env:
         return int(env)
-    return MICRO_BATCH_SIZE
+    return MICRO_BATCH_SIZE if default is None else default
 
 
 def parse_eval_batch_size() -> int:
@@ -3393,13 +3406,16 @@ def iterate_steps(
     split: Split,
     seed: int,
     epoch: int,
-    batch_size: int = BATCH_SIZE,
+    batch_size: int | None = None,
 ):
     """Training steps: one global shuffle per epoch, ``batch_size`` cases per step, split by topology.
 
     Yields lists of (network_id, case index) in order of first appearance within the step. With one
     topology this is the same permutation and the same batches as shuffling that topology alone.
+    ``batch_size`` defaults to the current global ``BATCH_SIZE`` (so ``--batch`` / env overrides apply).
     """
+    if batch_size is None:
+        batch_size = BATCH_SIZE
     generator = torch.Generator()
     generator.manual_seed(seed * 1000 + epoch)
     if split.count > 1:
@@ -3419,9 +3435,11 @@ def iterate_indexes(
     seed: int,
     epoch: int,
     shuffle: bool,
-    batch_size: int = BATCH_SIZE,
+    batch_size: int | None = None,
 ):
     """Batches that never mix topologies: networks in id order, cases in split order unless ``shuffle``."""
+    if batch_size is None:
+        batch_size = BATCH_SIZE
     generator = torch.Generator()
     generator.manual_seed(seed * 1000 + epoch)
     network_index = split.network_index.numpy()
@@ -4210,12 +4228,15 @@ def test_model(
 
 
 def main() -> None:
-    global DATA_FRACTION, MICRO_BATCH_SIZE, EVAL_BATCH_SIZE, VAL_EVERY
+    global BATCH_SIZE, DATA_FRACTION, MICRO_BATCH_SIZE, EVAL_BATCH_SIZE, VAL_EVERY
     ensure_runtime_packages()
     DATA_FRACTION = parse_data_fraction()
-    MICRO_BATCH_SIZE = parse_micro_batch_size()
+    BATCH_SIZE = parse_batch_size()
+    MICRO_BATCH_SIZE = parse_micro_batch_size(default=BATCH_SIZE)
     EVAL_BATCH_SIZE = parse_eval_batch_size()
     VAL_EVERY = parse_val_every()
+    if BATCH_SIZE < 1:
+        raise ValueError(f"batch must be >= 1, got {BATCH_SIZE}")
     if MICRO_BATCH_SIZE < 1 or MICRO_BATCH_SIZE > BATCH_SIZE:
         raise ValueError(f"micro-batch must be in [1, {BATCH_SIZE}], got {MICRO_BATCH_SIZE}")
     if EVAL_BATCH_SIZE < 1:
