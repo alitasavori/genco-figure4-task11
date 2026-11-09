@@ -101,7 +101,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1079,6 +1079,23 @@ def summarize_pair_embed(pair: torch.Tensor) -> dict[str, float]:
 
 
 @dataclass
+class BottleneckDiagnostics:
+    """Where residual / state error lives - use this to decide architecture changes."""
+
+    pbl_share_by_type: dict[str, float]
+    mean_pbl_by_type: dict[str, float]
+    p_vs_q_share: dict[str, float]
+    genco_style_pbl: dict[str, float]
+    genco_style_cut_frac: float
+    stage_reduction: list[dict[str, float]]
+    high_y_vs_rest: dict[str, float]
+    hops_to_slack: list[dict[str, float]]
+    worst_buses: list[dict[str, float | int | str]]
+    angle_rmse_pq_pv: float
+    voltage_rmse_pq: float
+
+
+@dataclass
 class ForwardDiagnostics:
     oracle_pbl: dict[str, float]
     flat_start_pbl: dict[str, float]
@@ -1090,6 +1107,207 @@ class ForwardDiagnostics:
     pair_embed: dict[str, float]
     rpe_channels: list[dict[str, float]]
     ybus_abs_mean: float
+    bottleneck: BottleneckDiagnostics
+
+
+def _hops_to_sources(adjacency: np.ndarray, sources: list[int]) -> np.ndarray:
+    """Unweighted BFS hop distances; unreachable buses stay +inf."""
+    buses = adjacency.shape[0]
+    dist = np.full(buses, np.inf, dtype=np.float64)
+    if not sources:
+        return dist
+    queue: deque[int] = deque()
+    for source in sources:
+        if 0 <= source < buses:
+            dist[source] = 0.0
+            queue.append(source)
+    while queue:
+        node = queue.popleft()
+        neighbors = np.flatnonzero(adjacency[node])
+        for nxt in neighbors:
+            if dist[nxt] > dist[node] + 1.0:
+                dist[nxt] = dist[node] + 1.0
+                queue.append(int(nxt))
+    return dist
+
+
+def genco_style_residual(residual: torch.Tensor, types: torch.Tensor) -> torch.Tensor:
+    """Zero PV-Q and slack P/Q mismatches the way GENCO-style reporting often does."""
+    out = residual.clone()
+    layout = type_layout(types)
+    if layout.per_case:
+        pq, pv, slack, _angle = layout.masks
+        out[..., 1] = torch.where(pv, torch.zeros_like(out[..., 1]), out[..., 1])
+        out[..., 0] = torch.where(slack, torch.zeros_like(out[..., 0]), out[..., 0])
+        out[..., 1] = torch.where(slack, torch.zeros_like(out[..., 1]), out[..., 1])
+        return out
+    _pq, pv, slack = layout.index
+    if layout.present[1]:
+        out[:, pv, 1] = 0.0
+    if layout.present[2]:
+        out[:, slack, :] = 0.0
+    return out
+
+
+def collect_bottleneck_diagnostics(
+    residual: torch.Tensor,
+    stage_residuals: list[torch.Tensor],
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    types: torch.Tensor,
+    ybus: torch.Tensor,
+    *,
+    top_k: int = 10,
+) -> BottleneckDiagnostics:
+    """Break down final residual so architecture work targets the real mass, not one RMSE slot."""
+    layout = type_layout(types)
+    types_cpu = types.detach().cpu()
+    if types_cpu.dim() > 1:
+        types_np = types_cpu[0].numpy().astype(np.int64)
+    else:
+        types_np = types_cpu.numpy().astype(np.int64)
+    y = ybus.detach()
+    if y.dim() == 3:
+        y = y[0]
+    y_abs_diag = torch.abs(torch.diagonal(y)).detach().cpu().numpy().astype(np.float64)
+    adj = (torch.abs(y).detach().cpu().numpy() > 1e-6) & ~np.eye(y.shape[0], dtype=bool)
+
+    per_bus = torch.sqrt(residual[..., 0] ** 2 + residual[..., 1] ** 2)
+    mean_bus = per_bus.mean(dim=0).detach().cpu().numpy()
+    abs_dp = residual[..., 0].abs().mean(dim=0).detach().cpu().numpy()
+    abs_dq = residual[..., 1].abs().mean(dim=0).detach().cpu().numpy()
+    total_mass = float(mean_bus.sum()) + 1e-12
+
+    share_by_type: dict[str, float] = {}
+    mean_by_type: dict[str, float] = {}
+    for type_id, name in enumerate(TYPE_NAMES):
+        mask = types_np == type_id
+        if not mask.any():
+            continue
+        share_by_type[name] = float(mean_bus[mask].sum() / total_mass)
+        mean_by_type[name] = float(mean_bus[mask].mean())
+
+    dp_mass = float(np.abs(abs_dp).sum())
+    dq_mass = float(np.abs(abs_dq).sum())
+    pq_mass = dp_mass + dq_mass + 1e-12
+    p_vs_q = {"P_share": dp_mass / pq_mass, "Q_share": dq_mass / pq_mass}
+
+    genco_res = genco_style_residual(residual, types)
+    genco_pbl = pbl_stats(genco_res)
+    raw_mean = float(per_bus.mean())
+    genco_cut = 0.0 if raw_mean <= 0 else max(0.0, 1.0 - genco_pbl["mean"] / raw_mean)
+
+    stage_rows: list[dict[str, float]] = []
+    prev = None
+    first = None
+    for stage_idx, stage_res in enumerate(stage_residuals, start=1):
+        stats = pbl_stats(stage_res)
+        mean = stats["mean"]
+        if first is None:
+            first = mean
+        reduction_from_prev = 0.0 if prev is None or prev <= 0 else (prev - mean) / prev
+        reduction_from_first = 0.0 if first is None or first <= 0 else (first - mean) / first
+        stage_rows.append(
+            {
+                "stage": float(stage_idx),
+                "mean": mean,
+                "reduction_from_prev": reduction_from_prev,
+                "reduction_from_first": reduction_from_first,
+            }
+        )
+        prev = mean
+
+    if mean_bus.size:
+        threshold = float(np.quantile(y_abs_diag, 0.75))
+        high = y_abs_diag >= threshold
+        rest = ~high
+        high_y = {
+            "threshold_|Yii|": threshold,
+            "high_y_buses": float(int(high.sum())),
+            "high_y_mean_pbl": float(mean_bus[high].mean()) if high.any() else 0.0,
+            "rest_mean_pbl": float(mean_bus[rest].mean()) if rest.any() else 0.0,
+            "high_y_share": float(mean_bus[high].sum() / total_mass) if high.any() else 0.0,
+        }
+    else:
+        high_y = {
+            "threshold_|Yii|": 0.0,
+            "high_y_buses": 0.0,
+            "high_y_mean_pbl": 0.0,
+            "rest_mean_pbl": 0.0,
+            "high_y_share": 0.0,
+        }
+
+    slack_idx = [int(i) for i in np.flatnonzero(types_np == 2)]
+    hops = _hops_to_sources(adj, slack_idx)
+    hop_rows: list[dict[str, float]] = []
+    finite = np.isfinite(hops)
+    if finite.any():
+        max_hop = int(np.nanmax(hops[finite]))
+        for hop in range(0, min(max_hop, 8) + 1):
+            mask = hops == hop
+            if not mask.any():
+                continue
+            hop_rows.append(
+                {
+                    "hops": float(hop),
+                    "buses": float(int(mask.sum())),
+                    "mean_pbl": float(mean_bus[mask].mean()),
+                    "share": float(mean_bus[mask].sum() / total_mass),
+                }
+            )
+        far = hops > 8
+        if far.any():
+            hop_rows.append(
+                {
+                    "hops": 9.0,
+                    "buses": float(int(far.sum())),
+                    "mean_pbl": float(mean_bus[far].mean()),
+                    "share": float(mean_bus[far].sum() / total_mass),
+                }
+            )
+
+    order = np.argsort(-mean_bus)[: min(top_k, mean_bus.size)]
+    worst: list[dict[str, float | int | str]] = []
+    for bus in order:
+        type_id = int(types_np[bus])
+        worst.append(
+            {
+                "bus_1based": int(bus) + 1,
+                "type": TYPE_NAMES[type_id] if 0 <= type_id < len(TYPE_NAMES) else str(type_id),
+                "mean_pbl": float(mean_bus[bus]),
+                "mean_|dP|": float(abs_dp[bus]),
+                "mean_|dQ|": float(abs_dq[bus]),
+                "|Yii|": float(y_abs_diag[bus]),
+                "hops_to_slack": float(hops[bus]) if np.isfinite(hops[bus]) else -1.0,
+            }
+        )
+
+    error = wrap_angle_errors((prediction - target).clone(), layout)
+    if layout.per_case:
+        pq_mask, pv_mask, _slack_mask, angle_mask = layout.masks
+        angle_err = error[..., 1][angle_mask]
+        volt_err = error[..., 0][pq_mask]
+    else:
+        pq, pv, _slack = layout.index
+        angle_idx = layout.angle_index
+        angle_err = error[:, angle_idx, 1].reshape(-1)
+        volt_err = error[:, pq, 0].reshape(-1) if layout.present[0] else error.new_zeros(0)
+    angle_rmse = float(torch.sqrt(torch.mean(angle_err * angle_err))) if angle_err.numel() else 0.0
+    volt_rmse = float(torch.sqrt(torch.mean(volt_err * volt_err))) if volt_err.numel() else 0.0
+
+    return BottleneckDiagnostics(
+        pbl_share_by_type=share_by_type,
+        mean_pbl_by_type=mean_by_type,
+        p_vs_q_share=p_vs_q,
+        genco_style_pbl=genco_pbl,
+        genco_style_cut_frac=genco_cut,
+        stage_reduction=stage_rows,
+        high_y_vs_rest=high_y,
+        hops_to_slack=hop_rows,
+        worst_buses=worst,
+        angle_rmse_pq_pv=angle_rmse,
+        voltage_rmse_pq=volt_rmse,
+    )
 
 
 def collect_forward_diagnostics(
@@ -1127,6 +1345,10 @@ def collect_forward_diagnostics(
         model_pbl = stage_pbl[-1] if stage_pbl else pbl_from_unknown(specified, prediction, types, ybus)
         state_rmse = state_rmse_by_type(prediction, target, types)
         ybus_abs = float(torch.abs(ybus).mean())
+        final_residual = residuals[-1] if residuals else nodal_residual(specified, prediction, types, ybus)
+        bottleneck = collect_bottleneck_diagnostics(
+            final_residual, list(residuals), prediction, target, types, ybus
+        )
     return ForwardDiagnostics(
         oracle_pbl=oracle,
         flat_start_pbl=flat_pbl,
@@ -1138,7 +1360,73 @@ def collect_forward_diagnostics(
         pair_embed=summarize_pair_embed(pair),
         rpe_channels=summarize_rpe(network.rpe),
         ybus_abs_mean=ybus_abs,
+        bottleneck=bottleneck,
     )
+
+
+def format_bottleneck_diagnostics(bottleneck: BottleneckDiagnostics) -> str:
+    lines = ["Bottleneck (architecture targeting - read this before changing depth/width):"]
+    share = bottleneck.pbl_share_by_type
+    mean = bottleneck.mean_pbl_by_type
+    share_txt = "  ".join(
+        f"{name} share {share[name]:.1%} mean {mean[name]:.4g}" for name in TYPE_NAMES if name in share
+    )
+    lines.append(f"  PBL mass by bus type: {share_txt}")
+    slack_share = share.get("Slack", 0.0)
+    if slack_share < 0.15:
+        lines.append(
+            f"  => Slack is NOT the main error mass ({slack_share:.1%} of sum PBL). "
+            "Large slack_P RMSE is one bus's unknown P; mean PBL is dominated by PQ/PV angles."
+        )
+    else:
+        lines.append(
+            f"  => Slack holds {slack_share:.1%} of sum PBL - unusual; check slack packing / labels."
+        )
+    pq = bottleneck.p_vs_q_share
+    lines.append(
+        f"  Residual axis mass: |dP| {pq['P_share']:.1%}  |dQ| {pq['Q_share']:.1%}  "
+        f"(GENCO-style zero PV-Q+slack -> PBL mean {bottleneck.genco_style_pbl['mean']:.4g}, "
+        f"cuts {bottleneck.genco_style_cut_frac:.1%})"
+    )
+    lines.append(
+        f"  State RMSE drivers: angle(PQ+PV) {bottleneck.angle_rmse_pq_pv:.4g} rad  "
+        f"voltage(PQ) {bottleneck.voltage_rmse_pq:.4g} pu"
+    )
+    hy = bottleneck.high_y_vs_rest
+    lines.append(
+        f"  High-|Yii| top25% ({int(hy['high_y_buses'])} buses, thr {hy['threshold_|Yii|']:.4g}): "
+        f"mean PBL {hy['high_y_mean_pbl']:.4g} vs rest {hy['rest_mean_pbl']:.4g} "
+        f"(share {hy['high_y_share']:.1%})"
+    )
+    if bottleneck.stage_reduction:
+        lines.append("  Stage residual reduction (stall => need more capacity/depth or better init):")
+        for row in bottleneck.stage_reduction:
+            lines.append(
+                f"    stage {int(row['stage'])}: mean {row['mean']:.4g}  "
+                f"d_prev {row['reduction_from_prev']:+.1%}  "
+                f"vs stage1 {row['reduction_from_first']:+.1%}"
+            )
+    if bottleneck.hops_to_slack:
+        lines.append("  Mean PBL by hops to slack:")
+        for row in bottleneck.hops_to_slack:
+            hop_label = ">=9" if row["hops"] >= 9 else str(int(row["hops"]))
+            lines.append(
+                f"    {hop_label:>3s} hops  {int(row['buses']):3d} buses  "
+                f"mean {row['mean_pbl']:.4g}  share {row['share']:.1%}"
+            )
+    if bottleneck.worst_buses:
+        lines.append("  Worst buses (1-based):")
+        for row in bottleneck.worst_buses:
+            lines.append(
+                f"    bus {row['bus_1based']:3d} ({row['type']:5s}) PBL {row['mean_pbl']:.4g}  "
+                f"|dP| {row['mean_|dP|']:.4g} |dQ| {row['mean_|dQ|']:.4g}  "
+                f"|Yii| {row['|Yii|']:.4g}  hops {row['hops_to_slack']}"
+            )
+    lines.append(
+        "  If stage d_prev ~0 late and high-|Y| share is large: try more stages / wider D before "
+        "blaming slack. If P_share >> Q_share: prioritize angle accuracy."
+    )
+    return "\n".join(lines)
 
 
 def format_forward_diagnostics(
@@ -1179,6 +1467,7 @@ def format_forward_diagnostics(
             f"  {row['name']:12s} off_mean {row['off_mean']:+.4g} off_max {row['off_max']:+.4g} "
             f"diag_mean {row['diag_mean']:+.4g}"
         )
+    lines.append(format_bottleneck_diagnostics(diagnostics.bottleneck))
     lines.append(
         "Read the oracle line first: if it is not ~1e-6, fix data/units before judging the model."
     )
