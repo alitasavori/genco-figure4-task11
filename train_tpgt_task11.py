@@ -17,20 +17,20 @@ type masks (``TypeLayout``). Device copies of the networks (``DeviceNetworks``) 
 they fit the memory budget, otherwise in an LRU. Validation and test batch the same way. The
 250-batch and epoch log lines break the step time into network moves, pair encoder, forward,
 backward and optimizer (``StepTimer``). Checkpoint epochs also write a bar plot against the
-published numbers and IEEE 118 bus error maps.
+published numbers (latest under ``results/``, plus a per-epoch copy under
+``bar_plots/seed_*/epoch_*/``) and IEEE 118 bus error maps.
 The hidden sizes, depth, batch, and epoch cap below are implementation
 choices so a Colab GPU can finish a run. They are not paper hyperparameters.
 
 IEEE 118 is meshed, so pair features use the full in-service topology:
-admittance (real, imaginary), adjacency, hop distance, and effective
-resistance (5 channels). See `meshed_rpe`.
+complex effective impedance Re/Im (2 channels). See `meshed_rpe`.
 
-Architecture (default ``v7``: checkpoint_version ``meshed-rpe-5-d4-v7``)
+Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
 ------------------------------------------------------------------------
 * **Correction stages** (``DEPTH``), each with its own weights; the physics
   loss sums stage residuals with GENCO weights ``0.5**(K-i)`` (last stage 1).
   Default ``DEPTH=4``; preset ``v8`` uses ``DEPTH=8`` with wider ``D/D_E/D_A/HEADS``.
-* **5-channel RPE** (random-walk channels removed).
+* **2-channel RPE**: ``Zeff_Re_norm``, ``Zeff_Im_norm`` (complex Laplacian effective impedance).
 * **RPE channel dropout**: during training each channel is zeroed with
   probability ``RPE_CHANNEL_DROPOUT`` per optimizer step; never at eval.
 * **Versioned run folder**: checkpoints go to ``Foundation Model/tpgt_task11_<RUN_TAG>``
@@ -77,10 +77,11 @@ Performance notes (Colab / large train split)
   0.5 MB each on case118; otherwise an LRU of that size. The decision is logged at seed start.
 * **Optional**: ``GENCO_TPGT_VAL_EVERY=3`` or ``--val-every 3`` skips most
   validation passes (faster; coarser early stopping).
-* **LR schedule**: Adam at ``LEARNING_RATE`` with ``ReduceLROnPlateau`` on
-  validation PBL (x0.7 after 5 non-improving validations) and early stopping
-  after 100, as in GENCO. The epoch line shows ``lr``; scheduler state is saved
-  in checkpoints, and resumed runs keep their saved optimizer learning rate.
+* **LR / grads**: Adam at ``LEARNING_RATE`` with **cosine decay** to
+  ``LEARNING_RATE * LR_COSINE_MIN_RATIO`` over ``EPOCHS`` (updates get smaller
+  through training) plus ``GRAD_CLIP_NORM`` on every optimizer step (caps loss
+  spikes). Early stopping still uses validation PBL patience. The epoch line
+  shows ``lr``; scheduler state is checkpointed.
 * **Debug (on by default)**: every validation pass also scores a fixed training
   subset (``train_pbl`` and ``gap`` in the epoch line). On checkpoint epochs the
   run prints the forward report, RPE zero-ablation, RPE and residual correctness
@@ -134,11 +135,11 @@ HEADS = 2
 DEPTH = 4
 ETA = 1.0
 BATCH_SIZE = 32
-# Optimizer schedule follows GENCO's Task 1.1 config (HGNS_PF_pfdelta_bs64_seed1.yaml):
-# Adam at 5e-4, ReduceLROnPlateau on validation PBL (x0.7, patience 5), early stop after 100.
+# Adam start LR matches GENCO Task 1.1; cosine anneals it so late epochs take tinier steps.
+# Grad clip caps single-batch explosions (epoch-7 style spikes). Early stop still on val PBL.
 LEARNING_RATE = 5e-4
-LR_PLATEAU_FACTOR = 0.7
-LR_PLATEAU_PATIENCE = 5
+LR_COSINE_MIN_RATIO = 0.05  # final lr = LEARNING_RATE * this (2.5e-5 at defaults)
+GRAD_CLIP_NORM = 1.0  # 0 disables; clip after GradScaler.unscale_
 EARLY_STOP_PATIENCE = 100
 EPOCHS = 100
 # Drive checkpoints (and results CSV / comparison plot) every 3rd epoch and at the final epoch.
@@ -153,27 +154,28 @@ LAMBDA_PHYS = 0.15
 PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
-CACHE_VERSION = "tpgt-cache-4"
-RPE_FEATURE_NAMES = (
-    "ReY/sY",
-    "ImY/sY",
-    "adjacency",
-    "hop_norm",
-    "Reff_norm",
-)
+CACHE_VERSION = "tpgt-cache-7"
+RPE_FEATURE_NAMES = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_DIM = len(RPE_FEATURE_NAMES)
 # Per optimizer step, each RPE channel is zeroed (whole 118x118 plane, no rescaling) with this
 # probability. Training only; validation, test and diagnostics always see the full RPE.
 RPE_CHANNEL_DROPOUT = 0.1
 # Bumped when pair-encoder input size or architecture changes; old Drive checkpoints are ignored.
-CHECKPOINT_VERSION = "meshed-rpe-5-d4-v7"
+CHECKPOINT_VERSION = "meshed-rpe-2-d4-v7"
 # Checkpoints, split caches and result tables live in tpgt_task11_<RUN_TAG> so runs of an
 # older architecture (e.g. the 2-stage, 10-channel run in tpgt_task11/) are never overwritten.
 RUN_TAG = "v7"
 RUN_DIR_NAME = f"tpgt_task11_{RUN_TAG}"
+# Residual/state packing stays 2 known slots per type. v9 node encoders see all four PF
+# quantities (P, Q, V, θ) with unknowns zeroed, plus bus-shunt B from parquet ``BS`` (device only).
+NODE_SPECIFIED_DIM = 2
+NODE_PQVT_DIM = 4
+NODE_SHUNT_B_DIM = 1
+NODE_FEATURE_DIM = NODE_PQVT_DIM + NODE_SHUNT_B_DIM  # 5 = (P,Q,V,θ,Bs)
+USE_NODE_SHUNT = False
 # Named width/depth presets (same math/loss/packing). ``GENCO_TPGT_ARCH`` / ``--arch`` selects one;
 # optional ``GENCO_TPGT_D`` / ``DEPTH`` / ``D_E`` / ``D_A`` / ``HEADS`` / ``RUN_TAG`` override fields.
-ARCH_PRESETS: dict[str, dict[str, int | str]] = {
+ARCH_PRESETS: dict[str, dict[str, int | str | bool]] = {
     "v7": {
         "D": 48,
         "D_E": 24,
@@ -181,7 +183,8 @@ ARCH_PRESETS: dict[str, dict[str, int | str]] = {
         "HEADS": 2,
         "DEPTH": 4,
         "RUN_TAG": "v7",
-        "CHECKPOINT_VERSION": "meshed-rpe-5-d4-v7",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d4-v7",
+        "USE_NODE_SHUNT": False,
     },
     # Deeper iterative refine + wider type-pair attention; new Drive folder ``tpgt_task11_v8``.
     "v8": {
@@ -191,7 +194,19 @@ ARCH_PRESETS: dict[str, dict[str, int | str]] = {
         "HEADS": 4,
         "DEPTH": 8,
         "RUN_TAG": "v8",
-        "CHECKPOINT_VERSION": "meshed-rpe-5-d8-w96-h4-v8",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h4-v8",
+        "USE_NODE_SHUNT": False,
+    },
+    # v8 width/depth + (P,Q,V,θ,Bs) node features; Zeff Re/Im RPE; folder ``tpgt_task11_v9``.
+    "v9": {
+        "D": 96,
+        "D_E": 48,
+        "D_A": 48,
+        "HEADS": 4,
+        "DEPTH": 8,
+        "RUN_TAG": "v9",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h4-pqvt-busBS-v9",
+        "USE_NODE_SHUNT": True,
     },
 }
 # Fixed training subset scored with val's PBL metric each validation pass (overfitting check).
@@ -699,12 +714,53 @@ class CorrectionStage(nn.Module):
         return torch.einsum("bhna,hda->bnd", mixed_heads, self.w_o)
 
 
+def bus_shunt_gb(ybus: torch.Tensor) -> torch.Tensor:
+    """Per-bus shunt+charging ``(G, B)`` from the Ybus row-sum (series branch terms cancel).
+
+    ``ybus`` is shared ``(N, N)`` or per case ``(B, N, N)`` → ``(N, 2)`` or ``(B, N, 2)``.
+    """
+    row = ybus.sum(dim=-1)
+    return torch.stack((row.real, row.imag), dim=-1)
+
+
+def bus_shunt_b(ybus: torch.Tensor) -> torch.Tensor:
+    """``Im(∑_j Y_ij)``: all to-ground susceptance in Y (bus shunt **and** line charging).
+
+    Prefer parquet ``BS`` for the node feature (device-only). This helper is for diagnostics.
+    """
+    return ybus.sum(dim=-1).imag
+
+
+def network_shunt_b(network: Network) -> torch.Tensor:
+    """Bus-shunt susceptance ``BS`` (p.u.); zeros if the network was built without it."""
+    shunt = getattr(network, "shunt_b", None)
+    if shunt is None:
+        return torch.zeros(int(network.types.shape[-1]), dtype=torch.float32, device=network.types.device)
+    return shunt
+
+
+def node_encoder_features(
+    specified: torch.Tensor,
+    layout: TypeLayout,
+    shunt_b: torch.Tensor,
+) -> torch.Tensor:
+    """``(P, Q, V, θ, B_s)`` per bus: unknowns zeroed; ``B_s`` = bus shunt device only (parquet ``BS``)."""
+    power_p, power_q, voltage, angle = assemble(specified, torch.zeros_like(specified), layout)
+    bs = shunt_b.to(device=specified.device, dtype=specified.dtype)
+    if bs.dim() == 1:
+        bs = bs.unsqueeze(0).expand(specified.shape[0], -1)
+    return torch.stack((power_p, power_q, voltage, angle, bs), dim=-1)
+
+
 class TPGT(nn.Module):
     """Fixed-depth type-pair graph Transformer with independently learned stages."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.encoders = nn.ModuleList(MLP(2, D) for _ in range(3))
+        node_in = NODE_FEATURE_DIM if USE_NODE_SHUNT else NODE_SPECIFIED_DIM
+        # v9: (P,Q,V,θ,Bs) for all types. Else: packed specified (2). No ground node.
+        self.encoders = nn.ModuleList(MLP(node_in, D) for _ in range(3))
+        self.use_node_shunt = USE_NODE_SHUNT
         self.pair_encoder = MLP(RPE_DIM, D_E)
         self.stages = nn.ModuleList(CorrectionStage() for _ in range(DEPTH))
 
@@ -717,10 +773,12 @@ class TPGT(nn.Module):
         ybus: torch.Tensor,
         pair: torch.Tensor | None = None,
         layout: TypeLayout | None = None,
+        shunt_b: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """``types`` (N,) with ``pair_type_masks`` (9, N, N), or per case (B, N) with (B, 9, N, N).
 
         ``layout`` (precomputed by ``move_to`` / ``PassBatch``) replaces ``types`` and the masks.
+        ``shunt_b`` is bus-shunt ``BS`` (N,) or (B, N); required for v9 node features.
         """
         if pair is None:
             pair = self.pair_encoder(rpe)
@@ -737,9 +795,16 @@ class TPGT(nn.Module):
             dtype=act_dtype,
         )
         unknown = flat_start(specified, layout)
+        if self.use_node_shunt:
+            if shunt_b is None:
+                shunt_b = specified.new_zeros(specified.shape[:2])
+            node_feats = node_encoder_features(specified, layout, shunt_b).to(dtype=act_dtype)
+        else:
+            node_feats = specified
         for type_id, encoder in enumerate(self.encoders):
-            if layout.present[type_id]:
-                hidden = write_type(hidden, layout, type_id, encoder(gather_type(specified, layout, type_id)))
+            if not layout.present[type_id]:
+                continue
+            hidden = write_type(hidden, layout, type_id, encoder(gather_type(node_feats, layout, type_id)))
         residuals = []
         for stage in self.stages:
             hidden, unknown, residual = stage(hidden, unknown, specified, pair, layout, ybus)
@@ -1027,6 +1092,7 @@ def eval_batch_with_pair(
             network.pair_type_masks,
             network.ybus,
             pair=pair,
+            shunt_b=network_shunt_b(network),
         )
         breakdown = task_loss(prediction, target, residuals, network.types)
         final_pbl = pbl_stats(residuals[-1])
@@ -1398,6 +1464,7 @@ def collect_forward_diagnostics(
             network.pair_type_masks,
             ybus,
             pair=pair,
+            shunt_b=network_shunt_b(network),
         )
         breakdown = task_loss(prediction, target, residuals, types)
         stage_pbl = [pbl_stats(r) for r in residuals]
@@ -1612,7 +1679,13 @@ def audit_residual_correctness(
 
         pair = pair_features(model, network)
         prediction, residuals = model(
-            specified, types, network.rpe, network.pair_type_masks, ybus, pair=pair
+            specified,
+            types,
+            network.rpe,
+            network.pair_type_masks,
+            ybus,
+            pair=pair,
+            shunt_b=network_shunt_b(network),
         )
         recomputed = nodal_residual(specified, prediction, types, ybus)
         scale = float(residuals[-1].abs().max().clamp(min=1.0))
@@ -1873,6 +1946,8 @@ class Network:
     pair_type_masks: torch.Tensor | None = field(default=None, repr=False)
     pair_embed: torch.Tensor | None = field(default=None, repr=False)
     branches: tuple[tuple[int, int, float, float], ...] | None = field(default=None, repr=False)
+    # Bus shunt susceptance from parquet ``BS`` (p.u.); device-only, not line charging.
+    shunt_b: torch.Tensor | None = field(default=None, repr=False)
     type_key: bytes | None = field(default=None, repr=False, compare=False)
     layout: TypeLayout | None = field(default=None, repr=False, compare=False)
 
@@ -1911,45 +1986,48 @@ class Split:
     networks: list[Network]
 
 
+def _effective_impedance_matrix(laplacian: np.ndarray) -> np.ndarray:
+    """``Z_eff[i,j] = L^†_ii + L^†_jj - 2 L^†_ij`` for real or complex Laplacian ``L``."""
+    pseudoinverse = np.linalg.pinv(laplacian)
+    diagonal = np.diag(pseudoinverse)
+    return (diagonal[:, None] + diagonal[None, :]) - 2.0 * pseudoinverse
+
+
 def meshed_rpe(
     bus_count: int,
     branches: list[tuple[int, int, float, float]],
     ybus: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Five pair features on the full in-service meshed graph.
+    """Two pair features: normalized Re/Im of complex effective impedance (Method B).
 
-    Order: Re(Y)/s_Y, Im(Y)/s_Y, A_ij, hop/d_max, eff_res/r_max. Branch r and
-    x build W (for effective resistance); Y comes from the case Ybus used in
-    the power-flow residual.
-
-    s_Y(c) is the mean of off-diagonal |Y_pq| with p != q and |Y_pq| > eps
-    (zeros from non-adjacent pairs are excluded).
-
-    For a non-adjacent pair, Y_ij is zero but hop and effective resistance
-    are positive. That is expected: direct admittance is local, while hop
-    and resistance summarize the full meshed graph. They are not contradictory.
+    Branch admittance ``y_ij = 1/(r_ij + j x_ij)``; parallel branches add. Complex
+    Laplacian ``L = diag(Y 1) - Y`` with ``Y_ij = y_ij``. Then
+    ``Z_eff(i,j) = L^†_ii + L^†_jj - 2 L^†_ij``,
+    ``Zeff_Re_norm = Re(Z_eff)/s_R``, ``Zeff_Im_norm = Im(Z_eff)/s_X`` with per-component
+    ``s_R = max_{p≠q}|Re(Z_eff)|``, ``s_X = max_{p≠q}|Im(Z_eff)|``.
+    ``ybus`` is unused (residual still uses full scenario Ybus).
 
     Components are numbered in order of their lowest bus index; buses with no
-    in-service branch form singleton components with zero hop and resistance.
+    in-service branch form singleton components with zero features.
     """
+    del ybus
     from scipy.sparse import csr_matrix
-    from scipy.sparse.csgraph import connected_components, shortest_path
+    from scipy.sparse.csgraph import connected_components
 
-    y = ybus.astype(np.complex128)
-    y_abs = np.abs(y)
-    weight = np.zeros((bus_count, bus_count), dtype=np.float64)
+    admittance = np.zeros((bus_count, bus_count), dtype=np.complex128)
     adjacency = np.zeros((bus_count, bus_count), dtype=bool)
     table = np.asarray(branches, dtype=np.float64).reshape(-1, 4)
-    magnitude = np.hypot(table[:, 2], table[:, 3])
-    table = table[magnitude > 0]
-    if table.shape[0]:
-        origin = table[:, 0].astype(np.int64)
-        destination = table[:, 1].astype(np.int64)
-        branch_weight = 1.0 / magnitude[magnitude > 0]
-        rows = np.stack((origin, destination), axis=1).ravel()
-        columns = np.stack((destination, origin), axis=1).ravel()
-        np.add.at(weight, (rows, columns), np.repeat(branch_weight, 2))
-        adjacency[rows, columns] = True
+    for origin, destination, resistance, reactance in table:
+        impedance = resistance + 1j * reactance
+        if abs(impedance) <= 0.0:
+            continue
+        branch_y = 1.0 / impedance
+        i = int(origin)
+        j = int(destination)
+        admittance[i, j] += branch_y
+        admittance[j, i] += branch_y
+        adjacency[i, j] = True
+        adjacency[j, i] = True
 
     graph = csr_matrix(adjacency.astype(np.float64))
     _count, labels = connected_components(graph, directed=False)
@@ -1959,45 +2037,34 @@ def meshed_rpe(
     component = rank[inverse.reshape(-1)].astype(np.int64)
     component_id = int(first_bus.size)
 
-    hop = shortest_path(graph, method="D", directed=False, unweighted=True)
-    hop[~np.isfinite(hop)] = 0.0
-
-    scale_y = np.ones(component_id, dtype=np.float64)
-    hop_scale = np.ones(component_id, dtype=np.float64)
-    resistance_scale = np.ones(component_id, dtype=np.float64)
-    effective = np.zeros((bus_count, bus_count), dtype=np.float64)
+    re_scale = np.ones(component_id, dtype=np.float64)
+    im_scale = np.ones(component_id, dtype=np.float64)
+    z_eff = np.zeros((bus_count, bus_count), dtype=np.complex128)
     for comp in range(component_id):
         buses = np.flatnonzero(component == comp)
-        scale_y[comp] = component_admittance_scale(y_abs, component, comp)
-        max_hop = float(hop[np.ix_(buses, buses)].max())
-        hop_scale[comp] = max_hop if max_hop > 0 else 1.0
         if buses.size == 1:
             continue
-        sub_weight = weight[np.ix_(buses, buses)]
-        sub_laplacian = np.diag(np.sum(sub_weight, axis=1)) - sub_weight
-        pseudoinverse = np.linalg.pinv(sub_laplacian)
-        diagonal = np.diag(pseudoinverse)
-        delta = (diagonal[:, None] + diagonal[None, :]) - 2.0 * pseudoinverse
-        effective[np.ix_(buses, buses)] = np.maximum(delta, 0.0)
-        max_resistance = float(effective[np.ix_(buses, buses)].max())
-        resistance_scale[comp] = max_resistance if max_resistance > 0 else 1.0
+        sub_y = admittance[np.ix_(buses, buses)]
+        sub_laplacian = np.diag(np.sum(sub_y, axis=1)) - sub_y
+        block = _effective_impedance_matrix(sub_laplacian)
+        z_eff[np.ix_(buses, buses)] = block
+        off = block.copy()
+        np.fill_diagonal(off, 0.0)
+        max_re = float(np.max(np.abs(off.real))) if off.size else 0.0
+        max_im = float(np.max(np.abs(off.imag))) if off.size else 0.0
+        re_scale[comp] = max_re if max_re > 0 else 1.0
+        im_scale[comp] = max_im if max_im > 0 else 1.0
 
     same = component[:, None] == component[None, :]
     off_diagonal = same & ~np.eye(bus_count, dtype=bool)
     features = np.zeros((bus_count, bus_count, RPE_DIM), dtype=np.float32)
-    y_scale = scale_y[component][:, None]
-    features[..., 0] = np.where(same, y.real / y_scale, 0.0)
-    features[..., 1] = np.where(same, y.imag / y_scale, 0.0)
-    features[..., 2] = np.where(same, adjacency, False)
-    features[..., 3] = np.where(off_diagonal, hop / hop_scale[component][:, None], 0.0)
-    features[..., 4] = np.where(off_diagonal, effective / resistance_scale[component][:, None], 0.0)
+    re = np.where(off_diagonal, z_eff.real / re_scale[component][:, None], 0.0)
+    im = np.where(off_diagonal, z_eff.imag / im_scale[component][:, None], 0.0)
+    features[..., 0] = re.astype(np.float32)
+    features[..., 1] = im.astype(np.float32)
 
-    hop_symmetry = np.max(np.abs(hop - hop.T))
-    if hop_symmetry > 1e-5:
-        raise RuntimeError("Hop distance on the meshed graph is not symmetric.")
-    resistance_symmetry = np.max(np.abs(effective - effective.T))
-    if resistance_symmetry > 1e-4:
-        raise RuntimeError("Effective resistance is not symmetric.")
+    if np.max(np.abs(z_eff - z_eff.T)) > 1e-4:
+        raise RuntimeError("Complex effective impedance is not symmetric.")
     if not np.isfinite(features).all():
         raise RuntimeError("Meshed RPE contains non-finite values.")
     return features, component
@@ -2036,93 +2103,33 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
     )
 
     diagonal = np.arange(bus_count)
-    diag_adj = bool(np.allclose(rpe[diagonal, diagonal, 2], 0.0))
-    checks.append(
-        CorrectnessCheck(
-            "diag_adjacency_zero",
-            diag_adj,
-            "diagonal adjacency is 0" if diag_adj else "diagonal adjacency must be 0",
+    for channel, label in enumerate(("Re", "Im")):
+        diag_ok = bool(np.allclose(rpe[diagonal, diagonal, channel], 0.0))
+        checks.append(
+            CorrectnessCheck(
+                f"diag_zeff_{label.lower()}_zero",
+                diag_ok,
+                f"diagonal Zeff {label} is 0" if diag_ok else f"diagonal Zeff {label} must be 0",
+            )
         )
-    )
-    diag_hop = bool(np.allclose(rpe[diagonal, diagonal, 3], 0.0))
-    checks.append(
-        CorrectnessCheck(
-            "diag_hop_zero",
-            diag_hop,
-            "diagonal normalized hop is 0" if diag_hop else "diagonal hop must be 0",
+        sym_ok = bool(np.allclose(rpe[:, :, channel], rpe[:, :, channel].T, atol=1e-4))
+        checks.append(
+            CorrectnessCheck(
+                f"zeff_{label.lower()}_symmetric",
+                sym_ok,
+                f"normalized Zeff {label} symmetric" if sym_ok else f"Zeff {label} channel not symmetric",
+            )
         )
-    )
-    diag_reff = bool(np.allclose(rpe[diagonal, diagonal, 4], 0.0))
-    checks.append(
-        CorrectnessCheck(
-            "diag_reff_zero",
-            diag_reff,
-            "diagonal normalized Reff is 0" if diag_reff else "diagonal Reff must be 0",
-        )
-    )
-
-    hop_sym = bool(np.allclose(rpe[:, :, 3], rpe[:, :, 3].T, atol=1e-5))
-    checks.append(
-        CorrectnessCheck(
-            "hop_symmetric",
-            hop_sym,
-            "normalized hop symmetric" if hop_sym else "hop channel not symmetric",
-        )
-    )
-    reff_sym = bool(np.allclose(rpe[:, :, 4], rpe[:, :, 4].T, atol=1e-4))
-    checks.append(
-        CorrectnessCheck(
-            "reff_symmetric",
-            reff_sym,
-            "normalized Reff symmetric" if reff_sym else "Reff channel not symmetric",
-        )
-    )
-
-    y_abs = np.abs(ybus.astype(np.complex128))
-    admittance_errors: list[float] = []
-    for origin in range(bus_count):
-        comp = int(component[origin])
-        if comp < 0:
-            continue
-        y_scale = component_admittance_scale(y_abs, component, comp)
-        for destination in range(bus_count):
-            if int(component[destination]) != comp:
-                continue
-            admittance_errors.append(abs(rpe[origin, destination, 0] - ybus.real[origin, destination] / y_scale))
-            admittance_errors.append(abs(rpe[origin, destination, 1] - ybus.imag[origin, destination] / y_scale))
-    max_adm = float(max(admittance_errors)) if admittance_errors else 0.0
-    adm_ok = max_adm <= recompute_atol
-    checks.append(
-        CorrectnessCheck(
-            "ybus_admittance_channels",
-            adm_ok,
-            f"max |RPE0/1 - Y/s_Y| = {max_adm:.3e} (tol {recompute_atol:.0e})",
-        )
-    )
 
     if getattr(network, "branches", None) is not None:
         branches = network.branches
         assert branches is not None
-        adjacency = np.zeros((bus_count, bus_count), dtype=np.float32)
-        for origin, destination, _resistance, _reactance in branches:
-            adjacency[origin, destination] = 1.0
-            adjacency[destination, origin] = 1.0
-        adj_ok = bool(np.allclose(rpe[:, :, 2], adjacency, atol=1e-6))
-        checks.append(
-            CorrectnessCheck(
-                "adjacency_vs_branches",
-                adj_ok,
-                f"{len(branches)} in-service branches"
-                + (" match channel 2" if adj_ok else " disagree with channel 2"),
-            )
-        )
-
         expected, expected_component = meshed_rpe(bus_count, list(branches), ybus)
         max_diff = float(np.max(np.abs(expected - rpe)))
         recompute_ok = max_diff <= recompute_atol and np.array_equal(expected_component, component)
         checks.append(
             CorrectnessCheck(
-                "recompute_from_ybus_branches",
+                "recompute_from_branches",
                 recompute_ok,
                 f"max |recomputed - cached| = {max_diff:.3e} (tol {recompute_atol:.0e})",
             )
@@ -2130,7 +2137,7 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
     else:
         checks.append(
             CorrectnessCheck(
-                "recompute_from_ybus_branches",
+                "recompute_from_branches",
                 True,
                 "skipped (branches not stored on Network; rebuild split cache to enable)",
             )
@@ -2210,7 +2217,7 @@ def parse_arch_name() -> str | None:
 
 def apply_architecture_config() -> str:
     """Apply ``ARCH_PRESETS`` / per-dim env overrides. Same residual, packing, and loss logic."""
-    global D, D_E, D_A, HEADS, DEPTH, RUN_TAG, RUN_DIR_NAME, CHECKPOINT_VERSION
+    global D, D_E, D_A, HEADS, DEPTH, RUN_TAG, RUN_DIR_NAME, CHECKPOINT_VERSION, USE_NODE_SHUNT
     name = parse_arch_name()
     if name:
         if name not in ARCH_PRESETS:
@@ -2224,6 +2231,7 @@ def apply_architecture_config() -> str:
         DEPTH = int(preset["DEPTH"])
         RUN_TAG = str(preset["RUN_TAG"])
         CHECKPOINT_VERSION = str(preset["CHECKPOINT_VERSION"])
+        USE_NODE_SHUNT = bool(preset.get("USE_NODE_SHUNT", False))
     else:
         name = RUN_TAG
 
@@ -2240,6 +2248,11 @@ def apply_architecture_config() -> str:
     run_override = os.environ.get("GENCO_TPGT_RUN_TAG", "").strip()
     if run_override:
         RUN_TAG = run_override
+    shunt_override = os.environ.get("GENCO_TPGT_NODE_SHUNT", "").strip().lower()
+    if shunt_override in ("1", "true", "yes"):
+        USE_NODE_SHUNT = True
+    elif shunt_override in ("0", "false", "no"):
+        USE_NODE_SHUNT = False
     # Re-read after overrides (globals() assignments above).
     D = int(globals()["D"])
     D_E = int(globals()["D_E"])
@@ -2253,8 +2266,11 @@ def apply_architecture_config() -> str:
 
 
 def architecture_summary() -> str:
+    node_in = NODE_FEATURE_DIM if USE_NODE_SHUNT else NODE_SPECIFIED_DIM
+    node_txt = "P,Q,V,θ,busBS" if USE_NODE_SHUNT else "spec"
     return (
         f"arch {RUN_TAG}: DEPTH={DEPTH} D={D} D_E={D_E} D_A={D_A} HEADS={HEADS} "
+        f"node_in={node_in} ({node_txt}) "
         f"checkpoint_version={CHECKPOINT_VERSION}"
     )
 
@@ -2512,7 +2528,7 @@ def read_split(
     branch_count = branch_rows // full
     bus = pq.read_table(
         raw / "bus_data.parquet",
-        columns=["scenario", "bus", "Pd", "Qd", "Pg", "Qg", "Vm", "Va", "PQ", "PV", "REF"],
+        columns=["scenario", "bus", "Pd", "Qd", "Pg", "Qg", "Vm", "Va", "PQ", "PV", "REF", "BS"],
     ).slice(start * 118, count * 118)
     buses = _blocks(bus.column("bus").to_numpy(), 118)
     scenario_blocks = _blocks(bus.column("scenario").to_numpy(), 118)
@@ -2532,6 +2548,8 @@ def read_split(
     power_q = (_blocks(bus.column("Qg").to_numpy(), 118) - _blocks(bus.column("Qd").to_numpy(), 118)) / BASE_MVA
     voltage = _blocks(bus.column("Vm").to_numpy(), 118)
     angle = np.deg2rad(_blocks(bus.column("Va").to_numpy(), 118))
+    # Parquet ``BS`` is already p.u. bus-shunt susceptance (device only; GS is 0 on case118).
+    shunt_b = _blocks(bus.column("BS").to_numpy(), 118).astype(np.float32)
 
     branch = pq.read_table(
         raw / "branch_data.parquet",
@@ -2598,8 +2616,18 @@ def read_split(
     representatives = [int(local) for local in first_local]
     with blas_single_thread():
         networks = _representative_networks(
-            name, representatives, scenario_ids, type_code, y_by_scenario, status, origin, destination,
-            resistance, reactance, branch_count,
+            name,
+            representatives,
+            scenario_ids,
+            type_code,
+            y_by_scenario,
+            status,
+            origin,
+            destination,
+            resistance,
+            reactance,
+            branch_count,
+            shunt_b,
         )
     return Split(
         name=name,
@@ -2634,6 +2662,7 @@ def _representative_networks(
     resistance: np.ndarray,
     reactance: np.ndarray,
     branch_count: int,
+    shunt_b: np.ndarray,
 ) -> list[Network]:
     networks: list[Network] = []
     for local in representatives:
@@ -2666,6 +2695,7 @@ def _representative_networks(
                 component=torch.from_numpy(component.astype(np.int64)),
                 types=torch.from_numpy(types),
                 branches=tuple(branches),
+                shunt_b=torch.from_numpy(np.asarray(shunt_b[local], dtype=np.float32)),
             )
         )
     return networks
@@ -3063,6 +3093,7 @@ def move_to(network: Network, device: torch.device) -> Network:
         masks = type_pair_masks(types, component)
     else:
         masks = masks.to(device)
+    shunt = getattr(network, "shunt_b", None)
     return Network(
         ybus=host_to_device(network.ybus, device),
         rpe=host_to_device(network.rpe, device).to(dtype=torch.float32),
@@ -3071,6 +3102,7 @@ def move_to(network: Network, device: torch.device) -> Network:
         pair_type_masks=masks,
         pair_embed=pair_embed,
         branches=getattr(network, "branches", None),
+        shunt_b=None if shunt is None else host_to_device(shunt, device),
         type_key=network_type_key(network),
         layout=shared_layout(types, masks, types_np=network.types.detach().cpu().numpy()),
     )
@@ -3174,6 +3206,7 @@ def forward_cases(
     pair: torch.Tensor,
     ybus: torch.Tensor | None = None,
     layout: TypeLayout | None = None,
+    shunt_b: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
     """Prediction, target and stage residuals of ``index`` on ``network``'s bus types.
 
@@ -3193,6 +3226,8 @@ def forward_cases(
         voltage = split.voltage[chosen].to(device, non_blocking=True)
         angle = split.angle[chosen].to(device, non_blocking=True)
     specified, target = pack_case(power_p, power_q, voltage, angle, layout)
+    if shunt_b is None:
+        shunt_b = network_shunt_b(network)
     prediction, residuals = model(
         specified,
         layout.types,
@@ -3201,6 +3236,7 @@ def forward_cases(
         network.ybus if ybus is None else ybus,
         pair=pair,
         layout=layout,
+        shunt_b=shunt_b,
     )
     return prediction, target, residuals
 
@@ -3228,12 +3264,15 @@ def run_batch_residuals(
     pair: torch.Tensor | None = None,
     ybus: torch.Tensor | None = None,
     layout: TypeLayout | None = None,
+    shunt_b: torch.Tensor | None = None,
 ) -> tuple[TaskLossBreakdown, list[torch.Tensor]]:
     if pair is None:
         pair = pair_features(model, network)
     if layout is None:
         layout = network_layout(network)
-    prediction, target, residuals = forward_cases(model, split, network, index, device, pair, ybus, layout)
+    prediction, target, residuals = forward_cases(
+        model, split, network, index, device, pair, ybus, layout, shunt_b=shunt_b
+    )
     return task_loss(prediction, target, residuals, layout), residuals
 
 
@@ -3275,12 +3314,14 @@ class PassBatch:
         self.ybus: torch.Tensor | None = None
         self.select: torch.Tensor | None = None
         self.member_layout: TypeLayout | None = None
+        self.shunt_b: torch.Tensor | None = None
         if len(networks) == 1:
             self.kind = "single"
             return
         keys = {network_type_key(network) for network in networks}
         self.kind = "shared" if len(keys) == 1 else "mixed"
         self.ybus = torch.stack([network.ybus for network in networks]).to(torch.complex128)
+        self.shunt_b = torch.stack([network_shunt_b(network) for network in networks])
         self.select = host_to_device(torch.as_tensor(self.owner, dtype=torch.long), self.ybus.device)
         if self.kind == "mixed":
             layouts = [network_layout(network) for network in networks]
@@ -3329,8 +3370,17 @@ class PassBatch:
             return run_batch_residuals(model, split, self.networks[0], chunk, device, pair=pair)
         select = self.select[start:stop]
         layout = None if self.member_layout is None else self.member_layout.take(select)
+        assert self.shunt_b is not None
         return run_batch_residuals(
-            model, split, self.networks[0], chunk, device, pair=pair[select], ybus=self.ybus[select], layout=layout
+            model,
+            split,
+            self.networks[0],
+            chunk,
+            device,
+            pair=pair[select],
+            ybus=self.ybus[select],
+            layout=layout,
+            shunt_b=self.shunt_b[select],
         )
 
 
@@ -3513,6 +3563,10 @@ def train_step(
             logged_parts.append((detached_breakdown(breakdown), weight))
             del breakdown, scaled, _residuals
     with timer.phase("opt"):
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+        if GRAD_CLIP_NORM > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
         if scaler is not None:
             scaler.step(optimizer)
             scaler.update()
@@ -3842,13 +3896,38 @@ def train_epoch_loss_line(
     )
 
 
-def make_lr_scheduler(optimizer: torch.optim.Optimizer) -> torch.optim.lr_scheduler.ReduceLROnPlateau:
-    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+def cosine_lr_at_epoch(epoch: int) -> float:
+    """Adam LR after ``epoch`` completed epochs (0 = initial ``LEARNING_RATE``)."""
+    progress = min(max(int(epoch), 0), EPOCHS) / max(EPOCHS, 1)
+    # Half-cosine from 1 → LR_COSINE_MIN_RATIO over the full run.
+    scale = LR_COSINE_MIN_RATIO + 0.5 * (1.0 - LR_COSINE_MIN_RATIO) * (1.0 + math.cos(math.pi * progress))
+    return LEARNING_RATE * scale
+
+
+def make_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    completed_epochs: int = 0,
+) -> torch.optim.lr_scheduler.CosineAnnealingLR:
+    """Cosine decay ``LEARNING_RATE`` → ``LEARNING_RATE * LR_COSINE_MIN_RATIO`` over ``EPOCHS``.
+
+    ``completed_epochs`` advances the schedule so resumes match the saved epoch index.
+    """
+    for group in optimizer.param_groups:
+        group["lr"] = LEARNING_RATE
+        group["initial_lr"] = LEARNING_RATE
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        mode="min",
-        factor=LR_PLATEAU_FACTOR,
-        patience=LR_PLATEAU_PATIENCE,
+        T_max=EPOCHS,
+        eta_min=LEARNING_RATE * LR_COSINE_MIN_RATIO,
     )
+    completed = max(int(completed_epochs), 0)
+    if completed > 0:
+        scheduler.last_epoch = completed
+        scheduler._step_count = completed + 1
+        for group, lr in zip(optimizer.param_groups, scheduler._get_closed_form_lr()):
+            group["lr"] = lr
+    return scheduler
 
 
 def current_lr(optimizer: torch.optim.Optimizer) -> float:
@@ -3888,6 +3967,11 @@ def train_seed(
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = make_lr_scheduler(optimizer)
     grad_scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    print(
+        f"optim: Adam lr {LEARNING_RATE:.1e} → {LEARNING_RATE * LR_COSINE_MIN_RATIO:.1e} "
+        f"cosine/{EPOCHS}ep, grad_clip_norm={GRAD_CLIP_NORM:g}",
+        flush=True,
+    )
     cache_budget = device_cache_budget(device)
     train_share = len(train_split.networks) / max(len(train_split.networks) + len(val_split.networks), 1)
     train_networks = DeviceNetworks(train_split.networks, device, budget_bytes=int(cache_budget * train_share))
@@ -3923,13 +4007,22 @@ def train_seed(
             wait = 0
             best_state = None
         elif restored["scheduler"] is None:
-            print(f"Seed {seed}: checkpoint has no LR scheduler state; starting a fresh scheduler.", flush=True)
+            scheduler = make_lr_scheduler(optimizer, completed_epochs=start_epoch)
+            print(
+                f"Seed {seed}: checkpoint has no LR scheduler state; "
+                f"cosine synced to epoch {start_epoch} (lr {current_lr(optimizer):.1e}).",
+                flush=True,
+            )
         else:
             try:
                 scheduler.load_state_dict(restored["scheduler"])
             except (KeyError, TypeError, ValueError, RuntimeError) as error:
-                scheduler = make_lr_scheduler(optimizer)
-                print(f"Seed {seed}: LR scheduler state not restored ({error}); starting fresh.", flush=True)
+                scheduler = make_lr_scheduler(optimizer, completed_epochs=start_epoch)
+                print(
+                    f"Seed {seed}: LR scheduler state not restored ({error}); "
+                    f"cosine synced to epoch {start_epoch} (lr {current_lr(optimizer):.1e}).",
+                    flush=True,
+                )
         print(f"Seed {seed}: resumed optimizer lr {current_lr(optimizer):.1e}", flush=True)
     else:
         obsolete_reason = restore_obsolete or load_obsolete
@@ -4106,17 +4199,9 @@ def train_seed(
                     best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
                 else:
                     wait += 1
-                lr_before = current_lr(optimizer)
-                scheduler.step(val_score)
-                lr_after = current_lr(optimizer)
-                if lr_after < lr_before:
-                    print(
-                        f"Seed {seed} epoch {epoch + 1}: val_pbl plateaued; "
-                        f"lr reduced {lr_before:.1e} -> {lr_after:.1e}",
-                        flush=True,
-                    )
             else:
                 val_display = "skipped"
+            scheduler.step()
             print(
                 train_epoch_loss_line(
                     seed,
@@ -4267,8 +4352,18 @@ def comparison_figure_path(results: Path, spec: TaskSpec | None = None) -> Path:
     return results / f"figure4_task{spec.task_id}_tpgt.svg"
 
 
-def plot_comparison(results: Path, summary: list[dict], spec: TaskSpec | None = None) -> None:
-    """Bar plot (SVG + PNG) of TPGT mean ± std over the seeds scored so far against the published models."""
+def plot_comparison(
+    results: Path,
+    summary: list[dict],
+    spec: TaskSpec | None = None,
+    *,
+    archive_dir: Path | None = None,
+) -> None:
+    """Bar plot (SVG + PNG) vs published models; always refresh ``results/figure4_…_tpgt.*``.
+
+    When ``archive_dir`` is set (checkpoint epochs), also copy SVG+PNG there so every
+    3-epoch snapshot is kept next to that epoch's bus maps, not only the latest overwrite.
+    """
     spec = spec or TASKS["1.1"]
     by_category = {row["test_category"]: row for row in summary}
     if any(category not in by_category for category in CATEGORIES):
@@ -4281,11 +4376,22 @@ def plot_comparison(results: Path, summary: list[dict], spec: TaskSpec | None = 
     }
     seeds = min(int(by_category[category]["n_seeds"]) for category in CATEGORIES)
     output = comparison_figure_path(results, spec)
-    plot_tpgt_comparison(spec.task_id, spec.label, tpgt, output, tpgt_label=f"TPGT (this run, {seeds} seed(s))")
+    written = plot_tpgt_comparison(
+        spec.task_id, spec.label, tpgt, output, tpgt_label=f"TPGT (this run, {seeds} seed(s))"
+    )
+    if archive_dir is not None:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for path in written:
+            dest = archive_dir / path.name
+            shutil.copy2(path, dest)
+        print(f"archived bar plot to {archive_dir}", flush=True)
     try:
-        from IPython.display import SVG, display
+        from IPython.display import Image, SVG, display
 
         display(SVG(filename=str(output)))
+        png = output.with_suffix(".png")
+        if png.is_file():
+            display(Image(filename=str(png)))
     except Exception:
         pass
 
@@ -4522,8 +4628,9 @@ def main() -> None:
             record_seed(results, seed, scores, counts, checkpoint, epoch_number, spec)
             summary = write_summary(results, spec)
             print_comparison(summary, spec)
+            bar_archive = checkpoints / "bar_plots" / f"seed_{seed}" / f"epoch_{epoch_number}"
             try:
-                plot_comparison(results, summary, spec)
+                plot_comparison(results, summary, spec, archive_dir=bar_archive)
             except Exception as error:
                 print(f"Bar plot skipped for epoch {epoch_number}: {type(error).__name__}: {error}", flush=True)
             n1_split = held_splits.pop("N-1", None)

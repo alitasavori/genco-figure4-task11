@@ -1,4 +1,4 @@
-"""GENCO-style LR schedule: Adam 5e-4, ReduceLROnPlateau x0.7 after patience 5."""
+"""Cosine LR decay + gradient clip (anti-spike schedule)."""
 
 from __future__ import annotations
 
@@ -12,9 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from train_tpgt_task11 import (  # noqa: E402
+    EPOCHS,
+    GRAD_CLIP_NORM,
     LEARNING_RATE,
-    LR_PLATEAU_FACTOR,
-    LR_PLATEAU_PATIENCE,
+    LR_COSINE_MIN_RATIO,
+    cosine_lr_at_epoch,
     current_lr,
     make_lr_scheduler,
     train_epoch_loss_line,
@@ -26,32 +28,57 @@ def make_optimizer() -> torch.optim.Optimizer:
     return torch.optim.Adam([param], lr=LEARNING_RATE)
 
 
-def test_schedule_constants_follow_genco():
+def test_schedule_constants():
     assert LEARNING_RATE == pytest.approx(5e-4)
-    assert LR_PLATEAU_FACTOR == pytest.approx(0.7)
-    assert LR_PLATEAU_PATIENCE == 5
+    assert LR_COSINE_MIN_RATIO == pytest.approx(0.05)
+    assert GRAD_CLIP_NORM > 0.0
+    assert cosine_lr_at_epoch(0) == pytest.approx(LEARNING_RATE)
+    assert cosine_lr_at_epoch(EPOCHS) == pytest.approx(LEARNING_RATE * LR_COSINE_MIN_RATIO)
 
 
-def test_plateau_cuts_lr_after_six_non_improving_validations():
+def test_cosine_scheduler_shrinks_lr_over_epochs():
     optimizer = make_optimizer()
     scheduler = make_lr_scheduler(optimizer)
-    scheduler.step(1.0)
-    for _ in range(LR_PLATEAU_PATIENCE):
-        scheduler.step(1.0)
-        assert current_lr(optimizer) == pytest.approx(5e-4)
-    scheduler.step(1.0)
-    assert current_lr(optimizer) == pytest.approx(5e-4 * 0.7)
+    assert current_lr(optimizer) == pytest.approx(LEARNING_RATE)
+    mid = EPOCHS // 2
+    for _ in range(mid):
+        optimizer.step()
+        scheduler.step()
+    mid_lr = current_lr(optimizer)
+    assert mid_lr < LEARNING_RATE
+    assert mid_lr > LEARNING_RATE * LR_COSINE_MIN_RATIO
+    for _ in range(EPOCHS - mid):
+        optimizer.step()
+        scheduler.step()
+    assert current_lr(optimizer) == pytest.approx(LEARNING_RATE * LR_COSINE_MIN_RATIO, rel=1e-5)
+
+
+def test_scheduler_resume_syncs_completed_epochs():
+    walked = make_optimizer()
+    scheduler = make_lr_scheduler(walked)
+    for _ in range(7):
+        walked.step()
+        scheduler.step()
+    resumed = make_lr_scheduler(make_optimizer(), completed_epochs=7)
+    assert current_lr(resumed.optimizer) == pytest.approx(current_lr(walked))
 
 
 def test_scheduler_state_round_trips():
     optimizer = make_optimizer()
     scheduler = make_lr_scheduler(optimizer)
-    for value in (1.0, 1.0, 1.0):
-        scheduler.step(value)
-    restored = make_lr_scheduler(make_optimizer())
+    for _ in range(3):
+        optimizer.step()
+        scheduler.step()
+    restored_opt = make_optimizer()
+    restored_opt.load_state_dict(optimizer.state_dict())
+    restored = torch.optim.lr_scheduler.CosineAnnealingLR(
+        restored_opt,
+        T_max=EPOCHS,
+        eta_min=LEARNING_RATE * LR_COSINE_MIN_RATIO,
+    )
     restored.load_state_dict(scheduler.state_dict())
-    assert restored.num_bad_epochs == scheduler.num_bad_epochs
-    assert restored.best == scheduler.best
+    assert restored.last_epoch == scheduler.last_epoch
+    assert current_lr(restored_opt) == pytest.approx(current_lr(optimizer))
 
 
 def test_epoch_line_shows_lr():

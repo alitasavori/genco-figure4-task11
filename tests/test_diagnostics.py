@@ -11,6 +11,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import train_tpgt_task11 as tpgt  # noqa: E402
 from train_tpgt_task11 import (  # noqa: E402
     RPE_DIM,
     RPE_FEATURE_NAMES,
@@ -19,6 +20,9 @@ from train_tpgt_task11 import (  # noqa: E402
     Split,
     audit_residual_correctness,
     audit_rpe_correctness,
+    bus_shunt_b,
+    bus_shunt_gb,
+    node_encoder_features,
     contingency_class,
     evaluate_pbl,
     nodal_residual,
@@ -48,15 +52,52 @@ def test_summarize_rpe_shape():
     assert rows[0]["off_mean"] == rows[0]["off_mean"]  # finite
 
 
-def test_rpe_has_five_channels_without_random_walks():
-    assert RPE_DIM == 5
-    assert RPE_FEATURE_NAMES == ("ReY/sY", "ImY/sY", "adjacency", "hop_norm", "Reff_norm")
+def test_rpe_is_zeff_re_im():
+    assert RPE_DIM == 2
+    assert RPE_FEATURE_NAMES == ("Zeff_Re_norm", "Zeff_Im_norm")
     branches = [(0, 1, 0.1, 0.1), (1, 2, 0.1, 0.1), (0, 2, 0.1, 0.2)]
     ybus = np.zeros((3, 3), dtype=np.complex64)
-    ybus[0, 1] = ybus[1, 0] = 2.0 + 1.0j
     features, _component = meshed_rpe(3, branches, ybus)
-    assert features.shape == (3, 3, 5)
-    assert TPGT().pair_encoder.net[0].in_features == 5
+    assert features.shape == (3, 3, 2)
+    assert TPGT().pair_encoder.net[0].in_features == 2
+    for channel in range(2):
+        assert np.allclose(np.diagonal(features[..., channel]), 0.0)
+        assert np.allclose(features[..., channel], features[..., channel].T, atol=1e-4)
+
+
+def test_bus_shunt_b_row_sum_includes_charging_unlike_device_bs():
+    ybus = torch.zeros(3, 3, dtype=torch.complex64)
+    ybus[0, 0] = 1.5 - 0.25j
+    ybus[0, 1] = -1.0 + 0.1j
+    ybus[1, 0] = -1.0 + 0.1j
+    ybus[1, 1] = 2.0 + 0.5j
+    ybus[2, 2] = 0.3j
+    shunt = bus_shunt_gb(ybus)
+    assert shunt.shape == (3, 2)
+    assert torch.allclose(shunt[0], torch.tensor([0.5, -0.15]))
+    assert torch.allclose(bus_shunt_b(ybus), shunt[:, 1])
+
+
+def test_v9_node_features_are_pqvt_plus_device_bs():
+    previous = tpgt.USE_NODE_SHUNT
+    try:
+        tpgt.USE_NODE_SHUNT = True
+        model = TPGT()
+        assert model.encoders[0].net[0].in_features == 5
+        assert model.encoders[1].net[0].in_features == 5
+        assert model.encoders[2].net[0].in_features == 5
+        types = torch.tensor([0, 1, 2])
+        specified = torch.tensor([[[0.1, 0.2], [0.3, 1.0], [1.0, 0.0]]])
+        # Device-only BS (not Im(row-sum Y), which would also include line charging).
+        device_bs = torch.tensor([-0.4, 0.14, 0.0])
+        layout = tpgt.shared_layout(types, tpgt.type_pair_masks(types, torch.zeros(3, dtype=torch.long)))
+        feats = node_encoder_features(specified, layout, device_bs)
+        assert feats.shape == (1, 3, 5)
+        assert torch.allclose(feats[0, 0], torch.tensor([0.1, 0.2, 0.0, 0.0, -0.4]))
+        assert torch.allclose(feats[0, 1], torch.tensor([0.3, 0.0, 1.0, 0.0, 0.14]))
+        assert torch.allclose(feats[0, 2], torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0]))
+    finally:
+        tpgt.USE_NODE_SHUNT = previous
 
 
 def test_pair_encoder_weight_norms():
