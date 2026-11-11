@@ -218,15 +218,27 @@ def plot_tpgt_comparison(
     width = 0.75 / len(labels)
     for index, name in enumerate(labels):
         offset = (index - (len(labels) - 1) / 2) * width
-        axis.bar(positions + offset, means[index], width, yerr=stds[index], label=name, color=colors[index], capsize=2)
+        axis.bar(
+            positions + offset,
+            means[index],
+            width,
+            yerr=stds[index],
+            label=name,
+            color=colors[index],
+            capsize=2,
+            error_kw={"linewidth": 1.2},
+            zorder=3,
+        )
     axis.set_xticks(positions)
     axis.set_xticklabels(list(CATEGORIES))
     axis.set_ylabel("Power Balance Loss (Mean) [p.u.]")
     axis.set_ylim(0, max(PAPER_YLIM[1], 1.1 * top))
-    axis.yaxis.grid(True)
-    style_axis(axis)
+    axis.yaxis.grid(True, zorder=0)
+    axis.set_axisbelow(True)
     axis.set_title(f"Task {label}", fontproperties=font_properties(FONT_LABEL))
-    axis.legend(frameon=False, prop=font_properties(FONT_LEGEND))
+    legend = axis.legend(frameon=False, prop=font_properties(FONT_LEGEND), title="Model")
+    legend.get_title().set_fontproperties(font_properties(FONT_LEGEND))
+    style_axis(axis)
     figure.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
     png = output.with_suffix(".png")

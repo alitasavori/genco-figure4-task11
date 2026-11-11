@@ -27,6 +27,7 @@ from train_tpgt_task11 import (  # noqa: E402
     evaluate_pbl,
     nodal_residual,
     pack_case,
+    format_bus_shunt_ablation_diagnostics,
     format_rpe_effectiveness_diagnostics,
     meshed_rpe,
     pair_encoder_input_weight_norms,
@@ -112,6 +113,24 @@ def test_format_rpe_effectiveness_without_ablation():
     text = format_rpe_effectiveness_diagnostics(weights, None, None)
     assert "not run" in text
     assert "adjacency" in text
+
+
+def test_format_bus_shunt_ablation_with_zero_row():
+    weights = [{"type": "PQ", "name": "busBS", "weight_l2": 0.5}]
+    baseline = {"pbl_mean": 0.03, "state_mse": 0.01, "total_loss": 0.02}
+    rows = [
+        {
+            "name": "busBS",
+            "delta_pbl_mean": 0.002,
+            "delta_state_mse": 0.001,
+            "delta_total_loss": 0.001,
+            "mean_abs_bs": 0.14,
+        }
+    ]
+    text = format_bus_shunt_ablation_diagnostics(weights, baseline, rows)
+    assert "busBS" in text
+    assert "zero-ablation" in text
+    assert "ΔPBL +0.002" in text
 
 
 def test_audit_rpe_correctness_small_graph():

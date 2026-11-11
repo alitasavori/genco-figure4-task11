@@ -89,9 +89,10 @@ Performance notes (Colab / large train split)
   audits on the validation topology, and contingency diagnostics on test N-1/N-2
   (per-topology PBL spread, audits and ablation on the largest outage topologies,
   RPE shift from the training topology). Disable with ``GENCO_TPGT_DEBUG=0`` or
-  ``--no-debug``; skip only the ablation with ``GENCO_TPGT_RPE_ABLATION=0``.
+  ``--no-debug``; skip RPE ablation with ``GENCO_TPGT_RPE_ABLATION=0``, bus-shunt
+  (``busBS``) node ablation with ``GENCO_TPGT_SHUNT_ABLATION=0`` (v9 only).
   ``--diagnose`` runs the same on a saved checkpoint (``--no-contingency``,
-  ``--no-rpe-ablation`` to trim). ``--sanity-rpe`` audits one train case.
+  ``--no-rpe-ablation`` / ``--no-shunt-ablation`` to trim). ``--sanity-rpe`` audits one train case.
 """
 
 from __future__ import annotations
@@ -176,6 +177,7 @@ NODE_SPECIFIED_DIM = 2
 NODE_PQVT_DIM = 4
 NODE_SHUNT_B_DIM = 1
 NODE_FEATURE_DIM = NODE_PQVT_DIM + NODE_SHUNT_B_DIM  # 5 = (P,Q,V,θ,Bs)
+NODE_ENCODER_FEATURE_NAMES = ("P", "Q", "V", "theta", "busBS")
 USE_NODE_SHUNT = False
 # Named width/depth presets (same math/loss/packing). ``GENCO_TPGT_ARCH`` / ``--arch`` selects one;
 # optional ``GENCO_TPGT_D`` / ``DEPTH`` / ``D_E`` / ``D_A`` / ``HEADS`` / ``RUN_TAG`` override fields.
@@ -1112,6 +1114,8 @@ def eval_batch_with_pair(
     index: np.ndarray,
     device: torch.device,
     pair: torch.Tensor,
+    *,
+    shunt_b: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Loss and final-stage PBL on a fixed batch with precomputed pair embeddings."""
     model.eval()
@@ -1121,6 +1125,8 @@ def eval_batch_with_pair(
     voltage = split.voltage[chosen].to(device, non_blocking=True)
     angle = split.angle[chosen].to(device, non_blocking=True)
     specified, target = pack_case(power_p, power_q, voltage, angle, network.types)
+    if shunt_b is None:
+        shunt_b = network_shunt_b(network)
     with torch.no_grad():
         prediction, residuals = model(
             specified,
@@ -1129,7 +1135,7 @@ def eval_batch_with_pair(
             network.pair_type_masks,
             network.ybus,
             pair=pair,
-            shunt_b=network_shunt_b(network),
+            shunt_b=shunt_b,
         )
         breakdown = task_loss(prediction, target, residuals, network.types)
         final_pbl = pbl_stats(residuals[-1])
@@ -1138,6 +1144,57 @@ def eval_batch_with_pair(
         "state_mse": float(breakdown.state_mse),
         "total_loss": float(breakdown.total),
     }
+
+
+def type_encoder_input_weight_norms(model: TPGT) -> list[dict[str, float]]:
+    """L2 norm of each node-feature column on the first Linear layer (PQ/PV/slack encoders)."""
+    if not model.use_node_shunt:
+        return []
+    names = NODE_ENCODER_FEATURE_NAMES
+    rows: list[dict[str, float]] = []
+    for type_id, encoder in enumerate(model.encoders):
+        first = encoder.net[0]
+        if not isinstance(first, nn.Linear):
+            raise TypeError("type encoder first layer must be Linear")
+        norms = torch.linalg.vector_norm(first.weight.detach(), dim=0)
+        type_name = TYPE_NAMES[type_id] if type_id < len(TYPE_NAMES) else str(type_id)
+        for channel in range(min(int(norms.numel()), len(names))):
+            rows.append(
+                {
+                    "type": type_name,
+                    "name": names[channel],
+                    "weight_l2": float(norms[channel]),
+                }
+            )
+    return rows
+
+
+def collect_bus_shunt_ablation(
+    model: TPGT,
+    split: Split,
+    network: Network,
+    index: np.ndarray,
+    device: torch.device,
+) -> tuple[dict[str, float] | None, list[dict[str, float]] | None]:
+    """Zero parquet device-shunt ``busBS`` in node encoders; compare batch metrics to the baseline."""
+    if not model.use_node_shunt:
+        return None, None
+    model.eval()
+    clear_pair_embed_cache([network])
+    pair = pair_features(model, network)
+    shunt_b = network_shunt_b(network).to(device)
+    baseline = eval_batch_with_pair(model, split, network, index, device, pair, shunt_b=shunt_b)
+    zero_shunt = torch.zeros_like(shunt_b)
+    metrics = eval_batch_with_pair(model, split, network, index, device, pair, shunt_b=zero_shunt)
+    row = {
+        "name": "busBS",
+        "delta_pbl_mean": metrics["pbl_mean"] - baseline["pbl_mean"],
+        "delta_state_mse": metrics["state_mse"] - baseline["state_mse"],
+        "delta_total_loss": metrics["total_loss"] - baseline["total_loss"],
+        "mean_abs_bs": float(shunt_b.abs().mean()),
+    }
+    clear_pair_embed_cache([network])
+    return baseline, [row]
 
 
 def collect_rpe_channel_ablation(
@@ -1193,6 +1250,43 @@ def format_rpe_effectiveness_diagnostics(
     for row in sorted(ablation_rows, key=lambda item: item["delta_pbl_mean"], reverse=True):
         lines.append(
             f"  {row['name']:12s} ΔPBL {row['delta_pbl_mean']:+.4g}  "
+            f"Δstate_mse {row['delta_state_mse']:+.4g}  Δloss {row['delta_total_loss']:+.4g}"
+        )
+    return "\n".join(lines)
+
+
+def format_bus_shunt_ablation_diagnostics(
+    weight_rows: list[dict[str, float]],
+    baseline: dict[str, float] | None,
+    ablation_rows: list[dict[str, float]] | None,
+) -> str:
+    if not weight_rows and baseline is None:
+        return "Bus-shunt node feature (busBS): not used (arch without device BS channel)."
+    lines = ["Type-encoder input weight L2 per node feature (structural; not causal):"]
+    for row in sorted(weight_rows, key=lambda item: item["weight_l2"], reverse=True):
+        lines.append(
+            f"  {row['type']:5s} {row['name']:6s} weight_l2 {row['weight_l2']:.4g}"
+        )
+    if baseline is None or ablation_rows is None:
+        lines.append(
+            "Bus-shunt zero-ablation: not run (v9 debug; use --diagnose or GENCO_TPGT_SHUNT_ABLATION=1)."
+        )
+        return "\n".join(lines)
+    lines.append(
+        f"Bus-shunt (busBS) zero-ablation on same batch (baseline PBL mean {baseline['pbl_mean']:.6g}, "
+        f"state_mse {baseline['state_mse']:.6g}):"
+    )
+    lines.append(
+        "  Positive ΔPBL after zeroing busBS => channel helped; negative => zeroing improved metrics."
+    )
+    for row in ablation_rows:
+        extra = (
+            f"  mean |BS| {row['mean_abs_bs']:.4g}  "
+            if "mean_abs_bs" in row
+            else "  "
+        )
+        lines.append(
+            f"  {row['name']:6s} {extra}ΔPBL {row['delta_pbl_mean']:+.4g}  "
             f"Δstate_mse {row['delta_state_mse']:+.4g}  Δloss {row['delta_total_loss']:+.4g}"
         )
     return "\n".join(lines)
@@ -1784,6 +1878,7 @@ def print_forward_diagnostics(
     tag: str,
     *,
     rpe_ablation: bool = False,
+    shunt_ablation: bool = False,
 ) -> None:
     report = collect_forward_diagnostics(model, split, network, index, device)
     text = format_forward_diagnostics(tag, report)
@@ -1793,6 +1888,12 @@ def print_forward_diagnostics(
     if rpe_ablation:
         baseline, ablation_rows = collect_rpe_channel_ablation(model, split, network, index, device)
     text = text + "\n" + format_rpe_effectiveness_diagnostics(weight_rows, baseline, ablation_rows)
+    node_weight_rows = type_encoder_input_weight_norms(model)
+    shunt_baseline: dict[str, float] | None = None
+    shunt_rows: list[dict[str, float]] | None = None
+    if shunt_ablation:
+        shunt_baseline, shunt_rows = collect_bus_shunt_ablation(model, split, network, index, device)
+    text = text + "\n" + format_bus_shunt_ablation_diagnostics(node_weight_rows, shunt_baseline, shunt_rows)
     text = text + "\n" + format_rpe_correctness_checks(audit_rpe_correctness(network))
     text = text + "\n" + format_correctness_checks(
         "Residual correctness audit (power-balance computation):",
@@ -1823,6 +1924,19 @@ def wants_rpe_ablation(*, default: bool) -> bool:
     if flag in ("0", "false", "no"):
         return False
     return default
+
+
+def wants_shunt_ablation(*, default: bool) -> bool:
+    if "--no-shunt-ablation" in sys.argv:
+        return False
+    if "--shunt-ablation" in sys.argv:
+        return True
+    flag = os.environ.get("GENCO_TPGT_SHUNT_ABLATION", "").strip().lower()
+    if flag in ("1", "true", "yes"):
+        return True
+    if flag in ("0", "false", "no"):
+        return False
+    return default and USE_NODE_SHUNT
 
 
 def debug_sample_index(split: Split, network_id: int = 0, count: int = 32) -> np.ndarray:
@@ -4580,6 +4694,7 @@ def train_seed(
                     device,
                     tag=f"seed {seed} epoch {epoch + 1} ({len(sample)} valid cases, network {val_net})",
                     rpe_ablation=wants_rpe_ablation(default=True),
+                    shunt_ablation=wants_shunt_ablation(default=True),
                 )
             start_epoch = epoch + 1
             finish_checkpoint_epoch(start_epoch)
@@ -5067,6 +5182,7 @@ def cli_diagnose(
         device,
         tag=f"diagnose seed {seed} ({len(sample)} valid cases)",
         rpe_ablation=rpe_ablation,
+        shunt_ablation=wants_shunt_ablation(default=True),
     )
     if not contingency:
         return

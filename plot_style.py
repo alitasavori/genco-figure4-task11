@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from matplotlib import font_manager
+
+_FONT_REGISTERED = False
 
 FONT_TICK = 16
 FONT_LABEL = 18
@@ -13,11 +17,30 @@ FONT_CBAR = 16
 FONT_ANNOTATE = 13
 
 
+def _register_bundled_fonts() -> None:
+    """Load optional ``fonts/*.ttf`` next to this module (e.g. Liberation Serif on Colab)."""
+    global _FONT_REGISTERED
+    if _FONT_REGISTERED:
+        return
+    fonts_dir = Path(__file__).resolve().parent / "fonts"
+    if fonts_dir.is_dir():
+        for path in sorted(fonts_dir.glob("*.ttf")):
+            font_manager.fontManager.addfont(str(path))
+    _FONT_REGISTERED = True
+
+
 def times_family() -> str:
+    _register_bundled_fonts()
     available = {font.name for font in font_manager.fontManager.ttflist}
     if "Times New Roman" in available:
         return "Times New Roman"
-    for name in ("Nimbus Roman", "TeX Gyre Termes", "Liberation Serif", "DejaVu Serif"):
+    for name in (
+        "Liberation Serif",
+        "Nimbus Roman",
+        "TeX Gyre Termes",
+        "STIXGeneral",
+        "DejaVu Serif",
+    ):
         if name in available:
             return name
     return "serif"
@@ -36,7 +59,7 @@ def apply_plot_style() -> None:
         {
             "text.usetex": False,
             "font.family": family,
-            "font.serif": [family, "Times New Roman", "DejaVu Serif"],
+            "font.serif": [family, "Times New Roman", "Liberation Serif", "STIXGeneral", "DejaVu Serif"],
             "font.size": FONT_LABEL,
             "axes.titlesize": FONT_TITLE,
             "axes.labelsize": FONT_LABEL,
