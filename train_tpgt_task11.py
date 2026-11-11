@@ -155,8 +155,8 @@ EPOCHS = 100
 CHECKPOINT_EVERY = 3
 SEEDS = (0, 1, 2)
 BASE_MVA = 100.0
-LAMBDA_STATE = 0.85
-LAMBDA_PHYS = 0.15
+LAMBDA_STATE = 0.5
+LAMBDA_PHYS = 0.5
 # Stage i of K gets physics weight PHYSICS_STAGE_DECAY**(K-i), as in GENCO
 # (HGNS_PF_pfdelta_bs64_seed1.yaml): last stage 1, each earlier stage halved.
 PHYSICS_STAGE_DECAY = 0.5
@@ -228,7 +228,7 @@ Y_ADMITTANCE_EPS = 1e-10
 V_MIN_PU = 0.05
 V_MAX_PU = 2.0
 # Step size on angle unknowns; full ETA on P, Q, and V magnitudes.
-ETA_ANGLE = 0.25
+ETA_ANGLE = 1.0
 
 TEST_PARTS = (
     ("N", "n", "feasible"),
