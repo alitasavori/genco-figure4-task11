@@ -4647,6 +4647,8 @@ def evaluate_pbl(
     device: torch.device,
     batch_size: int = EVAL_BATCH_SIZE,
     per_network_out: dict[int, list[float]] | None = None,
+    *,
+    progress_label: str | None = None,
 ) -> float:
     """Mean final-stage PBL over ``split`` in full batches (several topologies and bus types per batch).
 
@@ -4657,8 +4659,13 @@ def evaluate_pbl(
     total = 0.0
     seen = 0
     cached: dict[int, Network] = {}
+    report_progress = progress_label is not None and split.count >= 256
+    started = time.perf_counter()
+    last_progress = started
+    batches = 0
     with torch.no_grad():
         for owners, index in iterate_type_batches(split, batch_size=batch_size, mix_patterns=True):
+            batches += 1
             ids, inverse = np.unique(owners, return_inverse=True)
             inverse = inverse.reshape(-1)
             for network_id in [key for key in cached if key not in set(ids.tolist())]:
@@ -4683,6 +4690,24 @@ def evaluate_pbl(
                     bucket = per_network_out.setdefault(int(network_id), [0.0, 0.0])
                     bucket[0] += weighted
                     bucket[1] += cases
+            if report_progress:
+                now = time.perf_counter()
+                if (
+                    batches == 1
+                    or seen >= split.count
+                    or batches % 10 == 0
+                    or now - last_progress >= PROGRESS_EVERY_SECONDS
+                ):
+                    elapsed = now - started
+                    rate = seen / elapsed if elapsed > 0 else 0.0
+                    remaining = split.count - seen
+                    eta = remaining / rate if rate > 0 else 0.0
+                    print(
+                        f"  eval {progress_label}: {seen}/{split.count} scenarios "
+                        f"({batches} batches)  elapsed {format_duration(elapsed)}  ETA {format_duration(eta)}",
+                        flush=True,
+                    )
+                    last_progress = now
     for network in cached.values():
         network.pair_embed = None
     if seen != split.count:
@@ -5587,8 +5612,20 @@ def test_model(
             networks = DeviceNetworks(split.networks, device)
             per_network: dict[int, list[float]] = {}
             key = score_key(grid, label, spec)
+            buses = int(split.networks[0].ybus.shape[0]) if split.networks else 0
+            print(
+                f"  scoring {key}: {split.count} scenarios, {len(split.networks)} topology(ies), "
+                f"{buses} buses, batch {eval_batch_size}",
+                flush=True,
+            )
             scores[key] = evaluate_pbl(
-                model, split, networks, device, batch_size=eval_batch_size, per_network_out=per_network
+                model,
+                split,
+                networks,
+                device,
+                batch_size=eval_batch_size,
+                per_network_out=per_network,
+                progress_label=key,
             )
             counts[key] = split.count
             print(f"test {key}: PBL {scores[key]:.6g} on {split.count} scenarios", flush=True)
