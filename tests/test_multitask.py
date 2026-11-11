@@ -628,3 +628,45 @@ def test_seed_metrics_and_summary_per_task(tmp_path):
     assert "4.1" in (tmp_path / "task4_1_tpgt_seed_metrics.csv").read_text(encoding="utf-8")
     tpgt.record_seed(tmp_path, 0, scores, counts, tmp_path / "epoch_3.pt", 3)
     assert (tmp_path / "task1_1_tpgt_seed_metrics.csv").is_file()
+
+
+def test_split_cache_stamp_flags_data_fraction_and_rpe(tmp_path, monkeypatch):
+    monkeypatch.setattr(tpgt, "DATA_FRACTION", 0.1)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "bus_data.parquet").write_bytes(b"x" * 8)
+    limit = 100
+    expected = tpgt.split_cache_stamp_for_raw(raw, limit)
+    saved = dict(expected)
+    saved["data_fraction"] = 1.0
+    saved["rpe_re_scale"] = 1.0
+    saved["rpe_im_scale"] = 1.0
+    assert tpgt.split_cache_stamp_mismatch(saved, expected, rpe_scales=None, is_train=True) == "DATA_FRACTION"
+    saved["data_fraction"] = 0.1
+    saved["rpe_re_scale"] = 2.0
+    assert (
+        tpgt.split_cache_stamp_mismatch(saved, expected, rpe_scales=(1.0, 1.0), is_train=False) == "rpe_re_scale vs train"
+    )
+
+
+def test_reconcile_purges_on_fraction_change(tmp_path, monkeypatch):
+    monkeypatch.setattr(tpgt, "DATA_FRACTION", 0.25)
+    make_tree(tmp_path, {"train": [("n", "feasible")]})
+    raw = tpgt.raw_dir(tmp_path, "train", "n", "feasible")
+    (raw / "bus_data.parquet").write_bytes(b"x" * 8)
+    active = tmp_path / "active"
+    persistent = tmp_path / "persistent"
+    active.mkdir()
+    persistent.mkdir()
+    stale = tpgt.split_cache_stamp_for_raw(raw, 10)
+    stale["data_fraction"] = 1.0
+    stale["rpe_re_scale"] = 1.0
+    stale["rpe_im_scale"] = 1.0
+    import json
+
+    (active / "train_n_feasible.json").write_text(json.dumps(stale), encoding="utf-8")
+    (active / "train_n_feasible.pt").write_bytes(b"stub")
+    monkeypatch.setattr(tpgt, "scenario_count", lambda _raw: 40)
+    monkeypatch.setattr(tpgt, "scenario_limit", lambda _raw: 10)
+    tpgt.reconcile_split_caches(active, persistent, tmp_path)
+    assert not (active / "train_n_feasible.pt").exists()

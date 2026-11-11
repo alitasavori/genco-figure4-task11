@@ -40,6 +40,9 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
 
 Performance notes (Colab / large train split)
 ---------------------------------------------
+* **Split cache**: Stamps record ``DATA_FRACTION``, scenario limit, and train RPE scales;
+  stale Drive or ``/content/*_cache`` trees purge automatically when those change.
+  Loaded caches refresh ``network.rpe`` from branches + scales before use.
 * **Drive I/O**: The 48600-case train/valid tensors live under the checkpoint
   tree on Google Drive. ``torch.load`` from Drive is often minutes slower than
   from ``/content`` local disk. On Colab, ``split_cache_dirs`` mirrors ``.pt``
@@ -3152,6 +3155,143 @@ def sync_split_cache_to_drive(active: Path, persistent: Path) -> None:
             _mirror_cache_file(path, persistent / path.name)
 
 
+def split_cache_stamp_for_raw(raw: Path, limit: int) -> dict:
+    return {
+        "version": CACHE_VERSION,
+        "checkpoint_version": CHECKPOINT_VERSION,
+        "bytes": raw.joinpath("bus_data.parquet").stat().st_size,
+        "scenario_limit": limit,
+        "data_fraction": float(DATA_FRACTION),
+    }
+
+
+def split_cache_stamp_mismatch(
+    saved: dict,
+    expected: dict,
+    *,
+    rpe_scales: tuple[float, float] | None,
+    is_train: bool,
+) -> str | None:
+    if saved.get("version") != expected["version"]:
+        return "cache version"
+    if saved.get("checkpoint_version") != expected["checkpoint_version"]:
+        return "checkpoint_version"
+    if saved.get("bytes") != expected["bytes"]:
+        return "dataset bytes"
+    if saved.get("scenario_limit") != expected["scenario_limit"]:
+        return "scenario_limit"
+    if saved.get("data_fraction") is None:
+        return "missing data_fraction in stamp (legacy cache)"
+    if not np.isclose(float(saved["data_fraction"]), float(expected["data_fraction"])):
+        return "DATA_FRACTION"
+    if "rpe_re_scale" not in saved or "rpe_im_scale" not in saved:
+        return "missing RPE scales in stamp (legacy cache)"
+    if not is_train and rpe_scales is not None:
+        if not np.isclose(float(saved["rpe_re_scale"]), rpe_scales[0], rtol=0, atol=1e-9):
+            return "rpe_re_scale vs train"
+        if not np.isclose(float(saved["rpe_im_scale"]), rpe_scales[1], rtol=0, atol=1e-9):
+            return "rpe_im_scale vs train"
+    return None
+
+
+def purge_split_caches(active: Path, persistent: Path, reason: str) -> int:
+    """Remove split ``.pt`` / ``.json`` caches (and train RPE scales) on both cache roots."""
+    removed = 0
+    for root in {active, persistent}:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.iterdir()):
+            if not path.is_file():
+                continue
+            if path.name == RPE_SCALES_FILE or path.suffix in {".pt", ".json"}:
+                path.unlink()
+                removed += 1
+    if removed:
+        print(
+            f"Purged {removed} split-cache file(s) ({reason}); splits will rebuild on load.",
+            flush=True,
+        )
+    return removed
+
+
+def refresh_split_rpe(
+    split: Split,
+    persistent: Path,
+    *,
+    is_train: bool,
+    rpe_scales: tuple[float, float] | None,
+) -> None:
+    """Ensure cached ``network.rpe`` matches ``meshed_rpe`` for stored branch lists and scales."""
+    if is_train:
+        re_scale, im_scale = unify_rpe_normalization(split)
+        save_rpe_global_scales(persistent, re_scale, im_scale)
+        return
+    scales = rpe_scales if rpe_scales is not None else load_rpe_global_scales(persistent)
+    if scales is None:
+        return
+    unify_rpe_normalization(split, scales)
+
+
+def reconcile_split_caches(active: Path, persistent: Path, data_root: Path) -> None:
+    """Drop stale caches when ``DATA_FRACTION``, architecture, or train RPE scales changed."""
+    folders = task_folders(data_root, "train")
+    if not folders:
+        return
+    topology, condition = folders[0]
+    raw = raw_dir(data_root, "train", topology, condition)
+    if not raw.joinpath("bus_data.parquet").is_file():
+        return
+    name = f"train_{topology}_{condition}"
+    full = scenario_count(raw)
+    limit = scenario_limit(raw)
+    if limit is None:
+        limit = full
+    expected = split_cache_stamp_for_raw(raw, limit)
+
+    for root in (active, persistent):
+        stamp_path = root / f"{name}.json"
+        if not stamp_path.is_file():
+            continue
+        try:
+            saved = json.loads(stamp_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            purge_split_caches(active, persistent, f"unreadable stamp {stamp_path.name}")
+            return
+        reason = split_cache_stamp_mismatch(saved, expected, rpe_scales=None, is_train=True)
+        if reason:
+            purge_split_caches(active, persistent, reason)
+            return
+
+    scales = load_rpe_global_scales(persistent)
+    if scales is None:
+        return
+    re_scale, im_scale = scales
+    for root in (active, persistent):
+        if not root.is_dir():
+            continue
+        for stamp_path in sorted(root.glob("*.json")):
+            if stamp_path.name == RPE_SCALES_FILE:
+                continue
+            try:
+                saved = json.loads(stamp_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if stamp_path.stem.startswith("train_"):
+                continue
+            if "rpe_re_scale" not in saved:
+                purge_split_caches(active, persistent, f"non-train stamp missing scales ({stamp_path.stem})")
+                return
+            if not np.isclose(float(saved["rpe_re_scale"]), re_scale, rtol=0, atol=1e-9) or not np.isclose(
+                float(saved["rpe_im_scale"]), im_scale, rtol=0, atol=1e-9
+            ):
+                purge_split_caches(
+                    active,
+                    persistent,
+                    f"cached RPE scales in {stamp_path.stem} != {RPE_SCALES_FILE}",
+                )
+                return
+
+
 def _compact_if(split: Split, name: str, compact: bool) -> Split:
     if compact:
         converted = compact_networks(split)
@@ -3181,14 +3321,10 @@ def cached_split(
         limit = scenario_limit(raw)
     if limit is None:
         limit = full
-    stamp = {
-        "version": CACHE_VERSION,
-        "checkpoint_version": CHECKPOINT_VERSION,
-        "bytes": raw.joinpath("bus_data.parquet").stat().st_size,
-        "scenario_limit": limit,
-    }
+    stamp = split_cache_stamp_for_raw(raw, limit)
     stamp_path = active / f"{name}.json"
     tensor_path = active / f"{name}.pt"
+    is_train = name.startswith("train")
     if stamp_path.exists() and tensor_path.exists():
         saved = json.loads(stamp_path.read_text(encoding="utf-8"))
         version_ok = (
@@ -3199,14 +3335,23 @@ def cached_split(
         old_limit = saved.get("scenario_limit")
         if old_limit is None:
             old_limit = full
-        if version_ok and limit == old_limit:
+        stamp_reason = split_cache_stamp_mismatch(
+            saved,
+            stamp,
+            rpe_scales=rpe_scales,
+            is_train=is_train,
+        )
+        if version_ok and limit == old_limit and stamp_reason is None:
             load_started = time.perf_counter()
             print(f"Loading cached {name} split from {tensor_path}", flush=True)
             payload = torch.load(tensor_path, map_location="cpu", weights_only=False)
             elapsed = time.perf_counter() - load_started
             print(f"  loaded {name} split in {elapsed:.1f}s ({tensor_path})", flush=True)
+            refresh_split_rpe(payload, persistent, is_train=is_train, rpe_scales=rpe_scales)
             sync_split_cache_to_drive(active, persistent)
             return _compact_if(payload, name, compact)
+        if version_ok and limit == old_limit and stamp_reason is not None:
+            print(f"Stale split cache for {name} ({stamp_reason}); rebuilding.", flush=True)
         if version_ok and limit > old_limit:
             existing = torch.load(tensor_path, map_location="cpu", weights_only=False)
             if isinstance(existing, Split) and existing.count == old_limit:
@@ -3234,7 +3379,6 @@ def cached_split(
             )
     active.mkdir(parents=True, exist_ok=True)
     build_started = time.perf_counter()
-    is_train = name.startswith("train")
     if is_train:
         scales_for_read: tuple[float, float] | None = None
     else:
@@ -5016,6 +5160,7 @@ def main() -> None:
     print(f"Split cache (active): {active_cache}", flush=True)
     if persistent_cache != active_cache:
         print(f"Split cache (Drive): {persistent_cache}", flush=True)
+    reconcile_split_caches(active_cache, persistent_cache, data)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training device: {device}", flush=True)
     if device.type == "cuda":
@@ -5152,6 +5297,7 @@ def cli_diagnose(
     configure_cuda_training(device)
     data = ensure_dataset(work, drive, spec)
     active_cache, persistent_cache = split_cache_dirs(checkpoints, spec)
+    reconcile_split_caches(active_cache, persistent_cache, data)
     val_split = load_task_split(data, "valid", active_cache, persistent_cache)
     val_net = dominant_network_id(val_split)
     network = move_to(val_split.networks[val_net], device)
