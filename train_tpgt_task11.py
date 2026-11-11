@@ -2400,7 +2400,7 @@ class CorrectnessCheck:
 
 def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> list[CorrectnessCheck]:
     """Structural checks plus optional full recompute from stored Ybus and in-service branches."""
-    rpe = network.rpe.detach().cpu().numpy()
+    rpe = network.rpe.detach().cpu().numpy().astype(np.float32, copy=False)
     ybus = network.ybus.detach().cpu().numpy()
     component = network.component.detach().cpu().numpy().astype(np.int64)
     bus_count = rpe.shape[0]
@@ -3111,13 +3111,18 @@ def folder_mix_text(parts: list[tuple[tuple[str, str], int]]) -> str:
     return f"{by_folder} | {conditions} | {topologies}"
 
 
+def colab_local_cache_dir(spec: TaskSpec | None = None) -> Path:
+    """Colab SSD mirror path; must use ``RUN_DIR_NAME`` after ``apply_architecture_config()``."""
+    if spec is None or spec.is_task11:
+        return Path(f"/content/{RUN_DIR_NAME}_cache")
+    return Path(f"/content/{spec.run_dir_name}_cache")
+
+
 def split_cache_dirs(checkpoints: Path, spec: TaskSpec | None = None) -> tuple[Path, Path]:
     """Return (fast_cache, persistent_cache). On Colab, fast_cache is local SSD."""
     persistent = checkpoints / "cache"
     if in_colab():
-        if spec is None or spec.is_task11:
-            return COLAB_LOCAL_CACHE, persistent
-        return Path(f"/content/{spec.run_dir_name}_cache"), persistent
+        return colab_local_cache_dir(spec), persistent
     return persistent, persistent
 
 
@@ -3461,8 +3466,6 @@ def load_task_split(data_root: Path, split_name: str, active: Path, persistent: 
 DATASET_RELATIVE = Path("Foundation Model") / "vendor" / "pfdelta_task1.1"
 WINDOWS_DRIVE = Path(r"K:\My Drive")
 COLAB_DRIVE = Path("/content/drive/MyDrive")
-# Fast split-cache mirror on Colab runtime disk (not synced across disconnects).
-COLAB_LOCAL_CACHE = Path(f"/content/{RUN_DIR_NAME}_cache")
 
 
 def dataset_relative(spec: TaskSpec | None = None) -> Path:

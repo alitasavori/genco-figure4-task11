@@ -86,5 +86,12 @@ def test_run_folders_are_versioned(tmp_path, monkeypatch):
     assert tpgt.RUN_DIR_NAME == f"tpgt_task11_{tpgt.RUN_TAG}" != "tpgt_task11"
     assert checkpoints == tmp_path / "Foundation Model" / tpgt.RUN_DIR_NAME
     assert results == tmp_path / "Foundation Model" / "results" / tpgt.RUN_DIR_NAME
-    assert tpgt.COLAB_LOCAL_CACHE.name == f"{tpgt.RUN_DIR_NAME}_cache"
+    assert tpgt.colab_local_cache_dir().name == f"{tpgt.RUN_DIR_NAME}_cache"
     assert tpgt.CHECKPOINT_VERSION != "meshed-rpe-10-v6-capacity"
+
+
+def test_colab_local_cache_follows_runtime_run_dir(monkeypatch):
+    monkeypatch.setattr(tpgt, "RUN_DIR_NAME", "tpgt_task11_v9")
+    assert tpgt.colab_local_cache_dir() == Path("/content/tpgt_task11_v9_cache")
+    monkeypatch.setattr(tpgt, "in_colab", lambda: True)
+    assert tpgt.split_cache_dirs(Path("/x"))[0] == Path("/content/tpgt_task11_v9_cache")

@@ -2,7 +2,7 @@
 
 [Open Task1_1.ipynb in Colab](https://colab.research.google.com/github/alitasavori/genco-figure4-task11/blob/main/Task1_1.ipynb)
 
-Use a GPU runtime. Run the preparation cell first (it clones the repo and mounts Drive), accept the Drive prompt, then run the training cell. The SVG cell draws the published figure and does not train. Data path: `My Drive/Foundation Model/vendor/pfdelta_task1.1`. Checkpoints go to `Foundation Model/tpgt_task11_<RUN_TAG>` (currently `tpgt_task11_v7`) and TPGT tables to `Foundation Model/results/tpgt_task11_<RUN_TAG>`.
+Use a GPU runtime. In **`Task1_1.ipynb`**, run **1. Pull latest** (clone/`git pull`, Drive mount, pip), then **2. Train** (no git in that cell—set `ARCH`, `DATA_FRACTION`, `BATCH_SIZE` at the top). Data: `My Drive/Foundation Model/vendor/pfdelta_task1.1`. Checkpoints: `Foundation Model/tpgt_task11_<ARCH>` (e.g. `tpgt_task11_v9`); tables: `Foundation Model/results/tpgt_task11_<ARCH>`.
 
 Other PFΔ IEEE 118 tasks (1.2, 1.3/2.1, 2.3, 4.1, 4.2, 4.3) have one training cell each in the notebook (`%run train_tpgt_task11.py --task <id>`). Each uses `Foundation Model/vendor/pfdelta_task<id>` (downloaded from Hugging Face if missing) and writes checkpoints, tables, a bar plot against the published numbers (`plot_task1_1.PUBLISHED`), and bus error maps at every checkpoint epoch to `Foundation Model/tpgt_task<id>_v7`.
 
