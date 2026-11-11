@@ -263,6 +263,8 @@ DEVICE_CACHE_CPU_BYTES = 2 * 1024**3
 # Steps mixing bus-type patterns: False runs every case in one per-case-type pass; True runs the
 # largest pattern block-wise and the remaining cases in one per-case-type pass.
 SPLIT_DOMINANT_PATTERN = False
+# When train has more topologies than this, steps never mix grids (``iterate_indexes``); avoids L4 OOM on N-2 tasks.
+MIX_TOPOLOGIES_THRESHOLD = 64
 # Bus error maps at checkpoint epochs: validation cases on the dominant topology.
 BUS_MAP_VAL_CASES = 256
 EXPECTED_COUNTS = {
@@ -2666,6 +2668,21 @@ def parse_val_every() -> int:
     return VAL_EVERY
 
 
+def mix_topologies_per_step(network_count: int) -> bool:
+    """Whether one optimizer step may batch cases from different topologies (global shuffle)."""
+    for index, arg in enumerate(sys.argv):
+        if arg == "--mix-topologies":
+            return True
+        if arg == "--no-mix-topologies":
+            return False
+    env = os.environ.get("GENCO_TPGT_MIX_TOPOLOGIES", "").strip().lower()
+    if env in ("0", "false", "no"):
+        return False
+    if env in ("1", "true", "yes"):
+        return True
+    return network_count <= MIX_TOPOLOGIES_THRESHOLD
+
+
 def scenario_limit(raw: Path) -> int | None:
     """Number of scenarios kept from the start of each split folder (prefix, not a random subset)."""
     if DATA_FRACTION >= 1.0:
@@ -4199,6 +4216,24 @@ def iterate_indexes(
             yield network_id, index[start : start + batch_size]
 
 
+def iterate_training_steps(
+    split: Split,
+    seed: int,
+    epoch: int,
+    batch_size: int | None = None,
+    *,
+    mix_topologies: bool,
+):
+    """Training steps: global mixed shuffle or single-topology batches (see ``mix_topologies``)."""
+    if batch_size is None:
+        batch_size = BATCH_SIZE
+    if mix_topologies:
+        yield from iterate_steps(split, seed, epoch, batch_size)
+        return
+    for network_id, index in iterate_indexes(split, seed, epoch, shuffle=True, batch_size=batch_size):
+        yield [(network_id, index)]
+
+
 def iterate_type_batches(split: Split, batch_size: int = EVAL_BATCH_SIZE, mix_patterns: bool = False):
     """Batches of up to ``batch_size`` cases whose topologies share ``network_type_key``.
 
@@ -4610,6 +4645,18 @@ def train_seed(
         flush=True,
     )
     train_probe = train_probe_split(train_split, min(val_split.count, TRAIN_PROBE_CASES))
+    mix_topologies = mix_topologies_per_step(len(train_split.networks))
+    if mix_topologies:
+        print(
+            f"train steps: mix topologies (global shuffle, up to {BATCH_SIZE} cases/step)",
+            flush=True,
+        )
+    else:
+        print(
+            f"train steps: one topology per step ({len(train_split.networks)} topologies; "
+            f"set GENCO_TPGT_MIX_TOPOLOGIES=1 to mix and risk OOM on N-2)",
+            flush=True,
+        )
     start_epoch = 0
     best_val = float("inf")
     wait = 0
@@ -4749,7 +4796,9 @@ def train_seed(
             logged_first_batch = False
             batch_durations: list[float] = []
             timer = StepTimer(device)
-            for step_groups in iterate_steps(train_split, seed, epoch):
+            for step_groups in iterate_training_steps(
+                train_split, seed, epoch, mix_topologies=mix_topologies
+            ):
                 if not logged_first_batch:
                     first_batch_started = time.perf_counter()
                 step_started = time.perf_counter()
