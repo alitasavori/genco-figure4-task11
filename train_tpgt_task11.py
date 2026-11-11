@@ -103,9 +103,11 @@ Performance notes (Colab / large train split)
   RPE shift from the training topology). Disable with ``GENCO_TPGT_DEBUG=0`` or
   ``--no-debug``; skip RPE ablation with ``GENCO_TPGT_RPE_ABLATION=0``, bus-shunt
   (``busBS``) node ablation with ``GENCO_TPGT_SHUNT_ABLATION=0`` (v9 only).
-  ``--eval-only --task 3.1`` loads checkpoints from ``--checkpoint-root`` (default
-  ``Foundation Model/tpgt_task11_<RUN_TAG>``) and scores Task 3.1 cross-grid test
-  splits without training. ``--diagnose`` runs the same on a saved checkpoint (``--no-contingency``,
+  ``--eval-only --task 3.1`` scores Table 4 test splits without training: same
+  split-cache prelude as ``main()`` (``reconcile_split_caches``, then ``load_task_split``
+  train on ``pfdelta_task3.1``). When ``--checkpoint-root`` / ``GENCO_TPGT_CHECKPOINT_ROOT``
+  points at another run (e.g. Task 1.1 weights), train RPE scales are taken from that
+  run's cache instead of rebuilding Task 3.1 train caches. ``--diagnose`` runs the same on a saved checkpoint (``--no-contingency``,
   ``--no-rpe-ablation`` / ``--no-shunt-ablation`` to trim). ``--sanity-rpe`` audits one train case.
 """
 
@@ -2435,11 +2437,21 @@ def load_rpe_global_scales(persistent: Path) -> tuple[float, float] | None:
     return float(payload["rpe_re_scale"]), float(payload["rpe_im_scale"])
 
 
-def ensure_eval_rpe_scales(persistent: Path, ckpt_root: Path) -> None:
-    """Task 3.1 eval-only: test split caches need train ``s_R,s_X`` from the weight run."""
+def cross_grid_checkpoint_root(checkpoints: Path, ckpt_root: Path | None) -> bool:
+    """True when eval loads weights from a different Drive run than this task's cache folder."""
+    if ckpt_root is None:
+        return False
+    try:
+        return ckpt_root.resolve() != checkpoints.resolve()
+    except OSError:
+        return ckpt_root != checkpoints
+
+
+def copy_training_rpe_scales(persistent: Path, weight_run: Path) -> None:
+    """Reuse ``s_R,s_X`` from another run (cross-grid Table 4 eval with foreign checkpoints)."""
     if load_rpe_global_scales(persistent) is not None:
         return
-    candidates = [ckpt_root / "cache", Path(f"/content/{ckpt_root.name}_cache")]
+    candidates = [weight_run / "cache", Path(f"/content/{weight_run.name}_cache")]
     for folder in candidates:
         scales = load_rpe_global_scales(folder)
         if scales is not None:
@@ -2451,9 +2463,51 @@ def ensure_eval_rpe_scales(persistent: Path, ckpt_root: Path) -> None:
             return
     raise RuntimeError(
         f"Missing RPE scales for eval caches (expected {rpe_scales_path(persistent)}). "
-        f"Train Task 1.1 on this arch once so {ckpt_root / 'cache' / RPE_SCALES_FILE} exists, "
+        f"Train on this arch once so {weight_run / 'cache' / RPE_SCALES_FILE} exists, "
         f"or copy that file into {persistent}."
     )
+
+
+def warm_split_caches(
+    data: Path,
+    active: Path,
+    persistent: Path,
+    spec: TaskSpec,
+    *,
+    weight_run: Path | None = None,
+    load_valid: bool = True,
+) -> tuple[Split | None, Split | None]:
+    """``main()``-style cache setup before train or Task 3.1 test-only eval."""
+    print(f"Split cache (active): {active}", flush=True)
+    if persistent != active:
+        print(f"Split cache (Drive): {persistent}", flush=True)
+        sync_split_cache_from_drive(persistent, active)
+    reconcile_split_caches(active, persistent, data)
+    checkpoints = persistent.parent
+    if cross_grid_checkpoint_root(checkpoints, weight_run):
+        print(
+            f"Cross-grid eval: RPE scales from weight run {weight_run} "
+            f"(skip Task {spec.label} train cache; test caches still use {spec.dataset_repo}).",
+            flush=True,
+        )
+        copy_training_rpe_scales(persistent, weight_run)
+        return None, None
+    load_started = time.perf_counter()
+    train_split = load_task_split(data, "train", active, persistent)
+    val_split = load_task_split(data, "valid", active, persistent) if load_valid else None
+    ready = f"{train_split.count} train"
+    if val_split is not None:
+        ready += f", {val_split.count} valid"
+    print(
+        f"Train split caches ready in {time.perf_counter() - load_started:.1f}s "
+        f"({ready} cases; scales {rpe_scales_path(persistent)})",
+        flush=True,
+    )
+    return train_split, val_split
+
+
+# Back-compat alias (tests).
+ensure_eval_rpe_scales = copy_training_rpe_scales
 
 
 def split_rpe_scales(split: Split) -> tuple[float, float]:
@@ -5613,24 +5667,13 @@ def main() -> None:
             )
     log_counts(data, results, spec)
     active_cache, persistent_cache = split_cache_dirs(checkpoints, spec)
-    print(f"Split cache (active): {active_cache}", flush=True)
-    if persistent_cache != active_cache:
-        print(f"Split cache (Drive): {persistent_cache}", flush=True)
-        sync_split_cache_from_drive(persistent_cache, active_cache)
-    reconcile_split_caches(active_cache, persistent_cache, data)
+    train_split, val_split = warm_split_caches(data, active_cache, persistent_cache, spec, load_valid=True)
+    assert train_split is not None and val_split is not None
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training device: {device}", flush=True)
     if device.type == "cuda":
         gc.collect()
         torch.cuda.empty_cache()
-    load_started = time.perf_counter()
-    train_split = load_task_split(data, "train", active_cache, persistent_cache)
-    val_split = load_task_split(data, "valid", active_cache, persistent_cache)
-    print(
-        f"Train+valid splits ready in {time.perf_counter() - load_started:.1f}s "
-        f"({train_split.count} train, {val_split.count} valid cases)",
-        flush=True,
-    )
     debug_diagnostics = wants_debug_diagnostics()
     print(
         "Debug diagnostics ON at checkpoint epochs (disable with GENCO_TPGT_DEBUG=0 or --no-debug)."
@@ -5762,9 +5805,14 @@ def cli_eval_only() -> None:
     print(f"Dataset: {data}", flush=True)
     log_counts(data, results, spec)
     active_cache, persistent_cache = split_cache_dirs(checkpoints, spec)
-    if persistent_cache != active_cache:
-        sync_split_cache_from_drive(persistent_cache, active_cache)
-    ensure_eval_rpe_scales(persistent_cache, ckpt_root)
+    warm_split_caches(
+        data,
+        active_cache,
+        persistent_cache,
+        spec,
+        weight_run=ckpt_root,
+        load_valid=False,
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}", flush=True)
     configure_cuda_training(device)
