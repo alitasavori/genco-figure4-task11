@@ -217,6 +217,17 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool]] = {
         "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h4-pqvt-busBS-v9",
         "USE_NODE_SHUNT": True,
     },
+    # v9 node/RPE features with v7 depth (4 stages); separate ``RUN_TAG`` / checkpoint version.
+    "v9d4": {
+        "D": 96,
+        "D_E": 48,
+        "D_A": 48,
+        "HEADS": 4,
+        "DEPTH": 4,
+        "RUN_TAG": "v9d4",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d4-w96-h4-pqvt-busBS-v9d4",
+        "USE_NODE_SHUNT": True,
+    },
 }
 # Fixed training subset scored with val's PBL metric each validation pass (overfitting check).
 TRAIN_PROBE_CASES = 2000
