@@ -132,6 +132,17 @@ def test_task11_is_the_default_task(monkeypatch):
     assert tpgt.score_key("case118", "N", tpgt.task_spec("1.3")) == "N"
 
 
+def test_ensure_eval_rpe_scales_copies_from_checkpoint_cache(tmp_path):
+    ckpt = tmp_path / "tpgt_task11_v9"
+    ckpt_cache = ckpt / "cache"
+    ckpt_cache.mkdir(parents=True)
+    dest = tmp_path / "tpgt_task3.1_v9" / "cache"
+    dest.mkdir(parents=True)
+    tpgt.save_rpe_global_scales(ckpt_cache, 1.25, 0.75)
+    tpgt.ensure_eval_rpe_scales(dest, ckpt)
+    assert tpgt.load_rpe_global_scales(dest) == (1.25, 0.75)
+
+
 def test_other_tasks_get_their_own_folders(tmp_path, monkeypatch):
     monkeypatch.setattr(tpgt, "in_colab", lambda: False)
     (tmp_path / "Foundation Model").mkdir()

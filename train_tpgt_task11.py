@@ -2435,6 +2435,27 @@ def load_rpe_global_scales(persistent: Path) -> tuple[float, float] | None:
     return float(payload["rpe_re_scale"]), float(payload["rpe_im_scale"])
 
 
+def ensure_eval_rpe_scales(persistent: Path, ckpt_root: Path) -> None:
+    """Task 3.1 eval-only: test split caches need train ``s_R,s_X`` from the weight run."""
+    if load_rpe_global_scales(persistent) is not None:
+        return
+    candidates = [ckpt_root / "cache", Path(f"/content/{ckpt_root.name}_cache")]
+    for folder in candidates:
+        scales = load_rpe_global_scales(folder)
+        if scales is not None:
+            save_rpe_global_scales(persistent, scales[0], scales[1])
+            print(
+                f"RPE scales for eval caches: s_R={scales[0]:.6g} s_X={scales[1]:.6g} (from {folder})",
+                flush=True,
+            )
+            return
+    raise RuntimeError(
+        f"Missing RPE scales for eval caches (expected {rpe_scales_path(persistent)}). "
+        f"Train Task 1.1 on this arch once so {ckpt_root / 'cache' / RPE_SCALES_FILE} exists, "
+        f"or copy that file into {persistent}."
+    )
+
+
 def split_rpe_scales(split: Split) -> tuple[float, float]:
     for network in split.networks:
         if network.rpe_re_scale is not None and network.rpe_im_scale is not None:
@@ -5743,6 +5764,7 @@ def cli_eval_only() -> None:
     active_cache, persistent_cache = split_cache_dirs(checkpoints, spec)
     if persistent_cache != active_cache:
         sync_split_cache_from_drive(persistent_cache, active_cache)
+    ensure_eval_rpe_scales(persistent_cache, ckpt_root)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}", flush=True)
     configure_cuda_training(device)
