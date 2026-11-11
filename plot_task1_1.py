@@ -75,7 +75,39 @@ PUBLISHED = {
         "GNS-S": {"N": (6.3e-1, 2.2e-1), "N-1": (7.3e-1, 2.4e-1), "N-2": (7.3e-1, 2.4e-1), "C2I": (7.0e-1, 2.8e-1)},
         "PFNet": {"N": (1.2, 0.04), "N-1": (1.4, 0.04), "N-2": (1.5, 0.02), "C2I": (1.1, 0.07)},
     },
+    # Table 4 (not Figure 4): train IEEE 118, test IEEE 57 / 118 / GOC 500. Keys are ``"<grid> <category>"``.
+    "3.1": {
+        "GENCO Base": {
+            "57 N": (4.9e-1, 1.9e-1), "57 N-1": (5.0e-1, 2.07e-1), "57 N-2": (4.8e-1, 1.7e-1), "57 C2I": (5.8e-1, 2.2e-1),
+            "118 N": (2.7e-3, 2.1e-3), "118 N-1": (4.5e-3, 3.4e-3), "118 N-2": (5.8e-3, 4.3e-3), "118 C2I": (2.2e-1, 0.8e-1),
+            "500 N": (8.7, 5.9), "500 N-1": (8.7, 5.9), "500 N-2": (8.7, 5.9), "500 C2I": (8.7, 5.8),
+        },
+        "CANOS-PF": {
+            "57 N": (1.7, 0.2), "57 N-1": (1.8, 0.2), "57 N-2": (1.8, 0.2), "57 C2I": (1.8, 0.2),
+            "118 N": (4.0e-2, 0.4e-2), "118 N-1": (5.6e-2, 0.5e-2), "118 N-2": (6.3e-2, 0.5e-2), "118 C2I": (7.2e-1, 0.9e-1),
+            "500 N": (2.3e1, 0.6e1), "500 N-1": (2.3e1, 0.6e1), "500 N-2": (2.3e1, 0.6e1), "500 C2I": (2.6e1, 0.6e1),
+        },
+        "GNS-S": {
+            "57 N": (3.3e1, 1.4e1), "57 N-1": (8.8e1, 3.9e1), "57 N-2": (1.5e2, 0.7e2), "57 C2I": (8.0e-1, 2.0e-1),
+            "118 N": (3.5e-1, 0.4e-1), "118 N-1": (3.8e-1, 0.4e-1), "118 N-2": (3.9e-1, 0.4e-1), "118 C2I": (7.7e-1, 0.5e-1),
+            "500 N": (2.4e1, 0.7e1), "500 N-1": (2.4e1, 0.7e1), "500 N-2": (2.4e1, 0.7e1), "500 C2I": (2.4e1, 0.7e1),
+        },
+        "PFNet": {
+            "57 N": (2.3, 0.4), "57 N-1": (2.3, 0.4), "57 N-2": (2.3, 0.4), "57 C2I": (2.4, 0.4),
+            "118 N": (3.4e-1, 0.08e-1), "118 N-1": (4.0e-1, 0.05e-1), "118 N-2": (4.2e-1, 0.09e-1), "118 C2I": (1.1, 0.03),
+            "500 N": (8.3e1, 3.9e1), "500 N-1": (8.1e1, 3.8e1), "500 N-2": (8.4e1, 4.0e1), "500 C2I": (8.9e1, 3.8e1),
+        },
+    },
 }
+TASK31_GRIDS = ("57", "118", "500")
+TASK31_GRID_TITLES = {"57": "IEEE 57", "118": "IEEE 118", "500": "GOC 500"}
+
+
+def categories_for(task: str) -> tuple[str, ...]:
+    """Reported test categories. Task 3.1 is Table 4: four conditions on each of three grids."""
+    if task == "3.1":
+        return tuple(f"{grid} {category}" for grid in TASK31_GRIDS for category in CATEGORIES)
+    return CATEGORIES
 PUBLISHED_TASK11 = PUBLISHED["1.1"]
 
 _GENCO_TABLE = (
@@ -97,6 +129,10 @@ PUBLISHED_SOURCES = {
         ("4.3", "4.3"),
     )
 }
+PUBLISHED_SOURCES["3.1"] = (
+    "GENCO arXiv 2608.09921v3 Table 4 (train IEEE 118; test IEEE 57, IEEE 118, GOC 500). "
+    "Newton–Raphson rows are omitted."
+)
 
 
 def _rows_for(summary: list[dict]) -> dict[str, dict[str, tuple[float, float]]]:
@@ -195,6 +231,66 @@ def _ylim_for(grouped: dict) -> tuple[tuple[float, float], list[float]]:
     return (0.0, ymax), [i * ymax / 4 for i in range(5)]
 
 
+def _draw_bars(axis, categories: tuple[str, ...], labels, colors, means, stds, title: str) -> None:
+    positions = np.arange(len(categories))
+    width = 0.75 / max(len(labels), 1)
+    for index, name in enumerate(labels):
+        offset = (index - (len(labels) - 1) / 2) * width
+        axis.bar(
+            positions + offset,
+            means[index],
+            width,
+            yerr=stds[index],
+            label=name,
+            color=colors[index],
+            capsize=2,
+            error_kw={"linewidth": 1.2},
+            zorder=3,
+        )
+    axis.set_xticks(positions)
+    short = [category.split()[-1] for category in categories]
+    axis.set_xticklabels(short)
+    axis.set_ylabel("Power Balance Loss (Mean) [p.u.]")
+    top = max(mean + std for row_mean, row_std in zip(means, stds) for mean, std in zip(row_mean, row_std))
+    axis.set_ylim(0, max(PAPER_YLIM[1], 1.1 * top) if top <= PAPER_YLIM[1] else 1.1 * top)
+    axis.yaxis.grid(True, zorder=0)
+    axis.set_axisbelow(True)
+    axis.set_title(title, fontproperties=font_properties(FONT_LABEL))
+    style_axis(axis)
+
+
+def _plot_task31_comparison(
+    label: str,
+    tpgt: dict[str, tuple[float, float]],
+    output: Path,
+    tpgt_label: str,
+) -> list[Path]:
+    """Three panels (IEEE 57, IEEE 118, GOC 500), each the usual N / N-1 / N-2 / C2I bars."""
+    published = PUBLISHED["3.1"]
+    models = [model for model in MODELS if model in published]
+    labels = [f"{model} (published)" for model in models] + [tpgt_label]
+    colors = [PALETTE[model] for model in models] + [TPGT_COLOR]
+    apply_plot_style()
+    figure, axes = plt.subplots(3, 1, figsize=(10, 14))
+    for axis, grid in zip(axes, TASK31_GRIDS):
+        categories = tuple(f"{grid} {category}" for category in CATEGORIES)
+        means = [[published[model][category][0] for category in categories] for model in models]
+        stds = [[published[model][category][1] for category in categories] for model in models]
+        means.append([tpgt[category][0] for category in categories])
+        stds.append([tpgt[category][1] for category in categories])
+        _draw_bars(axis, categories, labels, colors, means, stds, f"Task {label} — {TASK31_GRID_TITLES[grid]}")
+    axes[0].legend(frameon=False, prop=font_properties(FONT_LEGEND), title="Model")
+    axes[0].get_legend().get_title().set_fontproperties(font_properties(FONT_LEGEND))
+    figure.tight_layout()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    png = output.with_suffix(".png")
+    figure.savefig(output, format="svg", bbox_inches="tight")
+    figure.savefig(png, format="png", dpi=120, bbox_inches="tight")
+    plt.close(figure)
+    print(f"wrote {output} and {png.name}", flush=True)
+    return [output, png]
+
+
 def plot_tpgt_comparison(
     task: str,
     label: str,
@@ -203,6 +299,8 @@ def plot_tpgt_comparison(
     tpgt_label: str = "TPGT (this run)",
 ) -> list[Path]:
     """Mean PBL per test category: published models of ``task`` next to TPGT; writes ``output`` (SVG) and PNG."""
+    if task == "3.1":
+        return _plot_task31_comparison(label, tpgt, output, tpgt_label)
     published = PUBLISHED.get(task, {})
     models = [model for model in MODELS if model in published]
     labels = [f"{model} (published)" for model in models] + [tpgt_label]

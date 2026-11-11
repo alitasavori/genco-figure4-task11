@@ -15,7 +15,13 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import train_tpgt_task11 as tpgt  # noqa: E402
-from plot_task1_1 import PUBLISHED, PUBLISHED_SOURCES, PUBLISHED_TASK11, plot_tpgt_comparison  # noqa: E402
+from plot_task1_1 import (  # noqa: E402
+    PUBLISHED,
+    PUBLISHED_SOURCES,
+    PUBLISHED_TASK11,
+    categories_for,
+    plot_tpgt_comparison,
+)
 from test_diagnostics import tiny_consistent_split  # noqa: E402
 
 
@@ -117,7 +123,13 @@ def test_task11_is_the_default_task(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["train_tpgt_task11.py", "--task=1.2"])
     assert tpgt.parse_task().task_id == "1.2"
     with pytest.raises(ValueError):
-        tpgt.task_spec("3.1")
+        tpgt.task_spec("9.9")
+    task31 = tpgt.task_spec("3.1")
+    assert task31.dataset_repo == "gridfm/pfdelta_task3.1"
+    assert task31.folders == tpgt.task_spec("1.3").folders
+    assert tpgt.eval_case_names(task31) == ("case57", "case118", "case500")
+    assert tpgt.score_key("case57", "N-2", task31) == "57 N-2"
+    assert tpgt.score_key("case118", "N", tpgt.task_spec("1.3")) == "N"
 
 
 def test_other_tasks_get_their_own_folders(tmp_path, monkeypatch):
@@ -132,6 +144,7 @@ def test_other_tasks_get_their_own_folders(tmp_path, monkeypatch):
         "1.2": "tpgt_task1.2_v7",
         "1.3": "tpgt_task1.3_v7",
         "2.3": "tpgt_task2.3_v7",
+        "3.1": "tpgt_task3.1_v7",
         "4.1": "tpgt_task4.1_v7",
         "4.2": "tpgt_task4.2_v7",
         "4.3": "tpgt_task4.3_v7",
@@ -145,7 +158,7 @@ def test_other_tasks_get_their_own_folders(tmp_path, monkeypatch):
         monkeypatch.setattr(tpgt, "in_colab", lambda: True)
         assert tpgt.split_cache_dirs(checkpoints, spec)[0] == Path(f"/content/{folder}_cache")
         monkeypatch.setattr(tpgt, "in_colab", lambda: False)
-    assert len({tpgt.task_spec(task).run_dir_name for task in [*expected, "1.1"]}) == 7
+    assert len({tpgt.task_spec(task).run_dir_name for task in [*expected, "1.1"]}) == 8
 
 
 def make_tree(root: Path, layout: dict[str, list[tuple[str, str]]]) -> None:
@@ -283,6 +296,46 @@ def test_iterate_steps_mixes_topologies_and_covers_every_case():
         for net, index in groups:
             assert set(owners[index].tolist()) == {net}
     assert any(len(groups) > 1 for groups in steps)
+
+
+def test_pack_same_type_steps_caps_runs_and_keeps_large_chunks():
+    nets = [type("Net", (), {"type_key": key})() for key in (b"a", b"a", b"b", b"a", b"a")]
+    chunks = [(net, np.array([net])) for net in range(len(nets))]
+    chunks.append((0, np.arange(16)))
+    steps = tpgt.pack_same_type_steps(chunks, nets, max_topologies=8, max_cases=16)
+    assert [[net for net, _index in groups] for groups in steps] == [[0, 1], [2], [3, 4], [0]]
+    assert [len(groups[-1][1]) for groups in steps] == [1, 1, 1, 16]
+
+    tiny = [(net, np.array([net])) for net in range(10)]
+    same = [type("Net", (), {"type_key": b"a"})() for _ in range(10)]
+    packed = tpgt.pack_same_type_steps(tiny, same, max_topologies=4, max_cases=16)
+    assert [len(groups) for groups in packed] == [4, 4, 2]
+    seen = np.concatenate([index for groups in packed for _net, index in groups])
+    assert sorted(seen.tolist()) == list(range(10))
+    assert tpgt.pack_same_type_steps(tiny, same, max_topologies=1, max_cases=16) == [[chunk] for chunk in tiny]
+
+
+def test_plan_training_steps_packs_one_case_topologies_of_one_type(monkeypatch):
+    monkeypatch.setattr(tpgt, "PACK_MAX_TOPOLOGIES", 4)
+    monkeypatch.setattr(tpgt, "PACK_MAX_CASES", 8)
+    monkeypatch.delenv("GENCO_TPGT_PACK_TOPOLOGIES", raising=False)
+    monkeypatch.delenv("GENCO_TPGT_PACK_CASES", raising=False)
+    mesh = three_bus_topologies()[0]
+    split, networks = consistent_split([mesh] * 6, [1] * 6)
+    assert len({tpgt.network_type_key(network) for network in networks}) == 1
+    steps = tpgt.plan_training_steps(split, 0, 0, batch_size=32, mix_topologies=False)
+    assert [len(groups) for groups in steps] == [4, 2]
+    seen = np.concatenate([index for groups in steps for _net, index in groups])
+    assert sorted(seen.tolist()) == list(range(6))
+
+    wide, _wide_networks = consistent_split([mesh], [40])
+    wide_steps = tpgt.plan_training_steps(wide, 0, 0, batch_size=32, mix_topologies=False)
+    assert [len(groups) for groups in wide_steps] == [1, 1]
+    assert sorted(len(index) for groups in wide_steps for _net, index in groups) == [8, 32]
+
+    mixed = tpgt.plan_training_steps(split, 0, 0, batch_size=32, mix_topologies=True)
+    assert len(mixed) == 1
+    assert sum(len(index) for _net, index in mixed[0]) == 6
 
 
 def test_iterate_indexes_never_mixes_topologies():
@@ -588,13 +641,15 @@ def test_compact_networks_keeps_dominant_topology_in_float32():
 
 def test_published_numbers_cover_every_task():
     assert PUBLISHED_TASK11 is PUBLISHED["1.1"]
-    assert set(PUBLISHED) == {"1.1", "1.2", "1.3", "2.3", "4.1", "4.2", "4.3"}
+    assert set(PUBLISHED) == {"1.1", "1.2", "1.3", "2.3", "3.1", "4.1", "4.2", "4.3"}
     assert set(PUBLISHED_SOURCES) == set(PUBLISHED)
     for task, models in PUBLISHED.items():
         assert set(models) == {"GENCO Base", "CANOS-PF", "GNS-S", "PFNet"}, task
         for scores in models.values():
-            assert set(scores) == {"N", "N-1", "N-2", "C2I"}
+            assert set(scores) == set(categories_for(task))
             assert all(mean > 0 and std > 0 for mean, std in scores.values())
+    assert PUBLISHED["3.1"]["GENCO Base"]["57 N"] == (4.9e-1, 1.9e-1)
+    assert PUBLISHED["3.1"]["GENCO Base"]["500 C2I"] == (8.7, 5.8)
     assert PUBLISHED["1.3"]["GENCO Base"]["N"] == (2.7e-3, 2.2e-3)
     assert PUBLISHED["4.3"]["PFNet"]["N-2"] == (1.5, 0.02)
     for spec in tpgt.TASKS.values():
@@ -613,6 +668,18 @@ def test_bar_plot_for_a_task_writes_svg_and_png(tmp_path):
     tpgt.plot_comparison(tmp_path, summary, tpgt.task_spec("2.1"))
     assert (tmp_path / "figure4_task1.3_tpgt.svg").is_file()
     assert (tmp_path / "figure4_task1.3_tpgt.png").is_file()
+    task31 = {category: (0.2, 0.05) for category in categories_for("3.1")}
+    written31 = plot_tpgt_comparison("3.1", "3.1", task31, tmp_path / "figure4_task3.1_tpgt.svg")
+    assert [path.name for path in written31] == ["figure4_task3.1_tpgt.svg", "figure4_task3.1_tpgt.png"]
+    counts = {}
+    raw = {}
+    for grid in ("57", "118", "500"):
+        for label, value in (("N", 0.1), ("N-1", 0.2), ("N-2", 0.3), ("C2I-N", 1.0), ("C2I-N-1", 2.0), ("C2I-N-2", 3.0)):
+            raw[f"{grid} {label}"] = value
+            counts[f"{grid} {label}"] = 4
+    reported = tpgt.attach_c2i(raw, counts, tpgt.task_spec("3.1"))
+    assert reported["118 C2I"] == pytest.approx(2.0)
+    assert set(categories_for("3.1")) <= set(reported)
 
 
 def test_seed_metrics_and_summary_per_task(tmp_path):

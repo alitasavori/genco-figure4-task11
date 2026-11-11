@@ -4,7 +4,7 @@ Option II from the draft: each correction stage has its own weights.
 
 Tasks (``--task`` or ``GENCO_TPGT_TASK``; see ``TASKS``)
 ----------------------------------------------------
-1.1 (default), 1.2, 1.3 (alias 2.1), 2.3, 4.1, 4.2, 4.3. Data: ``Foundation Model/vendor/pfdelta_task<id>``
+1.1 (default), 1.2, 1.3 (alias 2.1), 2.3, 3.1, 4.1, 4.2, 4.3. Data: ``Foundation Model/vendor/pfdelta_task<id>``
 (override ``GENCO_PFDELTA_TASK<id without dot>``, e.g. ``GENCO_PFDELTA_TASK42``), downloaded from
 ``gridfm/pfdelta_task<id>`` when missing. Training and validation use the union of the task's
 train/valid folders (each cached and cut to ``DATA_FRACTION`` on its own, then merged); every task
@@ -14,9 +14,13 @@ one global shuffle and runs them in one forward/backward: a single topology uses
 block-wise path, topologies with equal bus types (line outages) share it with per-case pair
 embeddings and Ybus, and topologies with different bus types (generator outages) run per-case
 type masks (``TypeLayout``). Device copies of the networks (``DeviceNetworks``) stay resident when
-they fit the memory budget, otherwise in an LRU. Validation and test batch the same way. The
-250-batch and epoch log lines break the step time into network moves, pair encoder, forward,
-backward and optimizer (``StepTimer``). Checkpoint epochs also write a bar plot against the
+they fit the memory budget, otherwise in an LRU. When the train split has more topologies than
+``MIX_TOPOLOGIES_THRESHOLD``, steps do not globally shuffle (that OOMs on N-2); same-bus-type
+grids are packed up to ``PACK_MAX_TOPOLOGIES`` / ``PACK_MAX_CASES`` instead, and a chunk that
+already has ``PACK_MAX_CASES`` cases stays one topology. Validation and test batch the same way.
+A progress line (about once a minute, and every 50 steps) and the epoch line break the step time
+into network moves, pair encoder, forward, backward and optimizer (``StepTimer``). Checkpoint
+epochs also write a bar plot against the
 published numbers (latest under ``results/``, plus a per-epoch copy under
 ``bar_plots/seed_*/epoch_*/``) and IEEE 118 bus error maps.
 The hidden sizes, depth, batch, and epoch cap below are implementation
@@ -99,7 +103,9 @@ Performance notes (Colab / large train split)
   RPE shift from the training topology). Disable with ``GENCO_TPGT_DEBUG=0`` or
   ``--no-debug``; skip RPE ablation with ``GENCO_TPGT_RPE_ABLATION=0``, bus-shunt
   (``busBS``) node ablation with ``GENCO_TPGT_SHUNT_ABLATION=0`` (v9 only).
-  ``--diagnose`` runs the same on a saved checkpoint (``--no-contingency``,
+  ``--eval-only --task 3.1`` loads checkpoints from ``--checkpoint-root`` (default
+  ``Foundation Model/tpgt_task11_<RUN_TAG>``) and scores Task 3.1 cross-grid test
+  splits without training. ``--diagnose`` runs the same on a saved checkpoint (``--no-contingency``,
   ``--no-rpe-ablation`` / ``--no-shunt-ablation`` to trim). ``--sanity-rpe`` audits one train case.
 """
 
@@ -134,7 +140,7 @@ from common import (
     upsert_csv,
 )
 from metrics import aggregate_c2i, sample_mean, sample_std
-from plot_task1_1 import PUBLISHED, plot_tpgt_comparison
+from plot_task1_1 import PUBLISHED, categories_for, plot_tpgt_comparison
 from storage import ROOT, in_colab, mount_drive
 
 # Implementation choices, not values from the draft.
@@ -268,8 +274,17 @@ DEVICE_CACHE_CPU_BYTES = 2 * 1024**3
 # Steps mixing bus-type patterns: False runs every case in one per-case-type pass; True runs the
 # largest pattern block-wise and the remaining cases in one per-case-type pass.
 SPLIT_DOMINANT_PATTERN = False
-# When train has more topologies than this, steps never mix grids (``iterate_indexes``); avoids L4 OOM on N-2 tasks.
+# When train has more topologies than this, steps do not use a global shuffle (that put up to
+# BATCH_SIZE distinct N-2 grids in one backward and OOM'd). Same-bus-type grids are still packed,
+# capped below, so a one-case N-2 topology is not its own optimizer step.
 MIX_TOPOLOGIES_THRESHOLD = 64
+# Caps for that pack. A chunk that already has PACK_MAX_CASES cases stays one topology (shared
+# pair embedding, the path that fits at BATCH_SIZE). GENCO_TPGT_PACK_TOPOLOGIES=1 disables packing.
+PACK_MAX_TOPOLOGIES = 8
+PACK_MAX_CASES = 16
+# Heartbeat during an epoch. The step timer's window resets on each line.
+PROGRESS_EVERY_STEPS = 50
+PROGRESS_EVERY_SECONDS = 60.0
 # Bus error maps at checkpoint epochs: validation cases on the dominant topology.
 BUS_MAP_VAL_CASES = 256
 EXPECTED_COUNTS = {
@@ -335,6 +350,13 @@ TASKS = {
     "2.3": TaskSpec(
         "2.3", "2.3", "2.3", "train N + N-1 + N-2 with 3x less data", _folders(TOPOLOGIES, ("feasible",))
     ),
+    "3.1": TaskSpec(
+        "3.1",
+        "3.1",
+        "3.1",
+        "train IEEE 118 (N + N-1 + N-2); test IEEE 57, IEEE 118, and GOC 500",
+        _folders(TOPOLOGIES, ("feasible",)),
+    ),
     "4.1": TaskSpec("4.1", "4.1", "4.1", "90% feasible + 10% C2I", _folders(TOPOLOGIES, ("feasible", "nose"))),
     "4.2": TaskSpec(
         "4.2", "4.2", "4.2", "50% feasible + 10% C2I + 40% approaching infeasibility", _folders(TOPOLOGIES, CONDITIONS)
@@ -344,6 +366,16 @@ TASKS = {
     ),
 }
 TASK_ALIASES = {"2.1": "1.3", "1.3/2.1": "1.3"}
+# Task 3.1 keeps the IEEE 118 train/valid folders and adds these test grids under case118/test/.
+TASK31_TEST_CASES = ("case57", "case118", "case500")
+
+
+def eval_case_names(spec: TaskSpec | None = None) -> tuple[str, ...]:
+    """Parquet case folder used at test time. Only Task 3.1 leaves IEEE 118."""
+    spec = spec or TASKS["1.1"]
+    if spec.task_id == "3.1":
+        return TASK31_TEST_CASES
+    return ("case118",)
 
 
 def task_spec(name: str) -> TaskSpec:
@@ -361,6 +393,48 @@ def parse_task() -> TaskSpec:
         if arg.startswith("--task="):
             return task_spec(arg.split("=", 1)[1])
     return task_spec(os.environ.get("GENCO_TPGT_TASK", "").strip() or "1.1")
+
+
+def wants_eval_only() -> bool:
+    if "--eval-only" in sys.argv:
+        return True
+    return os.environ.get("GENCO_TPGT_EVAL_ONLY", "").strip().lower() in ("1", "true", "yes")
+
+
+def parse_checkpoint_root(drive: Path | None) -> Path | None:
+    """Weight directory (contains ``seed_*/last.pt``). Default: Task 1.1 folder for current ``RUN_TAG``."""
+    for index, arg in enumerate(sys.argv):
+        if arg == "--checkpoint-root" and index + 1 < len(sys.argv):
+            return Path(sys.argv[index + 1])
+        if arg.startswith("--checkpoint-root="):
+            return Path(arg.split("=", 1)[1])
+    env = os.environ.get("GENCO_TPGT_CHECKPOINT_ROOT", "").strip()
+    if env:
+        return Path(env)
+    if drive is not None:
+        return drive / "Foundation Model" / RUN_DIR_NAME
+    return None
+
+
+def eval_checkpoint_payload(seed_dir: Path, device: torch.device) -> tuple[dict, int, Path] | None:
+    """``best_state`` from ``last.pt`` when present, else ``model``."""
+    last_path = seed_dir / "last.pt"
+    payload = try_load_checkpoint_file(last_path, device)
+    if payload is None:
+        return None
+    reason = checkpoint_version_reason(payload)
+    if reason is not None:
+        raise RuntimeError(f"{last_path}: {reason}")
+    pair_mismatch = pair_encoder_input_mismatch(payload)
+    if pair_mismatch is not None:
+        raise RuntimeError(f"{last_path}: {pair_mismatch}")
+    state = payload.get("best_state")
+    if not isinstance(state, dict):
+        state = payload.get("model")
+    if not isinstance(state, dict):
+        return None
+    cpu_state = {key: value.cpu() if torch.is_tensor(value) else value for key, value in state.items()}
+    return cpu_state, int(payload.get("epoch", 0)), last_path
 
 
 def ensure_runtime_packages() -> None:
@@ -2386,7 +2460,7 @@ def unify_network_rpe(
             continue
         ybus = network.ybus.detach().cpu().numpy()
         features, component = meshed_rpe(
-            118,
+            int(ybus.shape[0]),
             list(network.branches),
             ybus,
             re_scale=global_re,
@@ -2530,13 +2604,28 @@ def _blocks(values: np.ndarray, width: int) -> np.ndarray:
     return values.reshape(-1, width)
 
 
+def parquet_bus_count(raw: Path) -> int:
+    """Buses per scenario: length of the first scenario block in ``bus_data.parquet``."""
+    import pyarrow.parquet as pq
+
+    scenario = pq.read_table(raw / "bus_data.parquet", columns=["scenario"]).column("scenario").to_numpy()
+    if scenario.size == 0:
+        raise RuntimeError(f"{raw} bus_data is empty.")
+    change = np.flatnonzero(scenario != scenario[0])
+    width = int(change[0]) if change.size else int(scenario.size)
+    if width < 1 or scenario.size % width != 0:
+        raise RuntimeError(f"{raw} bus rows {scenario.size} are not a multiple of {width}.")
+    return width
+
+
 def scenario_count(raw: Path) -> int:
     import pyarrow.parquet as pq
 
     rows = pq.ParquetFile(raw / "bus_data.parquet").metadata.num_rows
-    if rows % 118 != 0:
-        raise RuntimeError(f"{raw} bus rows {rows} are not a multiple of 118.")
-    return rows // 118
+    width = parquet_bus_count(raw)
+    if rows % width != 0:
+        raise RuntimeError(f"{raw} bus rows {rows} are not a multiple of {width}.")
+    return rows // width
 
 
 def parse_data_fraction() -> float:
@@ -2889,6 +2978,7 @@ def read_split(
     if start < 0 or start >= end:
         raise ValueError(f"{name}: invalid scenario prefix [{start}, {end}) for {full} scenarios.")
     count = end - start
+    bus_count = parquet_bus_count(raw)
     branch_rows = pq.ParquetFile(raw / "branch_data.parquet").metadata.num_rows
     if branch_rows % full != 0:
         raise RuntimeError(f"{raw} branch rows are not one block per scenario.")
@@ -2896,34 +2986,34 @@ def read_split(
     bus = pq.read_table(
         raw / "bus_data.parquet",
         columns=["scenario", "bus", "Pd", "Qd", "Pg", "Qg", "Vm", "Va", "PQ", "PV", "REF", "BS"],
-    ).slice(start * 118, count * 118)
-    buses = _blocks(bus.column("bus").to_numpy(), 118)
-    scenario_blocks = _blocks(bus.column("scenario").to_numpy(), 118)
+    ).slice(start * bus_count, count * bus_count)
+    bus_ids = _blocks(bus.column("bus").to_numpy(), bus_count)
+    scenario_blocks = _blocks(bus.column("scenario").to_numpy(), bus_count)
     if not np.all(scenario_blocks[:, :1] == scenario_blocks):
         raise RuntimeError(f"{raw} bus rows are not grouped by scenario.")
-    if not np.all(buses == np.arange(118)):
-        raise RuntimeError(f"{raw} buses are not ordered 0..117 within each scenario.")
-    pq_flag = _blocks(bus.column("PQ").to_numpy(), 118)
-    pv_flag = _blocks(bus.column("PV").to_numpy(), 118)
-    ref_flag = _blocks(bus.column("REF").to_numpy(), 118)
-    type_code = np.zeros((count, 118), dtype=np.float32)
+    if not np.all(bus_ids == np.arange(bus_count)):
+        raise RuntimeError(f"{raw} buses are not ordered 0..{bus_count - 1} within each scenario.")
+    pq_flag = _blocks(bus.column("PQ").to_numpy(), bus_count)
+    pv_flag = _blocks(bus.column("PV").to_numpy(), bus_count)
+    ref_flag = _blocks(bus.column("REF").to_numpy(), bus_count)
+    type_code = np.zeros((count, bus_count), dtype=np.float32)
     type_code[pv_flag > 0.5] = 1
     type_code[ref_flag > 0.5] = 2
     if np.any((pq_flag > 0.5) & (pv_flag > 0.5)) or np.any((type_code == 0) & (pq_flag <= 0.5)):
         raise RuntimeError(f"{name} has a bus that is not exactly one of PQ, PV, or slack.")
-    power_p = (_blocks(bus.column("Pg").to_numpy(), 118) - _blocks(bus.column("Pd").to_numpy(), 118)) / BASE_MVA
-    power_q = (_blocks(bus.column("Qg").to_numpy(), 118) - _blocks(bus.column("Qd").to_numpy(), 118)) / BASE_MVA
-    voltage = _blocks(bus.column("Vm").to_numpy(), 118)
-    angle = np.deg2rad(_blocks(bus.column("Va").to_numpy(), 118))
-    # Parquet ``BS`` is already p.u. bus-shunt susceptance (device only; GS is 0 on case118).
-    shunt_b = _blocks(bus.column("BS").to_numpy(), 118).astype(np.float32)
+    power_p = (_blocks(bus.column("Pg").to_numpy(), bus_count) - _blocks(bus.column("Pd").to_numpy(), bus_count)) / BASE_MVA
+    power_q = (_blocks(bus.column("Qg").to_numpy(), bus_count) - _blocks(bus.column("Qd").to_numpy(), bus_count)) / BASE_MVA
+    voltage = _blocks(bus.column("Vm").to_numpy(), bus_count)
+    angle = np.deg2rad(_blocks(bus.column("Va").to_numpy(), bus_count))
+    # Parquet ``BS`` is already p.u. bus-shunt susceptance (device only).
+    shunt_b = _blocks(bus.column("BS").to_numpy(), bus_count).astype(np.float32)
 
     branch = pq.read_table(
         raw / "branch_data.parquet",
         columns=["scenario", "idx", "from_bus", "to_bus", "r", "x", "br_status"],
     ).slice(start * branch_count, count * branch_count)
     branch_scenario = _blocks(branch.column("scenario").to_numpy(), branch_count)
-    bus_scenario = _blocks(bus.column("scenario").to_numpy(), 118)
+    bus_scenario = _blocks(bus.column("scenario").to_numpy(), bus_count)
     if not np.array_equal(branch_scenario[:, 0], bus_scenario[:, 0]):
         raise RuntimeError(f"{raw} bus and branch scenarios are not in the same order.")
     status = _blocks(branch.column("br_status").to_numpy(), branch_count)
@@ -2957,7 +3047,7 @@ def read_split(
     worst_local = 0
     for local in range(count):
         scenario_id = scenario_ids[local]
-        ybus = ybus_from_entries(y_by_scenario[scenario_id])
+        ybus = ybus_from_entries(y_by_scenario[scenario_id], bus_count)
         pbl_mean = reference_mean_pbl(
             power_p[local],
             power_q[local],
@@ -2996,6 +3086,7 @@ def read_split(
             branch_count,
             shunt_b,
             rpe_scales=rpe_scales,
+            bus_count=bus_count,
         )
     return Split(
         name=name,
@@ -3032,6 +3123,7 @@ def _representative_networks(
     branch_count: int,
     shunt_b: np.ndarray,
     rpe_scales: tuple[float, float] | None = None,
+    bus_count: int = 118,
 ) -> list[Network]:
     rep_specs: list[tuple[int, np.ndarray, list[tuple[int, int, float, float]], np.ndarray]] = []
     for local in representatives:
@@ -3039,7 +3131,7 @@ def _representative_networks(
         if int(np.sum(types == 2)) != 1:
             raise RuntimeError(f"{name} scenario {scenario_ids[local]} has {int(np.sum(types == 2))} slack buses.")
         scenario_id = scenario_ids[local]
-        ybus = ybus_from_entries(y_by_scenario[scenario_id])
+        ybus = ybus_from_entries(y_by_scenario[scenario_id], bus_count)
         branches = []
         for branch_id in range(branch_count):
             if status[local, branch_id] < 0.5:
@@ -3073,7 +3165,7 @@ def _representative_networks(
 
     networks: list[Network] = []
     for local, types, branches, ybus in rep_specs:
-        features, component = meshed_rpe(118, branches, ybus, re_scale=global_re, im_scale=global_im)
+        features, component = meshed_rpe(bus_count, branches, ybus, re_scale=global_re, im_scale=global_im)
         networks.append(
             Network(
                 ybus=torch.from_numpy(ybus),
@@ -3097,11 +3189,18 @@ def log_counts(data_root: Path, results: Path, spec: TaskSpec | None = None) -> 
     else:
         folders = [("train", *folder) for folder in task_folders(data_root, "train")]
         folders.extend(("valid", *folder) for folder in task_folders(data_root, "valid"))
-    folders.extend(("test", topology, condition) for _label, topology, condition in TEST_PARTS)
-    for split, topology, condition in folders:
-        raw = data_root / "case118" / split / "case118" / topology / condition / "raw"
+    for grid in eval_case_names(spec):
+        for _label, topology, condition in TEST_PARTS:
+            folders.append(("test", topology, condition, grid))
+    for item in folders:
+        if len(item) == 3:
+            split, topology, condition = item
+            grid = "case118"
+        else:
+            split, topology, condition, grid = item
+        raw = raw_dir(data_root, split, topology, condition, grid)
         count = scenario_count(raw)
-        key = f"{split}/{topology}/{condition}"
+        key = f"{split}/{topology}/{condition}" if grid == "case118" and spec.task_id != "3.1" else f"{split}/{grid}/{topology}/{condition}"
         if not spec.is_task11:
             report[key] = {"loaded": count}
             print(f"count {key}: {count}", flush=True)
@@ -3116,8 +3215,9 @@ def log_counts(data_root: Path, results: Path, spec: TaskSpec | None = None) -> 
     return report
 
 
-def raw_dir(data_root: Path, split: str, topology: str, condition: str) -> Path:
-    return data_root / "case118" / split / "case118" / topology / condition / "raw"
+def raw_dir(data_root: Path, split: str, topology: str, condition: str, grid: str = "case118") -> Path:
+    """PFΔ parquet folder. The dataset root case is always ``case118``; Task 3.1 tests other ``grid`` names."""
+    return data_root / "case118" / split / grid / topology / condition / "raw"
 
 
 def task_folders(data_root: Path, split: str) -> list[tuple[str, str]]:
@@ -3666,14 +3766,18 @@ def drive_dataset(drive: Path | None, spec: TaskSpec | None = None) -> Path | No
 
 def dataset_missing_files(data_root: Path, spec: TaskSpec) -> list[Path]:
     """Parquet files of ``spec``'s published train/valid/test folders that are absent under ``data_root``."""
-    folders = [("test", topology, condition) for _label, topology, condition in TEST_PARTS]
+    folders = [
+        ("test", topology, condition, grid)
+        for grid in eval_case_names(spec)
+        for _label, topology, condition in TEST_PARTS
+    ]
     for split in ("train", "valid"):
-        folders.extend((split, *folder) for folder in spec.folders)
+        folders.extend((split, *folder, "case118") for folder in spec.folders)
     return [
-        raw_dir(data_root, *folder) / name
-        for folder in folders
+        raw_dir(data_root, split, topology, condition, grid) / name
+        for split, topology, condition, grid in folders
         for name in PARQUET_FILES
-        if not (raw_dir(data_root, *folder) / name).is_file()
+        if not (raw_dir(data_root, split, topology, condition, grid) / name).is_file()
     ]
 
 
@@ -4337,6 +4441,94 @@ def iterate_indexes(
             yield network_id, index[start : start + batch_size]
 
 
+def pack_step_limits() -> tuple[int, int]:
+    """Max topologies and cases when packing same-type grids. Topology cap 1 disables packing."""
+
+    def bounded(name: str, default: int) -> int:
+        raw = os.environ.get(name, "").strip()
+        value = default if not raw else int(raw)
+        return max(1, value)
+
+    return (
+        bounded("GENCO_TPGT_PACK_TOPOLOGIES", PACK_MAX_TOPOLOGIES),
+        bounded("GENCO_TPGT_PACK_CASES", PACK_MAX_CASES),
+    )
+
+
+def pack_same_type_steps(
+    chunks: list[tuple[int, np.ndarray]],
+    networks: list[Network],
+    *,
+    max_topologies: int,
+    max_cases: int,
+) -> list[list[tuple[int, np.ndarray]]]:
+    """Group single-topology chunks that share ``network_type_key`` into one step.
+
+    Chunks are already in network-id order and at most one batch each. A chunk with ``max_cases``
+    or more cases is its own step (one topology, shared pair embedding). Smaller chunks pack with
+    the following same-type chunks until the topology cap or the case cap. A type change flushes,
+    so a step never mixes bus types. Consecutive chunks of one topology are concatenated.
+    """
+    if max_topologies <= 1:
+        return [[chunk] for chunk in chunks]
+    steps: list[list[tuple[int, np.ndarray]]] = []
+    pending: list[tuple[int, np.ndarray]] = []
+    pending_cases = 0
+    pending_key: bytes | None = None
+
+    def flush() -> None:
+        nonlocal pending_cases, pending_key
+        if pending:
+            steps.append(list(pending))
+            pending.clear()
+            pending_cases = 0
+            pending_key = None
+
+    for network_id, index in chunks:
+        count = int(len(index))
+        if count >= max_cases:
+            flush()
+            steps.append([(network_id, index)])
+            continue
+        if pending and network_id == pending[-1][0]:
+            if pending_cases + count <= max_cases:
+                last_id, last_index = pending[-1]
+                pending[-1] = (last_id, np.concatenate((last_index, index)))
+                pending_cases += count
+                continue
+            flush()
+        key = network_type_key(networks[network_id])
+        if pending and (
+            key != pending_key or len(pending) >= max_topologies or pending_cases + count > max_cases
+        ):
+            flush()
+        pending.append((network_id, index))
+        pending_cases += count
+        pending_key = key
+    flush()
+    return steps
+
+
+def plan_training_steps(
+    split: Split,
+    seed: int,
+    epoch: int,
+    batch_size: int | None = None,
+    *,
+    mix_topologies: bool,
+) -> list[list[tuple[int, np.ndarray]]]:
+    """One epoch of training steps: a global mix, or same-type packs (see ``mix_topologies``)."""
+    if batch_size is None:
+        batch_size = BATCH_SIZE
+    if mix_topologies:
+        return list(iterate_steps(split, seed, epoch, batch_size))
+    chunks = list(iterate_indexes(split, seed, epoch, shuffle=True, batch_size=batch_size))
+    max_topologies, max_cases = pack_step_limits()
+    return pack_same_type_steps(
+        chunks, split.networks, max_topologies=max_topologies, max_cases=max_cases
+    )
+
+
 def iterate_training_steps(
     split: Split,
     seed: int,
@@ -4345,14 +4537,10 @@ def iterate_training_steps(
     *,
     mix_topologies: bool,
 ):
-    """Training steps: global mixed shuffle or single-topology batches (see ``mix_topologies``)."""
-    if batch_size is None:
-        batch_size = BATCH_SIZE
-    if mix_topologies:
-        yield from iterate_steps(split, seed, epoch, batch_size)
-        return
-    for network_id, index in iterate_indexes(split, seed, epoch, shuffle=True, batch_size=batch_size):
-        yield [(network_id, index)]
+    """Training steps: global mixed shuffle or same-type packs (see ``mix_topologies``)."""
+    yield from plan_training_steps(
+        split, seed, epoch, batch_size, mix_topologies=mix_topologies
+    )
 
 
 def iterate_type_batches(split: Split, batch_size: int = EVAL_BATCH_SIZE, mix_patterns: bool = False):
@@ -4580,6 +4768,18 @@ def test_pbl_line(seed: int, epoch_number: int, scores: dict[str, float]) -> str
     )
 
 
+def format_duration(seconds: float) -> str:
+    """``45s``, ``12m03s``, or ``2h05m``."""
+    whole = max(0, int(seconds))
+    hours, rem = divmod(whole, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
 def train_epoch_loss_line(
     seed: int,
     epoch_number: int,
@@ -4773,11 +4973,19 @@ def train_seed(
             flush=True,
         )
     else:
-        print(
-            f"train steps: one topology per step ({len(train_split.networks)} topologies; "
-            f"set GENCO_TPGT_MIX_TOPOLOGIES=1 to mix and risk OOM on N-2)",
-            flush=True,
-        )
+        max_topologies, max_cases = pack_step_limits()
+        if max_topologies <= 1:
+            print(
+                f"train steps: one topology per step ({len(train_split.networks)} topologies)",
+                flush=True,
+            )
+        else:
+            print(
+                f"train steps: up to {max_topologies} same-type topologies and {max_cases} cases "
+                f"per step ({len(train_split.networks)} topologies; a chunk of {max_cases}+ cases "
+                f"stays one topology; GENCO_TPGT_PACK_TOPOLOGIES=1 forces one topology per step)",
+                flush=True,
+            )
     start_epoch = 0
     best_val = float("inf")
     wait = 0
@@ -4913,15 +5121,21 @@ def train_seed(
             clear_pair_embed_cache(val_networks)
             # Loss sums (total, state, physics, stages) stay on the device in float64 until printed.
             running = torch.zeros(3 + DEPTH, dtype=torch.float64, device=device)
+            steps = plan_training_steps(train_split, seed, epoch, mix_topologies=mix_topologies)
+            n_steps = len(steps)
+            packed_steps = sum(len(groups) > 1 for groups in steps)
+            pack_note = f", {packed_steps} multi-topology" if packed_steps else ""
+            print(
+                f"  seed {seed} epoch {epoch + 1}: {n_steps} steps ({train_split.count} cases{pack_note})",
+                flush=True,
+            )
             batches = 0
-            logged_first_batch = False
+            cases_seen = 0
             batch_durations: list[float] = []
             timer = StepTimer(device)
-            for step_groups in iterate_training_steps(
-                train_split, seed, epoch, mix_topologies=mix_topologies
-            ):
-                if not logged_first_batch:
-                    first_batch_started = time.perf_counter()
+            epoch_started = time.perf_counter()
+            last_progress = epoch_started
+            for step_groups in steps:
                 step_started = time.perf_counter()
                 with timer.phase("move"):
                     moved = [(train_networks[network_id], index) for network_id, index in step_groups]
@@ -4935,27 +5149,41 @@ def train_seed(
                     timer=timer,
                 )
                 del moved
-                if not logged_first_batch:
-                    if device.type == "cuda":
-                        torch.cuda.synchronize()
-                    elapsed = time.perf_counter() - first_batch_started
-                    cases = sum(len(index) for _network_id, index in step_groups)
-                    topologies = "" if len(step_groups) == 1 else f", {len(step_groups)} topologies"
-                    print(
-                        f"  seed {seed} epoch {epoch + 1} first batch ({cases} cases{topologies}) "
-                        f"forward+backward {elapsed:.2f}s",
-                        flush=True,
-                    )
-                    logged_first_batch = True
+                cases = sum(len(index) for _network_id, index in step_groups)
+                cases_seen += cases
                 batch_durations.append(time.perf_counter() - step_started)
                 timer.end_step(len(step_groups), batch_durations[-1])
                 losses = (breakdown.total, breakdown.state_mse, breakdown.physics_sum, *breakdown.physics_stages)
                 running += torch.stack([value.detach().to(device) for value in losses]).double()
                 batches += 1
+                now = time.perf_counter()
+                if (
+                    batches == 1
+                    or batches == n_steps
+                    or batches % PROGRESS_EVERY_STEPS == 0
+                    or now - last_progress >= PROGRESS_EVERY_SECONDS
+                ):
+                    timing = timer.summary("window")
+                    totals = running.detach().cpu().tolist()
+                    elapsed = time.perf_counter() - epoch_started
+                    eta = elapsed / batches * (n_steps - batches)
+                    topologies = "" if len(step_groups) == 1 else f", {len(step_groups)} topologies"
+                    print(
+                        f"  seed {seed} epoch {epoch + 1} step {batches}/{n_steps} "
+                        f"({cases} cases{topologies}; {cases_seen}/{train_split.count} done)  "
+                        f"state {totals[1] / batches:.4f}  train {totals[0] / batches:.4f}  "
+                        f"elapsed {format_duration(elapsed)}  ETA {format_duration(eta)}  {timing}",
+                        flush=True,
+                    )
+                    last_progress = time.perf_counter()
             running_total, running_state, running_phys, *running_phys_stages = running.tolist()
             epoch_timing = timer.summary("epoch")
             run_validation = val_every <= 1 or (epoch + 1) % val_every == 0 or (epoch + 1) == EPOCHS
             if run_validation:
+                print(
+                    f"  seed {seed} epoch {epoch + 1}: validating {val_split.count} cases",
+                    flush=True,
+                )
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 val_score = evaluate_pbl(
@@ -5044,14 +5272,14 @@ def record_seed(
     checkpoint: Path,
     epoch: int,
     spec: TaskSpec | None = None,
+    *,
+    source: str = "independent_training",
 ) -> None:
     spec = spec or TASKS["1.1"]
-    c2i_counts = {"C2I-N": counts["C2I-N"], "C2I-N-1": counts["C2I-N-1"], "C2I-N-2": counts["C2I-N-2"]}
-    scores = dict(scores)
-    scores["C2I"] = aggregate_c2i(scores, c2i_counts)
+    scores = attach_c2i(scores, counts, spec)
     columns = [*SEED_COLUMNS, "epoch"]
     rows = []
-    for category in (*CATEGORIES,):
+    for category in categories_for(spec.task_id):
         rows.append(
             {
                 "model": MODEL_NAME,
@@ -5060,7 +5288,7 @@ def record_seed(
                 "seed": str(seed),
                 "mean_pbl_pu": f"{scores[category]:.8g}",
                 "checkpoint_path": str(checkpoint),
-                "source": "independent_training",
+                "source": source,
                 "epoch": str(epoch),
             }
         )
@@ -5092,7 +5320,7 @@ def write_summary(results: Path, spec: TaskSpec | None = None) -> list[dict]:
     for (_seed, category), (_epoch_number, value) in latest.items():
         grouped.setdefault(category, []).append(value)
     summary = []
-    for category in CATEGORIES:
+    for category in categories_for(spec.task_id):
         values = grouped.get(category, [])
         if not values:
             continue
@@ -5113,18 +5341,19 @@ def write_summary(results: Path, spec: TaskSpec | None = None) -> list[dict]:
 
 def print_comparison(summary: list[dict], spec: TaskSpec | None = None) -> None:
     spec = spec or TASKS["1.1"]
+    categories = categories_for(spec.task_id)
     print(f"\nTask {spec.label} mean power-balance loss (per unit)", flush=True)
     print("PUBLISHED", flush=True)
     for model, scores in PUBLISHED.get(spec.task_id, {}).items():
-        parts = [f"{category} {scores[category][0]:.4g} ± {scores[category][1]:.4g}" for category in CATEGORIES]
+        parts = [f"{category} {scores[category][0]:.4g} ± {scores[category][1]:.4g}" for category in categories]
         print(f"  {model}: " + "; ".join(parts), flush=True)
     print("TPGT this run", flush=True)
     by_category = {row["test_category"]: row for row in summary}
-    if any(category not in by_category for category in CATEGORIES):
-        print("  TPGT has no finished four-category seed yet.", flush=True)
+    if any(category not in by_category for category in categories):
+        print("  TPGT has no finished reported-category seed yet.", flush=True)
         return
     parts = []
-    for category in CATEGORIES:
+    for category in categories:
         row = by_category[category]
         parts.append(
             f"{category} {float(row['mean_across_seeds']):.4g} ± {float(row['std_across_seeds']):.4g} (n={row['n_seeds']})"
@@ -5150,16 +5379,17 @@ def plot_comparison(
     3-epoch snapshot is kept next to that epoch's bus maps, not only the latest overwrite.
     """
     spec = spec or TASKS["1.1"]
+    categories = categories_for(spec.task_id)
     by_category = {row["test_category"]: row for row in summary}
-    if any(category not in by_category for category in CATEGORIES):
+    if any(category not in by_category for category in categories):
         return
-    if any(int(by_category[category]["n_seeds"]) < 1 for category in CATEGORIES):
+    if any(int(by_category[category]["n_seeds"]) < 1 for category in categories):
         return
     tpgt = {
         category: (float(by_category[category]["mean_across_seeds"]), float(by_category[category]["std_across_seeds"]))
-        for category in CATEGORIES
+        for category in categories
     }
-    seeds = min(int(by_category[category]["n_seeds"]) for category in CATEGORIES)
+    seeds = min(int(by_category[category]["n_seeds"]) for category in categories)
     output = comparison_figure_path(results, spec)
     written = plot_tpgt_comparison(
         spec.task_id, spec.label, tpgt, output, tpgt_label=f"TPGT (this run, {seeds} seed(s))"
@@ -5228,6 +5458,28 @@ def write_checkpoint_bus_maps(
         print(f"Bus error maps skipped for epoch {epoch_number}: {type(error).__name__}: {error}", flush=True)
 
 
+def score_key(grid: str, label: str, spec: TaskSpec) -> str:
+    """Test-score name. Task 3.1 prefixes the grid (``57 N``); other tasks keep ``N``."""
+    if spec.task_id != "3.1":
+        return label
+    short = {"case57": "57", "case118": "118", "case500": "500"}[grid]
+    return f"{short} {label}"
+
+
+def attach_c2i(scores: dict[str, float], counts: dict[str, int], spec: TaskSpec) -> dict[str, float]:
+    """Add the paper's single C2I number (mean of the three nose splits) per reported grid."""
+    scores = dict(scores)
+    if spec.task_id != "3.1":
+        part_counts = {key: counts[key] for key in ("C2I-N", "C2I-N-1", "C2I-N-2")}
+        scores["C2I"] = aggregate_c2i(scores, part_counts)
+        return scores
+    for grid in ("57", "118", "500"):
+        part = {f"C2I-{suffix}": scores[f"{grid} C2I-{suffix}"] for suffix in ("N", "N-1", "N-2")}
+        weight = {f"C2I-{suffix}": counts[f"{grid} C2I-{suffix}"] for suffix in ("N", "N-1", "N-2")}
+        scores[f"{grid} C2I"] = aggregate_c2i(part, weight)
+    return scores
+
+
 def test_model(
     model: TPGT,
     data_root: Path,
@@ -5236,26 +5488,35 @@ def test_model(
     persistent_cache: Path,
     eval_batch_size: int = EVAL_BATCH_SIZE,
     after_split: Callable[[str, Split, DeviceNetworks, dict[int, list[float]]], None] | None = None,
+    spec: TaskSpec | None = None,
 ) -> tuple[dict[str, float], dict[str, int]]:
+    spec = spec or TASKS["1.1"]
     scores = {}
     counts = {}
     model.eval()
-    for label, topology, condition in TEST_PARTS:
-        split = cached_split(
-            active_cache,
-            persistent_cache,
-            raw_dir(data_root, "test", topology, condition),
-            f"test_{topology}_{condition}",
-        )
-        networks = DeviceNetworks(split.networks, device)
-        per_network: dict[int, list[float]] = {}
-        scores[label] = evaluate_pbl(
-            model, split, networks, device, batch_size=eval_batch_size, per_network_out=per_network
-        )
-        counts[label] = split.count
-        print(f"test {label}: PBL {scores[label]:.6g} on {split.count} scenarios", flush=True)
-        if after_split is not None:
-            after_split(label, split, networks, per_network)
+    for grid in eval_case_names(spec):
+        for label, topology, condition in TEST_PARTS:
+            cache_name = (
+                f"test_{grid}_{topology}_{condition}"
+                if spec.task_id == "3.1"
+                else f"test_{topology}_{condition}"
+            )
+            split = cached_split(
+                active_cache,
+                persistent_cache,
+                raw_dir(data_root, "test", topology, condition, grid),
+                cache_name,
+            )
+            networks = DeviceNetworks(split.networks, device)
+            per_network: dict[int, list[float]] = {}
+            key = score_key(grid, label, spec)
+            scores[key] = evaluate_pbl(
+                model, split, networks, device, batch_size=eval_batch_size, per_network_out=per_network
+            )
+            counts[key] = split.count
+            print(f"test {key}: PBL {scores[key]:.6g} on {split.count} scenarios", flush=True)
+            if after_split is not None and grid == "case118":
+                after_split(label, split, networks, per_network)
     return scores, counts
 
 
@@ -5392,15 +5653,15 @@ def main() -> None:
                 persistent_cache,
                 eval_batch_size=EVAL_BATCH_SIZE,
                 after_split=after_test_split,
+                spec=spec,
             )
-            c2i_counts = {
-                "C2I-N": counts["C2I-N"],
-                "C2I-N-1": counts["C2I-N-1"],
-                "C2I-N-2": counts["C2I-N-2"],
-            }
-            reported = dict(scores)
-            reported["C2I"] = aggregate_c2i(reported, c2i_counts)
-            print(test_pbl_line(seed, epoch_number, reported), flush=True)
+            reported = attach_c2i(scores, counts, spec)
+            if spec.task_id == "3.1":
+                for grid in ("57", "118", "500"):
+                    subset = {category: reported[f"{grid} {category}"] for category in CATEGORIES}
+                    print(f"case {grid}  " + test_pbl_line(seed, epoch_number, subset), flush=True)
+            else:
+                print(test_pbl_line(seed, epoch_number, reported), flush=True)
             return scores, counts
 
         def publish_checkpoint(
@@ -5444,6 +5705,89 @@ def main() -> None:
             on_epoch_end=on_epoch_end,
             after_periodic_checkpoint=publish_checkpoint,
         )
+
+
+def cli_eval_only() -> None:
+    """Task 3.1 cross-grid test only: load trained IEEE-118 weights and score 57 / 118 / 500."""
+    global BATCH_SIZE, DATA_FRACTION, EVAL_BATCH_SIZE
+    ensure_runtime_packages()
+    apply_architecture_config()
+    DATA_FRACTION = parse_data_fraction()
+    BATCH_SIZE = parse_batch_size()
+    EVAL_BATCH_SIZE = parse_eval_batch_size()
+    spec = parse_task()
+    if spec.task_id != "3.1":
+        raise ValueError("--eval-only supports Task 3.1 only (use --task 3.1).")
+    drive = google_drive_root()
+    ckpt_root = parse_checkpoint_root(drive)
+    if ckpt_root is None or not ckpt_root.is_dir():
+        raise FileNotFoundError(f"Checkpoint root not found: {ckpt_root}")
+    outputs = drive_output_dirs(drive, spec)
+    work, legacy_results = legacy_locations(drive)
+    if outputs is not None:
+        checkpoints, results = outputs
+    else:
+        checkpoints = work / spec.run_dir_name
+        results = task_results_dir(checkpoints, legacy_results, spec)
+    results.mkdir(parents=True, exist_ok=True)
+    os.environ["GENCO_RESULTS_DIR"] = str(results)
+    from common import use_selected_results
+
+    use_selected_results()
+    print(f"PFΔ Task {spec.label}: eval-only (weights from {ckpt_root})", flush=True)
+    print(architecture_summary(), flush=True)
+    print(f"Eval batch {EVAL_BATCH_SIZE}; results {results}", flush=True)
+    data = ensure_dataset(work, drive, spec)
+    print(f"Dataset: {data}", flush=True)
+    log_counts(data, results, spec)
+    active_cache, persistent_cache = split_cache_dirs(checkpoints, spec)
+    if persistent_cache != active_cache:
+        sync_split_cache_from_drive(persistent_cache, active_cache)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}", flush=True)
+    configure_cuda_training(device)
+    any_seed = False
+    for seed in SEEDS:
+        seed_dir = ckpt_root / f"seed_{seed}"
+        picked = eval_checkpoint_payload(seed_dir, device)
+        if picked is None:
+            print(f"Seed {seed}: no compatible last.pt under {seed_dir}, skipping.", flush=True)
+            continue
+        state, epoch, ckpt_path = picked
+        model = TPGT().to(device)
+        model.load_state_dict(state, strict=True)
+        model.eval()
+        print(f"Seed {seed}: loaded epoch {epoch} from {ckpt_path}", flush=True)
+        scores, counts = test_model(
+            model,
+            data,
+            device,
+            active_cache,
+            persistent_cache,
+            eval_batch_size=EVAL_BATCH_SIZE,
+            spec=spec,
+        )
+        reported = attach_c2i(scores, counts, spec)
+        for grid in ("57", "118", "500"):
+            subset = {category: reported[f"{grid} {category}"] for category in CATEGORIES}
+            print(f"case {grid}  " + test_pbl_line(seed, epoch, subset), flush=True)
+        record_seed(
+            results,
+            seed,
+            scores,
+            counts,
+            ckpt_path,
+            epoch,
+            spec,
+            source="cross_grid_eval",
+        )
+        any_seed = True
+    if not any_seed:
+        raise RuntimeError(f"No seeds evaluated under {ckpt_root}.")
+    summary = write_summary(results, spec)
+    print_comparison(summary, spec)
+    plot_comparison(results, summary, spec)
+    print(f"Done. Tables and figure under {results}", flush=True)
 
 
 def cli_diagnose(
@@ -5624,5 +5968,7 @@ if __name__ == "__main__":
 
         test_batched_messages_match_reference()
         print("test_tpgt_attention OK", flush=True)
+    elif wants_eval_only():
+        cli_eval_only()
     else:
         main()
