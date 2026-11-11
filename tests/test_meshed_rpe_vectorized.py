@@ -11,7 +11,12 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from train_tpgt_task11 import RPE_DIM, _effective_impedance_matrix, meshed_rpe  # noqa: E402
+from train_tpgt_task11 import (  # noqa: E402
+    RPE_DIM,
+    _effective_impedance_matrix,
+    global_zeff_rpe_scales,
+    meshed_rpe,
+)
 
 
 def loop_meshed_rpe(
@@ -113,6 +118,34 @@ def random_grid(seed: int, buses: int, *, outages: int, isolated: int) -> tuple[
         ybus[origin, origin] += y
         ybus[destination, destination] += y
     return branches, ybus
+
+
+def test_global_scales_preserve_relative_impedance_across_two_topologies():
+    """Separate per-topology max normalizes both edges to 1; global max keeps ratio."""
+    branches_a = [(0, 1, 1.0, 2.0)]
+    branches_b = [(0, 1, 10.0, 50.0)]
+    s_r, s_x = global_zeff_rpe_scales([branches_a, branches_b], bus_count=2)
+    feat_a, _ = meshed_rpe(2, branches_a, np.zeros((2, 2)), re_scale=s_r, im_scale=s_x)
+    feat_b, _ = meshed_rpe(2, branches_b, np.zeros((2, 2)), re_scale=s_r, im_scale=s_x)
+    per_a, _ = meshed_rpe(2, branches_a, np.zeros((2, 2)))
+    per_b, _ = meshed_rpe(2, branches_b, np.zeros((2, 2)))
+    assert np.allclose(per_a[0, 1], [1.0, 1.0], atol=1e-5)
+    assert np.allclose(per_b[0, 1], [1.0, 1.0], atol=1e-5)
+    assert not np.allclose(feat_a[0, 1], feat_b[0, 1], atol=1e-3)
+    assert feat_a[0, 1, 0] < feat_b[0, 1, 0]
+    assert feat_a[0, 1, 1] < feat_b[0, 1, 1]
+
+
+def test_single_line_zeff_equals_branch_impedance():
+    """Two-bus one line: Z_eff(0,1) must equal r+jx (not negated Y_bus Laplacian)."""
+    branches = [(0, 1, 1.0, 2.0)]
+    z_expected = 1.0 + 2.0j
+    features, _ = meshed_rpe(2, branches, np.zeros((2, 2), dtype=np.complex64))
+    y = 1.0 / z_expected
+    lap = np.array([[y, -y], [-y, y]], dtype=np.complex128)
+    z_eff = _effective_impedance_matrix(lap)[0, 1]
+    assert np.allclose(z_eff, z_expected, atol=1e-5)
+    assert np.allclose(features[0, 1], [1.0, 1.0], atol=1e-5)
 
 
 def test_parallel_lines_complex_zeff_toy():

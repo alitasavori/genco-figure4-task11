@@ -77,11 +77,12 @@ Performance notes (Colab / large train split)
   0.5 MB each on case118; otherwise an LRU of that size. The decision is logged at seed start.
 * **Optional**: ``GENCO_TPGT_VAL_EVERY=3`` or ``--val-every 3`` skips most
   validation passes (faster; coarser early stopping).
-* **LR / grads**: Adam at ``LEARNING_RATE`` with **cosine decay** to
-  ``LEARNING_RATE * LR_COSINE_MIN_RATIO`` over ``EPOCHS`` (updates get smaller
-  through training) plus ``GRAD_CLIP_NORM`` on every optimizer step (caps loss
-  spikes). Early stopping still uses validation PBL patience. The epoch line
-  shows ``lr``; scheduler state is checkpointed.
+* **LR / grads**: Adam at ``LEARNING_RATE`` with a **cosine ceiling** over
+  ``EPOCHS`` (lr is never above the cosine curve) and **ReduceLROnPlateau** on
+  ``val_pbl`` when validation runs (halve lr after ``LR_PLATEAU_PATIENCE``
+  checks without improvement; disable with ``GENCO_TPGT_LR_PLATEAU=0``).
+  ``GRAD_CLIP_NORM`` on every optimizer step. Early stopping uses separate val
+  patience. The epoch line shows ``lr``; scheduler state is checkpointed.
 * **Debug (on by default)**: every validation pass also scores a fixed training
   subset (``train_pbl`` and ``gap`` in the epoch line). On checkpoint epochs the
   run prints the forward report, RPE zero-ablation, RPE and residual correctness
@@ -139,6 +140,9 @@ BATCH_SIZE = 32
 # Grad clip caps single-batch explosions (epoch-7 style spikes). Early stop still on val PBL.
 LEARNING_RATE = 5e-4
 LR_COSINE_MIN_RATIO = 0.05  # final lr = LEARNING_RATE * this (2.5e-5 at defaults)
+LR_PLATEAU_PATIENCE = 5  # validation passes without val_pbl improvement before halving lr
+LR_PLATEAU_FACTOR = 0.5
+LR_PLATEAU_THRESHOLD = 1e-6  # min val_pbl improvement to reset plateau patience
 GRAD_CLIP_NORM = 1.0  # 0 disables; clip after GradScaler.unscale_
 EARLY_STOP_PATIENCE = 100
 EPOCHS = 100
@@ -154,7 +158,7 @@ LAMBDA_PHYS = 0.15
 PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
-CACHE_VERSION = "tpgt-cache-7"
+CACHE_VERSION = "tpgt-cache-9"
 RPE_FEATURE_NAMES = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_DIM = len(RPE_FEATURE_NAMES)
 # Per optimizer step, each RPE channel is zeroed (whole 118x118 plane, no rescaling) with this
@@ -744,8 +748,13 @@ def node_encoder_features(
     layout: TypeLayout,
     shunt_b: torch.Tensor,
 ) -> torch.Tensor:
-    """``(P, Q, V, θ, B_s)`` per bus: unknowns zeroed; ``B_s`` = bus shunt device only (parquet ``BS``)."""
-    power_p, power_q, voltage, angle = assemble(specified, torch.zeros_like(specified), layout)
+    """``(P, Q, V, θ, B_s)`` per bus for type encoders.
+
+    Unknown slots use the same ``flat_start`` as the physics iterate (PQ ``V=1`` pu, other
+  free variables 0) so attention does not see ``V=0`` on PQ while ``nodal_residual`` starts at 1 pu.
+    ``B_s`` is bus shunt device only (parquet ``BS``).
+    """
+    power_p, power_q, voltage, angle = assemble(specified, flat_start(specified, layout), layout)
     bs = shunt_b.to(device=specified.device, dtype=specified.dtype)
     if bs.dim() == 1:
         bs = bs.unsqueeze(0).expand(specified.shape[0], -1)
@@ -1036,6 +1045,34 @@ def state_rmse_by_type(
     return out
 
 
+def state_mae_by_type(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    types: torch.Tensor | TypeLayout,
+) -> dict[str, float]:
+    """Mean absolute error on unknown slots (same packing as pack_case)."""
+    layout = type_layout(types)
+    error = wrap_angle_errors((prediction - target).clone(), layout)
+    out: dict[str, float] = {}
+    labels = (
+        ("PQ_V", 0, 0),
+        ("PQ_theta", 0, 1),
+        ("PV_Q", 1, 0),
+        ("PV_theta", 1, 1),
+        ("slack_P", 2, 0),
+        ("slack_Q", 2, 1),
+    )
+    for name, type_id, slot in labels:
+        if not layout.present[type_id]:
+            continue
+        if layout.per_case:
+            diff = error[..., slot][layout.masks[type_id]]
+        else:
+            diff = error[:, layout.index[type_id], slot]
+        out[name] = float(torch.mean(diff.abs()))
+    return out
+
+
 def summarize_rpe(rpe: torch.Tensor) -> list[dict[str, float]]:
     """Per-channel stats; separate diagonal and off-diagonal pairs."""
     values = rpe.detach().cpu().numpy()
@@ -1199,6 +1236,7 @@ class ForwardDiagnostics:
     model_pbl: dict[str, float]
     stage_pbl: list[dict[str, float]]
     state_rmse: dict[str, float]
+    state_mae: dict[str, float]
     train_state_mse: float
     train_phys_stages: tuple[float, ...]
     pair_embed: dict[str, float]
@@ -1363,23 +1401,32 @@ def collect_bottleneck_diagnostics(
                 }
             )
 
+    error = wrap_angle_errors((prediction - target).clone(), layout)
+    per_bus_abs_v = error[..., 0].abs().mean(dim=0).detach().cpu().numpy()
+    per_bus_abs_theta = error[..., 1].abs().mean(dim=0).detach().cpu().numpy()
+
     order = np.argsort(-mean_bus)[: min(top_k, mean_bus.size)]
     worst: list[dict[str, float | int | str]] = []
     for bus in order:
         type_id = int(types_np[bus])
-        worst.append(
-            {
-                "bus_1based": int(bus) + 1,
-                "type": TYPE_NAMES[type_id] if 0 <= type_id < len(TYPE_NAMES) else str(type_id),
-                "mean_pbl": float(mean_bus[bus]),
-                "mean_|dP|": float(abs_dp[bus]),
-                "mean_|dQ|": float(abs_dq[bus]),
-                "|Yii|": float(y_abs_diag[bus]),
-                "hops_to_slack": float(hops[bus]) if np.isfinite(hops[bus]) else -1.0,
-            }
-        )
-
-    error = wrap_angle_errors((prediction - target).clone(), layout)
+        row: dict[str, float | int | str] = {
+            "bus_1based": int(bus) + 1,
+            "type": TYPE_NAMES[type_id] if 0 <= type_id < len(TYPE_NAMES) else str(type_id),
+            "mean_pbl": float(mean_bus[bus]),
+            "mean_|dP|": float(abs_dp[bus]),
+            "mean_|dQ|": float(abs_dq[bus]),
+            "|Yii|": float(y_abs_diag[bus]),
+            "hops_to_slack": float(hops[bus]) if np.isfinite(hops[bus]) else -1.0,
+        }
+        if type_id == 0:
+            row["mae_V_pu"] = float(per_bus_abs_v[bus])
+            row["mae_theta_rad"] = float(per_bus_abs_theta[bus])
+        elif type_id == 1:
+            row["mae_theta_rad"] = float(per_bus_abs_theta[bus])
+        else:
+            row["mae_P_pu"] = float(per_bus_abs_v[bus])
+            row["mae_Q_pu"] = float(per_bus_abs_theta[bus])
+        worst.append(row)
     angle_bus_mask = (types_np == 0) | (types_np == 1)
     if layout.per_case:
         pq_mask, pv_mask, _slack_mask, angle_mask = layout.masks
@@ -1470,6 +1517,7 @@ def collect_forward_diagnostics(
         stage_pbl = [pbl_stats(r) for r in residuals]
         model_pbl = stage_pbl[-1] if stage_pbl else pbl_from_unknown(specified, prediction, types, ybus)
         state_rmse = state_rmse_by_type(prediction, target, types)
+        state_mae = state_mae_by_type(prediction, target, types)
         ybus_abs = float(torch.abs(ybus).mean())
         final_residual = residuals[-1] if residuals else nodal_residual(specified, prediction, types, ybus)
         bottleneck = collect_bottleneck_diagnostics(
@@ -1481,6 +1529,7 @@ def collect_forward_diagnostics(
         model_pbl=model_pbl,
         stage_pbl=stage_pbl,
         state_rmse=state_rmse,
+        state_mae=state_mae,
         train_state_mse=float(breakdown.state_mse),
         train_phys_stages=tuple(float(v) for v in breakdown.physics_stages),
         pair_embed=summarize_pair_embed(pair),
@@ -1558,12 +1607,19 @@ def format_bottleneck_diagnostics(bottleneck: BottleneckDiagnostics) -> str:
                 f"mean {row['mean_pbl']:.4g}  share {row['share']:.1%}"
             )
     if bottleneck.worst_buses:
-        lines.append("  Worst buses (1-based):")
+        lines.append("  Worst buses (1-based bus index; same as PFΔ bus column + 1):")
         for row in bottleneck.worst_buses:
+            state = ""
+            if "mae_V_pu" in row:
+                state = f"  |dV| {row['mae_V_pu']:.4g} pu  |dθ| {row['mae_theta_rad']:.4g} rad"
+            elif "mae_theta_rad" in row:
+                state = f"  |dθ| {row['mae_theta_rad']:.4g} rad  (V specified)"
+            elif "mae_P_pu" in row:
+                state = f"  |dP|state {row['mae_P_pu']:.4g} pu  |dQ|state {row['mae_Q_pu']:.4g} pu"
             lines.append(
                 f"    bus {row['bus_1based']:3d} ({row['type']:5s}) PBL {row['mean_pbl']:.4g}  "
                 f"|dP| {row['mean_|dP|']:.4g} |dQ| {row['mean_|dQ|']:.4g}  "
-                f"|Yii| {row['|Yii|']:.4g}  hops {row['hops_to_slack']}"
+                f"|Yii| {row['|Yii|']:.4g}  hops {row['hops_to_slack']}{state}"
             )
     lines.append(
         "  Recipe toward GENCO early: (1) DATA_FRACTION=1.0 (0.1 cannot match full-data GENCO), "
@@ -1601,6 +1657,11 @@ def format_forward_diagnostics(
     lines.append(
         "State RMSE vs labels (pu or rad): "
         + "  ".join(f"{key} {value:.6g}" for key, value in sorted(rmse.items()))
+    )
+    mae = diagnostics.state_mae
+    lines.append(
+        "State MAE vs labels (pu or rad): "
+        + "  ".join(f"{key} {value:.6g}" for key, value in sorted(mae.items()))
     )
     pe = diagnostics.pair_embed
     lines.append(f"Pair embed |e_ij|: mean {pe['mean_norm']:.6g} max {pe['max_norm']:.6g}")
@@ -1948,6 +2009,9 @@ class Network:
     branches: tuple[tuple[int, int, float, float], ...] | None = field(default=None, repr=False)
     # Bus shunt susceptance from parquet ``BS`` (p.u.); device-only, not line charging.
     shunt_b: torch.Tensor | None = field(default=None, repr=False)
+    # Global Zeff normalizers used when building ``rpe`` (shared across topologies in a split).
+    rpe_re_scale: float | None = field(default=None, repr=False)
+    rpe_im_scale: float | None = field(default=None, repr=False)
     type_key: bytes | None = field(default=None, repr=False, compare=False)
     layout: TypeLayout | None = field(default=None, repr=False, compare=False)
 
@@ -1993,24 +2057,11 @@ def _effective_impedance_matrix(laplacian: np.ndarray) -> np.ndarray:
     return (diagonal[:, None] + diagonal[None, :]) - 2.0 * pseudoinverse
 
 
-def meshed_rpe(
+def _meshed_zeff_and_component(
     bus_count: int,
     branches: list[tuple[int, int, float, float]],
-    ybus: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Two pair features: normalized Re/Im of complex effective impedance (Method B).
-
-    Branch admittance ``y_ij = 1/(r_ij + j x_ij)``; parallel branches add. Complex
-    Laplacian ``L = diag(Y 1) - Y`` with ``Y_ij = y_ij``. Then
-    ``Z_eff(i,j) = L^†_ii + L^†_jj - 2 L^†_ij``,
-    ``Zeff_Re_norm = Re(Z_eff)/s_R``, ``Zeff_Im_norm = Im(Z_eff)/s_X`` with per-component
-    ``s_R = max_{p≠q}|Re(Z_eff)|``, ``s_X = max_{p≠q}|Im(Z_eff)|``.
-    ``ybus`` is unused (residual still uses full scenario Ybus).
-
-    Components are numbered in order of their lowest bus index; buses with no
-    in-service branch form singleton components with zero features.
-    """
-    del ybus
+    """Complex ``Z_eff`` and per-bus component ids from in-service branches only."""
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import connected_components
 
@@ -2037,8 +2088,6 @@ def meshed_rpe(
     component = rank[inverse.reshape(-1)].astype(np.int64)
     component_id = int(first_bus.size)
 
-    re_scale = np.ones(component_id, dtype=np.float64)
-    im_scale = np.ones(component_id, dtype=np.float64)
     z_eff = np.zeros((bus_count, bus_count), dtype=np.complex128)
     for comp in range(component_id):
         buses = np.flatnonzero(component == comp)
@@ -2048,26 +2097,180 @@ def meshed_rpe(
         sub_laplacian = np.diag(np.sum(sub_y, axis=1)) - sub_y
         block = _effective_impedance_matrix(sub_laplacian)
         z_eff[np.ix_(buses, buses)] = block
-        off = block.copy()
-        np.fill_diagonal(off, 0.0)
-        max_re = float(np.max(np.abs(off.real))) if off.size else 0.0
-        max_im = float(np.max(np.abs(off.imag))) if off.size else 0.0
-        re_scale[comp] = max_re if max_re > 0 else 1.0
-        im_scale[comp] = max_im if max_im > 0 else 1.0
+
+    if np.max(np.abs(z_eff - z_eff.T)) > 1e-4:
+        raise RuntimeError("Complex effective impedance is not symmetric.")
+    return z_eff, component
+
+
+def meshed_zeff_peak_abs(
+    z_eff: np.ndarray,
+    component: np.ndarray,
+    bus_count: int,
+) -> tuple[float, float]:
+    """Max |Re| and |Im| over same-component off-diagonal ``Z_eff`` entries."""
+    same = component[:, None] == component[None, :]
+    off_diagonal = same & ~np.eye(bus_count, dtype=bool)
+    if not np.any(off_diagonal):
+        return 1.0, 1.0
+    max_re = float(np.max(np.abs(z_eff.real[off_diagonal])))
+    max_im = float(np.max(np.abs(z_eff.imag[off_diagonal])))
+    return max(max_re, 1e-30), max(max_im, 1e-30)
+
+
+def global_zeff_rpe_scales(
+    branch_lists: list[list[tuple[int, int, float, float]]],
+    bus_count: int = 118,
+) -> tuple[float, float]:
+    """``s_R``, ``s_X`` = max off-diagonal |Re| and |Im| of ``Z_eff`` over every topology."""
+    max_re = 0.0
+    max_im = 0.0
+    for branches in branch_lists:
+        if not branches:
+            continue
+        z_eff, component = _meshed_zeff_and_component(bus_count, branches)
+        peak_re, peak_im = meshed_zeff_peak_abs(z_eff, component, bus_count)
+        max_re = max(max_re, peak_re)
+        max_im = max(max_im, peak_im)
+    return (max(max_re, 1.0), max(max_im, 1.0))
+
+
+def meshed_rpe(
+    bus_count: int,
+    branches: list[tuple[int, int, float, float]],
+    ybus: np.ndarray,
+    *,
+    re_scale: float | None = None,
+    im_scale: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Two pair features: normalized Re/Im of complex effective impedance (Method B).
+
+    Branch admittance ``y_ij = 1/(r_ij + j x_ij)`` on **off-diagonals only** (parallel
+    branches add); diagonal entries stay zero until the Laplacian step. This is a
+    weighted adjacency ``W``, not the assembled bus ``Y_bus`` (whose rows sum to zero).
+    Complex Laplacian ``L = diag(W 1) - W``. Then
+    ``Z_eff(i,j) = L^†_ii + L^†_jj - 2 L^†_ij``.
+
+    Normalization: if ``re_scale`` / ``im_scale`` are given, divide all channels by
+    those **global** positive scalars (same across topologies in a split). If omitted,
+    use legacy per-connected-component maxima (tests only).
+
+    ``ybus`` is unused (residual still uses full scenario Ybus).
+    """
+    del ybus
+    z_eff, component = _meshed_zeff_and_component(bus_count, branches)
+    component_id = int(component.max()) + 1 if component.size else 0
+
+    if re_scale is None or im_scale is None:
+        re_per = np.ones(component_id, dtype=np.float64)
+        im_per = np.ones(component_id, dtype=np.float64)
+        for comp in range(component_id):
+            buses = np.flatnonzero(component == comp)
+            if buses.size <= 1:
+                continue
+            block = z_eff[np.ix_(buses, buses)]
+            off = block.copy()
+            np.fill_diagonal(off, 0.0)
+            max_re = float(np.max(np.abs(off.real))) if off.size else 0.0
+            max_im = float(np.max(np.abs(off.imag))) if off.size else 0.0
+            re_per[comp] = max_re if max_re > 0 else 1.0
+            im_per[comp] = max_im if max_im > 0 else 1.0
+        re_div = re_per[component][:, None]
+        im_div = im_per[component][:, None]
+    else:
+        re_div = float(re_scale)
+        im_div = float(im_scale)
 
     same = component[:, None] == component[None, :]
     off_diagonal = same & ~np.eye(bus_count, dtype=bool)
     features = np.zeros((bus_count, bus_count, RPE_DIM), dtype=np.float32)
-    re = np.where(off_diagonal, z_eff.real / re_scale[component][:, None], 0.0)
-    im = np.where(off_diagonal, z_eff.imag / im_scale[component][:, None], 0.0)
+    re = np.where(off_diagonal, z_eff.real / re_div, 0.0)
+    im = np.where(off_diagonal, z_eff.imag / im_div, 0.0)
     features[..., 0] = re.astype(np.float32)
     features[..., 1] = im.astype(np.float32)
 
-    if np.max(np.abs(z_eff - z_eff.T)) > 1e-4:
-        raise RuntimeError("Complex effective impedance is not symmetric.")
     if not np.isfinite(features).all():
         raise RuntimeError("Meshed RPE contains non-finite values.")
     return features, component
+
+
+RPE_SCALES_FILE = "rpe_global_scales.json"
+
+
+def rpe_scales_path(persistent: Path) -> Path:
+    return persistent / RPE_SCALES_FILE
+
+
+def save_rpe_global_scales(persistent: Path, re_scale: float, im_scale: float) -> None:
+    """Persist train-fit ``s_R,s_X`` for valid/test cache builds (Drive ``checkpoints/cache``)."""
+    persistent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": CACHE_VERSION,
+        "checkpoint_version": CHECKPOINT_VERSION,
+        "rpe_re_scale": re_scale,
+        "rpe_im_scale": im_scale,
+    }
+    rpe_scales_path(persistent).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_rpe_global_scales(persistent: Path) -> tuple[float, float] | None:
+    path = rpe_scales_path(persistent)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("version") != CACHE_VERSION or payload.get("checkpoint_version") != CHECKPOINT_VERSION:
+        return None
+    return float(payload["rpe_re_scale"]), float(payload["rpe_im_scale"])
+
+
+def split_rpe_scales(split: Split) -> tuple[float, float]:
+    for network in split.networks:
+        if network.rpe_re_scale is not None and network.rpe_im_scale is not None:
+            return network.rpe_re_scale, network.rpe_im_scale
+    branch_lists = [list(network.branches) for network in split.networks if network.branches]
+    return global_zeff_rpe_scales(branch_lists)
+
+
+def unify_network_rpe(
+    networks: list[Network],
+    rpe_scales: tuple[float, float] | None = None,
+) -> tuple[float, float]:
+    """Recompute ``rpe`` on each network with shared ``s_R``, ``s_X`` (train scales or fit from ``networks``)."""
+    if rpe_scales is not None:
+        global_re, global_im = rpe_scales
+    else:
+        branch_lists = [list(network.branches) for network in networks if network.branches]
+        if not branch_lists:
+            return 1.0, 1.0
+        global_re, global_im = global_zeff_rpe_scales(branch_lists)
+    for network in networks:
+        if network.branches is None:
+            continue
+        ybus = network.ybus.detach().cpu().numpy()
+        features, component = meshed_rpe(
+            118,
+            list(network.branches),
+            ybus,
+            re_scale=global_re,
+            im_scale=global_im,
+        )
+        network.rpe = torch.from_numpy(features)
+        network.component = torch.from_numpy(component.astype(np.int64))
+        network.rpe_re_scale = global_re
+        network.rpe_im_scale = global_im
+        network.pair_embed = None
+    return global_re, global_im
+
+
+def unify_rpe_normalization(
+    split: Split,
+    rpe_scales: tuple[float, float] | None = None,
+) -> tuple[float, float]:
+    """Same as ``unify_network_rpe`` over ``split.networks``."""
+    return unify_network_rpe(split.networks, rpe_scales)
 
 
 @dataclass
@@ -2124,7 +2327,15 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
     if getattr(network, "branches", None) is not None:
         branches = network.branches
         assert branches is not None
-        expected, expected_component = meshed_rpe(bus_count, list(branches), ybus)
+        re_s = getattr(network, "rpe_re_scale", None)
+        im_s = getattr(network, "rpe_im_scale", None)
+        expected, expected_component = meshed_rpe(
+            bus_count,
+            list(branches),
+            ybus,
+            re_scale=re_s,
+            im_scale=im_s,
+        )
         max_diff = float(np.max(np.abs(expected - rpe)))
         recompute_ok = max_diff <= recompute_atol and np.array_equal(expected_component, component)
         checks.append(
@@ -2356,7 +2567,11 @@ def network_key(network: Network) -> tuple[bytes, bytes]:
 NETWORK_SCAN_LIMIT = 64
 
 
-def merge_many(splits: list[Split], name: str | None = None) -> Split:
+def merge_many(
+    splits: list[Split],
+    name: str | None = None,
+    rpe_scales: tuple[float, float] | None = None,
+) -> Split:
     """Concatenate ``splits`` in order; later topologies reuse a matching earlier ``Network``.
 
     The first split's networks are kept as they are, so its network ids do not change.
@@ -2380,6 +2595,7 @@ def merge_many(splits: list[Split], name: str | None = None) -> Split:
         by_key.setdefault(key, []).append(len(merged_networks) - 1)
         return len(merged_networks) - 1
 
+    unify_network_rpe(merged_networks, rpe_scales)
     mapped_index = []
     for position, split in enumerate(splits):
         network_map = np.array([place(network, position > 0) for network in split.networks], dtype=np.int64)
@@ -2511,6 +2727,7 @@ def read_split(
     *,
     prefix_end: int | None = None,
     prefix_start: int = 0,
+    rpe_scales: tuple[float, float] | None = None,
 ) -> Split:
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
@@ -2628,6 +2845,7 @@ def read_split(
             reactance,
             branch_count,
             shunt_b,
+            rpe_scales=rpe_scales,
         )
     return Split(
         name=name,
@@ -2663,8 +2881,9 @@ def _representative_networks(
     reactance: np.ndarray,
     branch_count: int,
     shunt_b: np.ndarray,
+    rpe_scales: tuple[float, float] | None = None,
 ) -> list[Network]:
-    networks: list[Network] = []
+    rep_specs: list[tuple[int, np.ndarray, list[tuple[int, int, float, float]], np.ndarray]] = []
     for local in representatives:
         types = type_code[local].astype(np.int64)
         if int(np.sum(types == 2)) != 1:
@@ -2685,9 +2904,26 @@ def _representative_networks(
                     float(reactance[local, branch_id]),
                 )
             )
-        features, component = meshed_rpe(118, branches, ybus)
-        if len(networks) == 0:
-            print(f"  meshed_rpe computed once for {name} topology (not per scenario)", flush=True)
+        rep_specs.append((local, types, branches, ybus))
+
+    if rpe_scales is not None:
+        global_re, global_im = rpe_scales
+        print(
+            f"  Zeff RPE uses train scales s_R={global_re:.6g} s_X={global_im:.6g} "
+            f"({len(rep_specs)} topology(ies) in {name})",
+            flush=True,
+        )
+    else:
+        global_re, global_im = global_zeff_rpe_scales([branches for _local, _types, branches, _ybus in rep_specs])
+        print(
+            f"  global Zeff RPE scales (train-fit): s_R={global_re:.6g} s_X={global_im:.6g} "
+            f"over {len(rep_specs)} topology(ies) ({name}); meshed_rpe once per topology (not per scenario)",
+            flush=True,
+        )
+
+    networks: list[Network] = []
+    for local, types, branches, ybus in rep_specs:
+        features, component = meshed_rpe(118, branches, ybus, re_scale=global_re, im_scale=global_im)
         networks.append(
             Network(
                 ybus=torch.from_numpy(ybus),
@@ -2696,6 +2932,8 @@ def _representative_networks(
                 types=torch.from_numpy(types),
                 branches=tuple(branches),
                 shunt_b=torch.from_numpy(np.asarray(shunt_b[local], dtype=np.float32)),
+                rpe_re_scale=global_re,
+                rpe_im_scale=global_im,
             )
         )
     return networks
@@ -2816,6 +3054,7 @@ def cached_split(
     limit: int | None = None,
     *,
     compact: bool = False,
+    rpe_scales: tuple[float, float] | None = None,
 ) -> Split:
     """Load ``name`` from the split cache or build it from parquet.
 
@@ -2863,6 +3102,12 @@ def cached_split(
                     f"  extended {name} split in {time.perf_counter() - build_started:.1f}s",
                     flush=True,
                 )
+                if name.startswith("train"):
+                    unify_rpe_normalization(split)
+                    re_scale, im_scale = split_rpe_scales(split)
+                    save_rpe_global_scales(persistent, re_scale, im_scale)
+                    stamp["rpe_re_scale"] = re_scale
+                    stamp["rpe_im_scale"] = im_scale
                 _compact_if(split, name, compact)
                 torch.save(split, tensor_path)
                 stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
@@ -2875,10 +3120,23 @@ def cached_split(
             )
     active.mkdir(parents=True, exist_ok=True)
     build_started = time.perf_counter()
-    split = read_split(raw, name, prefix_end=limit)
+    is_train = name.startswith("train")
+    if is_train:
+        scales_for_read: tuple[float, float] | None = None
+    else:
+        scales_for_read = rpe_scales if rpe_scales is not None else load_rpe_global_scales(persistent)
+        if scales_for_read is None:
+            raise RuntimeError(
+                f"Missing train RPE scales for {name}; build the train split cache first "
+                f"(expected {rpe_scales_path(persistent)})."
+            )
+    split = read_split(raw, name, prefix_end=limit, rpe_scales=scales_for_read)
     print(f"  built {name} split from parquet in {time.perf_counter() - build_started:.1f}s", flush=True)
     _compact_if(split, name, compact)
     save_started = time.perf_counter()
+    re_scale, im_scale = split_rpe_scales(split)
+    stamp["rpe_re_scale"] = re_scale
+    stamp["rpe_im_scale"] = im_scale
     torch.save(split, tensor_path)
     stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
     print(f"  saved {name} cache in {time.perf_counter() - save_started:.1f}s", flush=True)
@@ -2890,11 +3148,13 @@ def load_task_split(data_root: Path, split_name: str, active: Path, persistent: 
     """Union of every ``split_name`` folder of the task (each cached on its own, DATA_FRACTION per folder).
 
     A task with a single folder (Task 1.1) returns that folder's split unchanged.
+   Train splits fit ``s_R,s_X`` and write ``rpe_global_scales.json``; valid/test reuse those scales.
     """
     folders = task_folders(data_root, split_name)
     if not folders:
         raise FileNotFoundError(f"No {split_name} folders under {data_root / 'case118' / split_name}")
     multi = len(folders) > 1
+    train_scales = load_rpe_global_scales(persistent) if split_name != "train" else None
     parts = [
         cached_split(
             active,
@@ -2902,6 +3162,7 @@ def load_task_split(data_root: Path, split_name: str, active: Path, persistent: 
             raw_dir(data_root, split_name, topology, condition),
             f"{split_name}_{topology}_{condition}",
             compact=multi,
+            rpe_scales=train_scales,
         )
         for topology, condition in folders
     ]
@@ -2910,15 +3171,33 @@ def load_task_split(data_root: Path, split_name: str, active: Path, persistent: 
         flush=True,
     )
     if not multi:
-        return parts[0]
-    merge_started = time.perf_counter()
-    merged = merge_many(parts, name=split_name)
-    print(
-        f"{split_name}: merged {len(parts)} folders into {merged.count} cases, {len(merged.networks)} topologies "
-        f"in {time.perf_counter() - merge_started:.1f}s",
-        flush=True,
-    )
-    return merged
+        split = parts[0]
+    else:
+        merge_started = time.perf_counter()
+        split = merge_many(
+            parts,
+            name=split_name,
+            rpe_scales=None if split_name == "train" else train_scales,
+        )
+        print(
+            f"{split_name}: merged {len(parts)} folders into {split.count} cases, {len(split.networks)} topologies "
+            f"in {time.perf_counter() - merge_started:.1f}s",
+            flush=True,
+        )
+    if split_name == "train":
+        re_scale, im_scale = split_rpe_scales(split)
+        save_rpe_global_scales(persistent, re_scale, im_scale)
+        print(
+            f"{split_name}: saved RPE scales s_R={re_scale:.6g} s_X={im_scale:.6g} -> {rpe_scales_path(persistent)}",
+            flush=True,
+        )
+    elif train_scales is not None:
+        re_scale, im_scale = train_scales
+        print(
+            f"{split_name}: RPE normalization uses train scales s_R={re_scale:.6g} s_X={im_scale:.6g}",
+            flush=True,
+        )
+    return split
 
 
 DATASET_RELATIVE = Path("Foundation Model") / "vendor" / "pfdelta_task1.1"
@@ -3904,30 +4183,100 @@ def cosine_lr_at_epoch(epoch: int) -> float:
     return LEARNING_RATE * scale
 
 
-def make_lr_scheduler(
+def lr_plateau_enabled() -> bool:
+    flag = os.environ.get("GENCO_TPGT_LR_PLATEAU", "").strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def lr_plateau_patience() -> int:
+    env = os.environ.get("GENCO_TPGT_LR_PLATEAU_PATIENCE", "").strip()
+    if env:
+        return max(1, int(float(env)))
+    return LR_PLATEAU_PATIENCE
+
+
+@dataclass
+class LearningRateSchedule:
+    """Cosine lr ceiling plus optional ReduceLROnPlateau on validation PBL."""
+
+    optimizer: torch.optim.Optimizer
+    plateau: torch.optim.lr_scheduler.ReduceLROnPlateau
+    plateau_enabled: bool
+
+    def state_dict(self) -> dict:
+        return {
+            "kind": "plateau_cosine",
+            "plateau": self.plateau.state_dict(),
+            "plateau_enabled": self.plateau_enabled,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.plateau.load_state_dict(state["plateau"])
+        self.plateau_enabled = bool(state.get("plateau_enabled", True))
+
+    def apply_cosine_ceiling(self, completed_epoch: int) -> None:
+        ceiling = cosine_lr_at_epoch(completed_epoch)
+        for group in self.optimizer.param_groups:
+            group["lr"] = min(float(group["lr"]), ceiling)
+
+    def sync_completed_epochs(self, completed_epochs: int) -> None:
+        for group in self.optimizer.param_groups:
+            group["lr"] = LEARNING_RATE
+        self.apply_cosine_ceiling(completed_epochs)
+
+    def step_epoch(self, completed_epoch: int, val_pbl: float | None) -> None:
+        lr_before = current_lr(self.optimizer)
+        if self.plateau_enabled and val_pbl is not None:
+            self.plateau.step(val_pbl)
+        lr_after_plateau = current_lr(self.optimizer)
+        if lr_after_plateau < lr_before - 1e-15:
+            print(
+                f"  lr reduced on val plateau: {lr_before:.1e} -> {lr_after_plateau:.1e}",
+                flush=True,
+            )
+        self.apply_cosine_ceiling(completed_epoch)
+        lr_after = current_lr(self.optimizer)
+        if lr_after < lr_after_plateau - 1e-15:
+            print(
+                f"  lr capped by cosine epoch {completed_epoch}: {lr_after_plateau:.1e} -> {lr_after:.1e}",
+                flush=True,
+            )
+
+
+def make_lr_schedule(optimizer: torch.optim.Optimizer) -> LearningRateSchedule:
+    eta_min = LEARNING_RATE * LR_COSINE_MIN_RATIO
+    plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=LR_PLATEAU_FACTOR,
+        patience=lr_plateau_patience(),
+        threshold=LR_PLATEAU_THRESHOLD,
+        min_lr=eta_min,
+    )
+    enabled = lr_plateau_enabled()
+    return LearningRateSchedule(optimizer=optimizer, plateau=plateau, plateau_enabled=enabled)
+
+
+def restore_lr_schedule(
     optimizer: torch.optim.Optimizer,
+    state: dict | None,
     *,
     completed_epochs: int = 0,
-) -> torch.optim.lr_scheduler.CosineAnnealingLR:
-    """Cosine decay ``LEARNING_RATE`` → ``LEARNING_RATE * LR_COSINE_MIN_RATIO`` over ``EPOCHS``.
-
-    ``completed_epochs`` advances the schedule so resumes match the saved epoch index.
-    """
-    for group in optimizer.param_groups:
-        group["lr"] = LEARNING_RATE
-        group["initial_lr"] = LEARNING_RATE
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=EPOCHS,
-        eta_min=LEARNING_RATE * LR_COSINE_MIN_RATIO,
-    )
-    completed = max(int(completed_epochs), 0)
-    if completed > 0:
-        scheduler.last_epoch = completed
-        scheduler._step_count = completed + 1
-        for group, lr in zip(optimizer.param_groups, scheduler._get_closed_form_lr()):
-            group["lr"] = lr
-    return scheduler
+) -> LearningRateSchedule:
+    schedule = make_lr_schedule(optimizer)
+    if state is None:
+        schedule.sync_completed_epochs(completed_epochs)
+        return schedule
+    if state.get("kind") == "plateau_cosine":
+        try:
+            schedule.load_state_dict(state)
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            schedule.sync_completed_epochs(completed_epochs)
+        return schedule
+    schedule.sync_completed_epochs(completed_epochs)
+    return schedule
 
 
 def current_lr(optimizer: torch.optim.Optimizer) -> float:
@@ -3965,11 +4314,16 @@ def train_seed(
         )
         model = torch.compile(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = make_lr_scheduler(optimizer)
+    scheduler = make_lr_schedule(optimizer)
     grad_scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    plateau_note = (
+        f"plateau x{LR_PLATEAU_FACTOR:g} after {lr_plateau_patience()} val checks without gain"
+        if scheduler.plateau_enabled
+        else "plateau off (GENCO_TPGT_LR_PLATEAU=0)"
+    )
     print(
         f"optim: Adam lr {LEARNING_RATE:.1e} → {LEARNING_RATE * LR_COSINE_MIN_RATIO:.1e} "
-        f"cosine/{EPOCHS}ep, grad_clip_norm={GRAD_CLIP_NORM:g}",
+        f"cosine ceiling/{EPOCHS}ep, {plateau_note}, grad_clip_norm={GRAD_CLIP_NORM:g}",
         flush=True,
     )
     cache_budget = device_cache_budget(device)
@@ -4006,21 +4360,18 @@ def train_seed(
             best_val = float("inf")
             wait = 0
             best_state = None
-        elif restored["scheduler"] is None:
-            scheduler = make_lr_scheduler(optimizer, completed_epochs=start_epoch)
-            print(
-                f"Seed {seed}: checkpoint has no LR scheduler state; "
-                f"cosine synced to epoch {start_epoch} (lr {current_lr(optimizer):.1e}).",
-                flush=True,
-            )
         else:
-            try:
-                scheduler.load_state_dict(restored["scheduler"])
-            except (KeyError, TypeError, ValueError, RuntimeError) as error:
-                scheduler = make_lr_scheduler(optimizer, completed_epochs=start_epoch)
+            scheduler = restore_lr_schedule(optimizer, restored["scheduler"], completed_epochs=start_epoch)
+            if restored["scheduler"] is None:
                 print(
-                    f"Seed {seed}: LR scheduler state not restored ({error}); "
-                    f"cosine synced to epoch {start_epoch} (lr {current_lr(optimizer):.1e}).",
+                    f"Seed {seed}: checkpoint has no LR scheduler state; "
+                    f"synced to epoch {start_epoch} (lr {current_lr(optimizer):.1e}).",
+                    flush=True,
+                )
+            elif restored["scheduler"].get("kind") != "plateau_cosine":
+                print(
+                    f"Seed {seed}: legacy cosine-only scheduler in checkpoint; "
+                    f"synced to epoch {start_epoch} (lr {current_lr(optimizer):.1e}).",
                     flush=True,
                 )
         print(f"Seed {seed}: resumed optimizer lr {current_lr(optimizer):.1e}", flush=True)
@@ -4201,7 +4552,8 @@ def train_seed(
                     wait += 1
             else:
                 val_display = "skipped"
-            scheduler.step()
+            val_for_lr = val_score if run_validation else None
+            scheduler.step_epoch(epoch + 1, val_for_lr)
             print(
                 train_epoch_loss_line(
                     seed,

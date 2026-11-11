@@ -93,7 +93,7 @@ def test_v9_node_features_are_pqvt_plus_device_bs():
         layout = tpgt.shared_layout(types, tpgt.type_pair_masks(types, torch.zeros(3, dtype=torch.long)))
         feats = node_encoder_features(specified, layout, device_bs)
         assert feats.shape == (1, 3, 5)
-        assert torch.allclose(feats[0, 0], torch.tensor([0.1, 0.2, 0.0, 0.0, -0.4]))
+        assert torch.allclose(feats[0, 0], torch.tensor([0.1, 0.2, 1.0, 0.0, -0.4]))
         assert torch.allclose(feats[0, 1], torch.tensor([0.3, 0.0, 1.0, 0.0, 0.14]))
         assert torch.allclose(feats[0, 2], torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0]))
     finally:

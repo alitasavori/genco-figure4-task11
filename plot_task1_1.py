@@ -14,10 +14,10 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib import font_manager
 import numpy as np
 
 from common import CATEGORIES, MODELS, RESULTS, read_csv
+from plot_style import FONT_LABEL, FONT_LEGEND, apply_plot_style, font_properties, style_axis
 
 PALETTE = {
     "CANOS-PF": "#D9A6D9",
@@ -99,12 +99,6 @@ PUBLISHED_SOURCES = {
 }
 
 
-def _font(size: float) -> font_manager.FontProperties:
-    available = {font.name for font in font_manager.fontManager.ttflist}
-    family = "Times New Roman" if "Times New Roman" in available else "serif"
-    return font_manager.FontProperties(family=family, size=size)
-
-
 def _rows_for(summary: list[dict]) -> dict[str, dict[str, tuple[float, float]]]:
     grouped: dict[str, dict[str, tuple[float, float]]] = {}
     for row in summary:
@@ -127,21 +121,11 @@ def _rows_for(summary: list[dict]) -> dict[str, dict[str, tuple[float, float]]]:
 
 
 def _draw(grouped: dict, output: Path, ylim: tuple[float, float], yticks: list[float]) -> None:
-    plt.rcParams.update(
-        {
-            "text.usetex": False,
-            "font.family": "serif",
-            "mathtext.fontset": "stix",
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-            "svg.fonttype": "path",
-        }
-    )
+    apply_plot_style()
     models = [model for model in MODELS if model in grouped]
     fig, ax = plt.subplots(figsize=(8.5, 8))
     x = np.arange(len(CATEGORIES))
     width = 0.18
-    fontsize = 18
     for index, model in enumerate(models):
         means = [grouped[model][category][0] for category in CATEGORIES]
         stds = [grouped[model][category][1] for category in CATEGORIES]
@@ -165,22 +149,19 @@ def _draw(grouped: dict, output: Path, ylim: tuple[float, float], yticks: list[f
     ax.set_yticks(yticks)
     ax.yaxis.grid(True, zorder=0)
     ax.set_axisbelow(True)
-    tick_font = _font(fontsize)
-    for tick in ax.get_xticklabels() + ax.get_yticklabels():
-        tick.set_fontproperties(tick_font)
-    ax.yaxis.label.set_fontproperties(_font(fontsize))
+    style_axis(ax)
     ax.text(
         0.97,
         0.95,
         "Task 1.1",
         transform=ax.transAxes,
-        fontproperties=_font(fontsize),
+        fontproperties=font_properties(FONT_LABEL),
         va="top",
         ha="right",
         bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.85, "edgecolor": "none"},
     )
-    legend = ax.legend(frameon=False, prop=_font(14), loc="upper left", title="Model")
-    legend.get_title().set_fontproperties(_font(14))
+    legend = ax.legend(frameon=False, prop=font_properties(FONT_LEGEND), loc="upper left", title="Model")
+    legend.get_title().set_fontproperties(font_properties(FONT_LEGEND))
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(
@@ -231,7 +212,7 @@ def plot_tpgt_comparison(
     means.append([tpgt[category][0] for category in CATEGORIES])
     stds.append([tpgt[category][1] for category in CATEGORIES])
     top = max(mean + std for row_mean, row_std in zip(means, stds) for mean, std in zip(row_mean, row_std))
-    plt.rcParams["svg.fonttype"] = "path"
+    apply_plot_style()
     figure, axis = plt.subplots(figsize=(10, 8))
     positions = np.arange(len(CATEGORIES))
     width = 0.75 / len(labels)
@@ -243,8 +224,9 @@ def plot_tpgt_comparison(
     axis.set_ylabel("Power Balance Loss (Mean) [p.u.]")
     axis.set_ylim(0, max(PAPER_YLIM[1], 1.1 * top))
     axis.yaxis.grid(True)
-    axis.legend(frameon=False, fontsize=9)
-    axis.set_title(f"Task {label}")
+    style_axis(axis)
+    axis.set_title(f"Task {label}", fontproperties=font_properties(FONT_LABEL))
+    axis.legend(frameon=False, prop=font_properties(FONT_LEGEND))
     figure.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
     png = output.with_suffix(".png")

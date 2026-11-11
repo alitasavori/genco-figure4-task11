@@ -31,6 +31,16 @@ from pathlib import Path
 
 import numpy as np
 
+from plot_style import (
+    FONT_ANNOTATE,
+    FONT_LEGEND,
+    FONT_TITLE,
+    apply_plot_style,
+    font_properties,
+    style_colorbar,
+    times_family,
+)
+
 # Bus coordinates from pandapower ``networks.case118()`` geodata (bus k at index k-1).
 CASE118_XY = (
     (-2.2754, 2.8543), (-2.9368, 2.2122), (-1.8344, 1.7094), (-0.8886, 1.5533), (-0.9633, 0.6947),
@@ -190,8 +200,17 @@ def draw_map(ax, xy, pairs, ybus, types, values, norm, cmap, *, top_k=10, remove
         ring = np.asarray(rings)
         ax.scatter(xy[ring, 0], xy[ring, 1], s=260, facecolors="none", edgecolors="red", linewidths=2.0, zorder=4)
     for bus in np.argsort(-values)[:top_k]:
-        ax.annotate(str(bus + 1), xy[bus], xytext=(4, 4), textcoords="offset points", fontsize=7, weight="bold",
-                    zorder=5, path_effects=[pe.withStroke(linewidth=2, foreground="white")])
+        ax.annotate(
+            str(bus + 1),
+            xy[bus],
+            xytext=(4, 4),
+            textcoords="offset points",
+            fontsize=FONT_ANNOTATE,
+            weight="bold",
+            family=times_family(),
+            zorder=5,
+            path_effects=[pe.withStroke(linewidth=2, foreground="white")],
+        )
     ax.set_aspect("equal")
     ax.autoscale_view()
     ax.axis("off")
@@ -224,12 +243,15 @@ def save_map(path, xy, pairs, ybus, types, values, norm, cmap, title, dpi, cbar_
     draw_map(ax, xy, pairs, ybus, types, values, norm, cmap, **kwargs)
     cbar = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax, shrink=0.6, pad=0.01, label=cbar_label)
     set_log_ticks(cbar, norm)
+    style_colorbar(cbar)
     ax.legend(
         handles=legend_handles(outage_line=bool(kwargs.get("removed")), outage_gen=bool(len(kwargs.get("rings", ()))),
                                weakened=bool(kwargs.get("weakened"))),
-        loc="lower left", fontsize=7, frameon=True,
+        loc="lower left",
+        prop=font_properties(FONT_LEGEND),
+        frameon=True,
     )
-    ax.set_title(title, fontsize=9)
+    ax.set_title(title, fontsize=FONT_TITLE)
     fig.tight_layout()
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
@@ -400,6 +422,7 @@ def render(data: dict, out_dir: Path, *, layout_kind: str = "geodata", min_cases
     """Draw every map from ``data`` (see ``compute_from_model``) into ``out_dir``; returns the summary text."""
     from matplotlib.colors import LogNorm
 
+    apply_plot_style()
     out_dir.mkdir(parents=True, exist_ok=True)
     epoch = str(data["epoch"])
     val_pbl, val_dp, val_dq = data["val_pbl"], data["val_dp"], data["val_dq"]
@@ -459,12 +482,17 @@ def render(data: dict, out_dir: Path, *, layout_kind: str = "geodata", min_cases
     fig, axes = plt.subplots(1, 2, figsize=(11, 6.6), layout="constrained")
     for ax, values, name in ((axes[0], val_dp, "|ΔP|"), (axes[1], val_dq, "|ΔQ|")):
         draw_map(ax, xy, pairs, ref_y, ref_types, values, pq_norm, "viridis")
-        ax.set_title(f"mean {name} per bus (overall {values.mean():.4f} p.u.)", fontsize=10)
-    axes[0].legend(handles=legend_handles(), loc="lower left", fontsize=7)
+        ax.set_title(f"mean {name} per bus (overall {values.mean():.4f} p.u.)", fontsize=FONT_TITLE)
+    axes[0].legend(
+        handles=legend_handles(),
+        loc="lower left",
+        prop=font_properties(FONT_LEGEND),
+    )
     cbar = fig.colorbar(ScalarMappable(norm=pq_norm, cmap="viridis"), ax=axes, shrink=0.7, pad=0.01,
                         label="mean |mismatch| (p.u., log)")
     set_log_ticks(cbar, pq_norm)
-    fig.suptitle(f"Validation N ({val_cases} cases), epoch {epoch} | {layout_name}", fontsize=11)
+    style_colorbar(cbar)
+    fig.suptitle(f"Validation N ({val_cases} cases), epoch {epoch} | {layout_name}", fontsize=FONT_TITLE)
     fig.savefig(out_dir / "val_N_dP_dQ.png", dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     if verbose:
