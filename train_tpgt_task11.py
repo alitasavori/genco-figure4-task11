@@ -142,7 +142,11 @@ from common import (
     upsert_csv,
 )
 from metrics import aggregate_c2i, sample_mean, sample_std
-from plot_task1_1 import PUBLISHED, categories_for, display_task31_table, plot_tpgt_comparison, write_task31_table
+import plot_task1_1 as plot_task1_1_module
+from plot_task1_1 import PUBLISHED, categories_for, plot_tpgt_comparison
+
+write_task31_table = getattr(plot_task1_1_module, "write_task31_table", None)
+display_task31_table = getattr(plot_task1_1_module, "display_task31_table", None)
 from storage import ROOT, in_colab, mount_drive
 
 # Implementation choices, not values from the draft.
@@ -5494,8 +5498,15 @@ def plot_comparison(
     tpgt_label = f"TPGT (this run, {seeds} seed(s))"
     written = plot_tpgt_comparison(spec.task_id, spec.label, tpgt, output, tpgt_label=tpgt_label)
     if spec.task_id == "3.1":
-        written.extend(write_task31_table(results, tpgt, tpgt_label=tpgt_label))
-        display_task31_table(results)
+        if write_task31_table is None or display_task31_table is None:
+            print(
+                "Table 4 HTML/Markdown skipped: plot_task1_1.py is behind train_tpgt_task11.py. "
+                "Run the Colab preparation cell (git fetch && reset --hard origin/main), then retry.",
+                flush=True,
+            )
+        else:
+            written.extend(write_task31_table(results, tpgt, tpgt_label=tpgt_label))
+            display_task31_table(results)
     if archive_dir is not None:
         archive_dir.mkdir(parents=True, exist_ok=True)
         for path in written:
