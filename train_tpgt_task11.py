@@ -4771,16 +4771,6 @@ def train_seed(
                 losses = (breakdown.total, breakdown.state_mse, breakdown.physics_sum, *breakdown.physics_stages)
                 running += torch.stack([value.detach().to(device) for value in losses]).double()
                 batches += 1
-                if batches % 250 == 0:
-                    if device.type == "cuda":
-                        torch.cuda.synchronize()
-                    window = batch_durations[-250:]
-                    avg_sec = sum(window) / len(window)
-                    print(
-                        f"  seed {seed} epoch {epoch + 1} batch {batches} train {float(running[0]) / batches:.4f} "
-                        f"avg {avg_sec:.3f}s/batch (last {len(window)})  {timer.summary()}",
-                        flush=True,
-                    )
             running_total, running_state, running_phys, *running_phys_stages = running.tolist()
             epoch_timing = timer.summary("epoch")
             run_validation = val_every <= 1 or (epoch + 1) % val_every == 0 or (epoch + 1) == EPOCHS
