@@ -2817,6 +2817,24 @@ def parse_micro_batch_size(*, default: int | None = None) -> int:
     return MICRO_BATCH_SIZE if default is None else default
 
 
+def effective_eval_batch_size(bus_count: int, requested: int) -> int:
+    """Cap forward batch for large grids (500-bus attention is O(buses²) per case)."""
+    if bus_count <= 118:
+        return requested
+    if bus_count <= 200:
+        cap = min(requested, 32)
+    elif bus_count <= 350:
+        cap = min(requested, 16)
+    else:
+        cap = min(requested, 8)
+    if cap < requested:
+        print(
+            f"  eval batch capped {requested} -> {cap} for {bus_count}-bus grid (set GENCO_TPGT_EVAL_BATCH lower to silence)",
+            flush=True,
+        )
+    return max(1, cap)
+
+
 def parse_eval_batch_size() -> int:
     for index, arg in enumerate(sys.argv):
         if arg == "--eval-batch" and index + 1 < len(sys.argv):
@@ -5624,9 +5642,10 @@ def test_model(
             per_network: dict[int, list[float]] = {}
             key = score_key(grid, label, spec)
             buses = int(split.networks[0].ybus.shape[0]) if split.networks else 0
+            step_batch = effective_eval_batch_size(buses, eval_batch_size)
             print(
                 f"  scoring {key}: {split.count} scenarios, {len(split.networks)} topology(ies), "
-                f"{buses} buses, batch {eval_batch_size}",
+                f"{buses} buses, batch {step_batch}",
                 flush=True,
             )
             scores[key] = evaluate_pbl(
@@ -5634,7 +5653,7 @@ def test_model(
                 split,
                 networks,
                 device,
-                batch_size=eval_batch_size,
+                batch_size=step_batch,
                 per_network_out=per_network,
                 progress_label=key,
             )
@@ -5642,6 +5661,10 @@ def test_model(
             print(f"test {key}: PBL {scores[key]:.6g} on {split.count} scenarios", flush=True)
             if after_split is not None and grid == "case118":
                 after_split(label, split, networks, per_network)
+        if device.type == "cuda":
+            del networks
+            gc.collect()
+            torch.cuda.empty_cache()
     return scores, counts
 
 
