@@ -101,6 +101,23 @@ PUBLISHED = {
 }
 TASK31_GRIDS = ("57", "118", "500")
 TASK31_GRID_TITLES = {"57": "IEEE 57", "118": "IEEE 118", "500": "GOC 500"}
+TASK31_TABLE_ROW_ORDER = ("GENCO Base", "PFNet", "CANOS-PF", "GNS-S")
+TASK31_CATEGORY_HEADERS = ("N", "N-1", "N-2", "Close-to-infeasible")
+# Table 4 Newton–Raphson reference (mean ± std, three seeds); not included in best-among-learned.
+TASK31_NR = {
+    "57 N": (1.1e-6, 0.0),
+    "57 N-1": (1.2e-6, 0.0),
+    "57 N-2": (1.1e-6, 0.0),
+    "57 C2I": (1.3e-6, 0.0),
+    "118 N": (3.7e-6, 0.0),
+    "118 N-1": (3.2e-6, 0.0),
+    "118 N-2": (3.3e-6, 0.0),
+    "118 C2I": (4.6e-6, 0.0),
+    "500 N": (1.4e-5, 0.0),
+    "500 N-1": (1.4e-5, 0.0),
+    "500 N-2": (1.3e-5, 0.0),
+    "500 C2I": (1.6e-5, 0.0),
+}
 
 
 def categories_for(task: str) -> tuple[str, ...]:
@@ -131,8 +148,160 @@ PUBLISHED_SOURCES = {
 }
 PUBLISHED_SOURCES["3.1"] = (
     "GENCO arXiv 2608.09921v3 Table 4 (train IEEE 118; test IEEE 57, IEEE 118, GOC 500). "
-    "Newton–Raphson rows are omitted."
+    "Newton–Raphson rows are omitted from the published-learning table we compare against."
 )
+
+
+def format_task31_pbl_value(value: float) -> str:
+    """Table 4 style scalar (matches the paper's mixed decimal / scientific notation)."""
+    if not np.isfinite(value):
+        return "—"
+    if value == 0.0:
+        return "0.0e-6"
+    ax = abs(value)
+    if 10.0 <= ax < 100.0:
+        return f"{value / 10.0:.1f}e1"
+    if 1.0 <= ax < 10.0:
+        return f"{value:.1f}"
+    if 1e-5 <= ax < 1.0:
+        one_decimal = f"{value:.1f}"
+        if np.isclose(value, float(one_decimal), rtol=0, atol=5e-3):
+            return one_decimal
+    exponent = int(np.floor(np.log10(ax)))
+    mantissa = value / (10.0**exponent)
+    if abs(mantissa) >= 9.95:
+        exponent += 1
+        mantissa = value / (10.0**exponent)
+    mantissa_text = f"{mantissa:.2f}".rstrip("0").rstrip(".")
+    if exponent == 0:
+        return mantissa_text
+    return f"{mantissa_text}e{exponent}"
+
+
+def format_task31_pbl_cell(mean: float, std: float) -> str:
+    return f"{format_task31_pbl_value(mean)}±{format_task31_pbl_value(std)}"
+
+
+def task31_learning_winners(tpgt: dict[str, tuple[float, float]] | None) -> dict[tuple[str, str], set[str]]:
+    """For each grid and test category, models tied at the lowest mean PBL (learning methods only)."""
+    published = PUBLISHED["3.1"]
+    winners: dict[tuple[str, str], set[str]] = {}
+    for grid in TASK31_GRIDS:
+        for category in CATEGORIES:
+            candidates: list[tuple[float, str]] = []
+            for model in TASK31_TABLE_ROW_ORDER:
+                key = f"{grid} {category}"
+                mean = published[model][key][0]
+                candidates.append((mean, model))
+            if tpgt is not None and f"{grid} {category}" in tpgt:
+                candidates.append((tpgt[f"{grid} {category}"][0], "TPGT (this run)"))
+            best = min(mean for mean, _ in candidates)
+            winners[(grid, category)] = {label for mean, label in candidates if np.isclose(mean, best, rtol=0, atol=0)}
+    return winners
+
+
+def _task31_row_scores(
+    row_label: str,
+    grid: str,
+    *,
+    tpgt: dict[str, tuple[float, float]] | None,
+    tpgt_label: str,
+) -> dict[str, tuple[float, float]]:
+    published = PUBLISHED["3.1"]
+    out: dict[str, tuple[float, float]] = {}
+    for category in CATEGORIES:
+        key = f"{grid} {category}"
+        if row_label == "NR":
+            out[category] = TASK31_NR[key]
+        elif row_label == tpgt_label and tpgt is not None and key in tpgt:
+            out[category] = tpgt[key]
+        elif row_label in published:
+            out[category] = published[row_label][key]
+    return out
+
+
+def write_task31_table(
+    results_dir: Path,
+    tpgt: dict[str, tuple[float, float]],
+    *,
+    tpgt_label: str = "TPGT (this run)",
+) -> list[Path]:
+    """GENCO Table 4 layout (HTML + Markdown), bolding best learning score in each column."""
+    results_dir.mkdir(parents=True, exist_ok=True)
+    winners = task31_learning_winners(tpgt)
+    rows_html: list[str] = []
+    rows_md: list[str] = []
+    caption = (
+        "Table 4. Mean power balance loss for Task 3.1, where neural solvers are trained on IEEE 118 "
+        "and evaluated on IEEE 57, IEEE 118, and GOC 500 under (N), (N-1), (N-2), and close-to-infeasible "
+        "conditions. Errors denote the standard deviation across three random seeds. NR denotes AC power flow "
+        "solved using Newton–Raphson (highlighted in light gray). Bold values indicate the best performance "
+        "among learning-based methods."
+    )
+    header = (
+        "<tr><th>Case</th><th>Model</th>"
+        + "".join(f"<th>{name}</th>" for name in TASK31_CATEGORY_HEADERS)
+        + "</tr>"
+    )
+    rows_md.append(
+        "| Case | Model | " + " | ".join(TASK31_CATEGORY_HEADERS) + " |",
+    )
+    rows_md.append("| --- | --- | " + " | ".join("---" for _ in TASK31_CATEGORY_HEADERS) + " |")
+    display_rows = [*TASK31_TABLE_ROW_ORDER, tpgt_label, "NR"]
+    for grid in TASK31_GRIDS:
+        first = True
+        for row_label in display_rows:
+            scores = _task31_row_scores(row_label, grid, tpgt=tpgt, tpgt_label=tpgt_label)
+            if not scores:
+                continue
+            cells_html = []
+            cells_md = []
+            for category in CATEGORIES:
+                mean, std = scores[category]
+                text = format_task31_pbl_cell(mean, std)
+                bold = row_label != "NR" and row_label in winners.get((grid, category), set())
+                cells_html.append(f"<td><strong>{text}</strong></td>" if bold else f"<td>{text}</td>")
+                cells_md.append(f"**{text}**" if bold else text)
+            case_cell = grid if first else ""
+            first = False
+            row_style = ' style="background:#e8e8e8"' if row_label == "NR" else ""
+            rows_html.append(
+                f"<tr{row_style}><td>{case_cell}</td><td>{row_label}</td>" + "".join(cells_html) + "</tr>"
+            )
+            rows_md.append(f"| {case_cell} | {row_label} | " + " | ".join(cells_md) + " |")
+    html = (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<style>table{border-collapse:collapse;font-family:system-ui,sans-serif;font-size:14px}"
+        "th,td{border:1px solid #ccc;padding:6px 10px;text-align:center}"
+        "th{background:#f5f5f5}caption{text-align:left;max-width:900px;margin-bottom:12px;line-height:1.4}"
+        "</style></head><body>"
+        f"<table><caption><strong>Experiment Power Balance Loss (Mean) [p.u.]</strong><br>{caption}</caption>"
+        f"<thead>{header}</thead><tbody>{''.join(rows_html)}</tbody></table></body></html>"
+    )
+    html_path = results_dir / "table4_task3.1_tpgt.html"
+    md_path = results_dir / "table4_task3.1_tpgt.md"
+    html_path.write_text(html, encoding="utf-8")
+    md_body = (
+        "**Experiment Power Balance Loss (Mean) [p.u.]**\n\n"
+        f"{caption}\n\n"
+        + "\n".join(rows_md)
+    )
+    md_path.write_text(md_body, encoding="utf-8")
+    print(f"wrote {html_path.name} and {md_path.name}", flush=True)
+    return [html_path, md_path]
+
+
+def display_task31_table(results_dir: Path) -> None:
+    """Show the HTML Table 4 in a Jupyter / Colab cell."""
+    path = results_dir / "table4_task3.1_tpgt.html"
+    if not path.is_file():
+        return
+    try:
+        from IPython.display import HTML, display
+
+        display(HTML(path.read_text(encoding="utf-8")))
+    except Exception:
+        print(path.read_text(encoding="utf-8")[:4000], flush=True)
 
 
 def _rows_for(summary: list[dict]) -> dict[str, dict[str, tuple[float, float]]]:

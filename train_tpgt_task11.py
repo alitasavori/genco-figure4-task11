@@ -142,7 +142,7 @@ from common import (
     upsert_csv,
 )
 from metrics import aggregate_c2i, sample_mean, sample_std
-from plot_task1_1 import PUBLISHED, categories_for, plot_tpgt_comparison
+from plot_task1_1 import PUBLISHED, categories_for, display_task31_table, plot_tpgt_comparison, write_task31_table
 from storage import ROOT, in_colab, mount_drive
 
 # Implementation choices, not values from the draft.
@@ -5466,9 +5466,11 @@ def plot_comparison(
     }
     seeds = min(int(by_category[category]["n_seeds"]) for category in categories)
     output = comparison_figure_path(results, spec)
-    written = plot_tpgt_comparison(
-        spec.task_id, spec.label, tpgt, output, tpgt_label=f"TPGT (this run, {seeds} seed(s))"
-    )
+    tpgt_label = f"TPGT (this run, {seeds} seed(s))"
+    written = plot_tpgt_comparison(spec.task_id, spec.label, tpgt, output, tpgt_label=tpgt_label)
+    if spec.task_id == "3.1":
+        written.extend(write_task31_table(results, tpgt, tpgt_label=tpgt_label))
+        display_task31_table(results)
     if archive_dir is not None:
         archive_dir.mkdir(parents=True, exist_ok=True)
         for path in written:

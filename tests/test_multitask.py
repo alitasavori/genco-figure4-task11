@@ -20,7 +20,10 @@ from plot_task1_1 import (  # noqa: E402
     PUBLISHED_SOURCES,
     PUBLISHED_TASK11,
     categories_for,
+    format_task31_pbl_cell,
     plot_tpgt_comparison,
+    task31_learning_winners,
+    write_task31_table,
 )
 from test_diagnostics import tiny_consistent_split  # noqa: E402
 
@@ -675,6 +678,20 @@ def test_published_numbers_cover_every_task():
     assert PUBLISHED["4.3"]["PFNet"]["N-2"] == (1.5, 0.02)
     for spec in tpgt.TASKS.values():
         assert spec.task_id in PUBLISHED
+
+
+def test_task31_table_format_and_winners(tmp_path):
+    assert format_task31_pbl_cell(4.9e-1, 1.9e-1) == "4.9e-1±1.9e-1"
+    assert format_task31_pbl_cell(2.3, 0.4) == "2.3±0.4"
+    assert format_task31_pbl_cell(1.1e-6, 0.0) == "1.1e-6±0.0e-6"
+    assert "GENCO Base" in task31_learning_winners(None)[("118", "N")]
+    tpgt = {f"118 {cat}": (1e-4, 0.0) for cat in ("N", "N-1", "N-2", "C2I")}
+    assert "TPGT (this run)" in task31_learning_winners(tpgt)[("118", "N")]
+    task31 = {category: (0.2, 0.05) for category in categories_for("3.1")}
+    paths = write_task31_table(tmp_path, task31)
+    assert {path.name for path in paths} == {"table4_task3.1_tpgt.html", "table4_task3.1_tpgt.md"}
+    html = paths[0].read_text(encoding="utf-8")
+    assert "<strong>" in html and "NR" in html
 
 
 def test_bar_plot_for_a_task_writes_svg_and_png(tmp_path):
