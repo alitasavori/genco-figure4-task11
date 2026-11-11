@@ -2485,6 +2485,9 @@ def warm_split_caches(
     print(f"Split cache (active): {active}", flush=True)
     if persistent != active:
         print(f"Split cache (Drive): {persistent}", flush=True)
+        if persistent.is_dir():
+            on_drive = len(list(persistent.glob("*.pt")))
+            print(f"  reusing up to {on_drive} cached split .pt on Drive (mirroring to {active})", flush=True)
         sync_split_cache_from_drive(persistent, active)
     reconcile_split_caches(active, persistent, data)
     checkpoints = persistent.parent
@@ -2495,6 +2498,9 @@ def warm_split_caches(
             flush=True,
         )
         copy_training_rpe_scales(persistent, weight_run)
+        scales_path = rpe_scales_path(persistent)
+        if persistent != active and scales_path.is_file():
+            _mirror_cache_file(scales_path, active / RPE_SCALES_FILE)
         return None, None
     load_started = time.perf_counter()
     train_split = load_task_split(data, "train", active, persistent)
@@ -3401,6 +3407,25 @@ def sync_split_cache_to_drive(active: Path, persistent: Path) -> None:
     for path in sorted(active.iterdir()):
         if path.is_file():
             _mirror_cache_file(path, persistent / path.name)
+
+
+def persist_split_caches(active: Path, persistent: Path, *, label: str = "") -> None:
+    """Flush Colab SSD caches to Drive and log how many artifacts are stored."""
+    sync_split_cache_to_drive(active, persistent)
+    if persistent == active:
+        root = persistent
+    else:
+        root = persistent
+    if not root.is_dir():
+        return
+    stamps = sum(1 for _ in root.glob("*.stamp.json"))
+    tensors = sum(1 for _ in root.glob("*.pt"))
+    extras = sum(1 for _ in root.glob("*.json"))
+    tag = f" ({label})" if label else ""
+    print(
+        f"Split caches on Drive{tag}: {tensors} .pt, {stamps} stamps, {extras} json under {root}",
+        flush=True,
+    )
 
 
 def split_cache_stamp_for_raw(raw: Path, limit: int) -> dict:
@@ -5597,6 +5622,60 @@ def score_key(grid: str, label: str, spec: TaskSpec) -> str:
     return f"{short} {label}"
 
 
+def task31_partial_eval_path(results: Path, spec: TaskSpec) -> Path:
+    return results / f"task{spec.file_tag}_tpgt_eval_partial.json"
+
+
+def load_partial_eval(
+    results: Path, spec: TaskSpec, seed: int, ckpt_path: Path
+) -> tuple[dict[str, float], dict[str, int]]:
+    path = task31_partial_eval_path(results, spec)
+    if not path.is_file():
+        return {}, {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}, {}
+    if int(payload.get("seed", -1)) != seed or str(payload.get("checkpoint_path", "")) != str(ckpt_path):
+        return {}, {}
+    scores = {str(k): float(v) for k, v in payload.get("scores", {}).items()}
+    counts = {str(k): int(v) for k, v in payload.get("counts", {}).items()}
+    if scores:
+        print(f"Resuming partial Task 3.1 eval from {path.name} ({len(scores)} score keys)", flush=True)
+    return scores, counts
+
+
+def save_partial_eval(
+    results: Path,
+    spec: TaskSpec,
+    seed: int,
+    epoch: int,
+    ckpt_path: Path,
+    scores: dict[str, float],
+    counts: dict[str, int],
+) -> None:
+    path = task31_partial_eval_path(results, spec)
+    path.write_text(
+        json.dumps(
+            {
+                "seed": seed,
+                "epoch": epoch,
+                "checkpoint_path": str(ckpt_path),
+                "scores": scores,
+                "counts": counts,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def grid_scoring_complete(scores: dict[str, float], grid: str, spec: TaskSpec) -> bool:
+    if spec.task_id != "3.1":
+        return False
+    return all(score_key(grid, label, spec) in scores for label, _topology, _condition in TEST_PARTS)
+
+
 def attach_c2i(scores: dict[str, float], counts: dict[str, int], spec: TaskSpec) -> dict[str, float]:
     """Add the paper's single C2I number (mean of the three nose splits) per reported grid."""
     scores = dict(scores)
@@ -5620,12 +5699,14 @@ def test_model(
     eval_batch_size: int = EVAL_BATCH_SIZE,
     after_split: Callable[[str, Split, DeviceNetworks, dict[int, list[float]]], None] | None = None,
     spec: TaskSpec | None = None,
+    only_grids: tuple[str, ...] | None = None,
 ) -> tuple[dict[str, float], dict[str, int]]:
     spec = spec or TASKS["1.1"]
     scores = {}
     counts = {}
     model.eval()
-    for grid in eval_case_names(spec):
+    grids = only_grids if only_grids is not None else eval_case_names(spec)
+    for grid in grids:
         for label, topology, condition in TEST_PARTS:
             cache_name = (
                 f"test_{grid}_{topology}_{condition}"
@@ -5661,6 +5742,7 @@ def test_model(
             print(f"test {key}: PBL {scores[key]:.6g} on {split.count} scenarios", flush=True)
             if after_split is not None and grid == "case118":
                 after_split(label, split, networks, per_network)
+        persist_split_caches(active_cache, persistent_cache, label=grid)
         if device.type == "cuda":
             del networks
             gc.collect()
@@ -5901,15 +5983,25 @@ def cli_eval_only() -> None:
         model.load_state_dict(state, strict=True)
         model.eval()
         print(f"Seed {seed}: loaded epoch {epoch} from {ckpt_path}", flush=True)
-        scores, counts = test_model(
-            model,
-            data,
-            device,
-            active_cache,
-            persistent_cache,
-            eval_batch_size=EVAL_BATCH_SIZE,
-            spec=spec,
-        )
+        scores, counts = load_partial_eval(results, spec, seed, ckpt_path)
+        for grid in eval_case_names(spec):
+            if grid_scoring_complete(scores, grid, spec):
+                print(f"Seed {seed}: skip {grid} tests (scores already on Drive partial eval)", flush=True)
+                continue
+            part_scores, part_counts = test_model(
+                model,
+                data,
+                device,
+                active_cache,
+                persistent_cache,
+                eval_batch_size=EVAL_BATCH_SIZE,
+                spec=spec,
+                only_grids=(grid,),
+            )
+            scores.update(part_scores)
+            counts.update(part_counts)
+            save_partial_eval(results, spec, seed, epoch, ckpt_path, scores, counts)
+        persist_split_caches(active_cache, persistent_cache, label="final")
         reported = attach_c2i(scores, counts, spec)
         for grid in ("57", "118", "500"):
             subset = {category: reported[f"{grid} {category}"] for category in CATEGORIES}
@@ -5930,6 +6022,9 @@ def cli_eval_only() -> None:
     summary = write_summary(results, spec)
     print_comparison(summary, spec)
     plot_comparison(results, summary, spec)
+    partial = task31_partial_eval_path(results, spec)
+    if partial.is_file():
+        partial.unlink()
     print(f"Done. Tables and figure under {results}", flush=True)
 
 
