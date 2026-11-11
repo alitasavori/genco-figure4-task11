@@ -649,6 +649,23 @@ def test_split_cache_stamp_flags_data_fraction_and_rpe(tmp_path, monkeypatch):
     )
 
 
+def test_patch_legacy_split_stamp_keeps_tensor(tmp_path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "bus_data.parquet").write_bytes(b"x" * 8)
+    stamp_path = tmp_path / "valid_n_feasible.json"
+    expected = tpgt.split_cache_stamp_for_raw(raw, 100)
+    legacy = {k: v for k, v in expected.items() if k != "data_fraction"}
+    import json
+
+    stamp_path.write_text(json.dumps(legacy), encoding="utf-8")
+    assert tpgt.patch_legacy_split_stamp(stamp_path, expected, (1.0, 1.0))
+    saved = json.loads(stamp_path.read_text(encoding="utf-8"))
+    assert saved["data_fraction"] == expected["data_fraction"]
+    assert saved["rpe_re_scale"] == 1.0
+    assert tpgt.split_cache_stamp_mismatch(saved, expected, rpe_scales=(1.0, 1.0), is_train=False) is None
+
+
 def test_reconcile_purges_on_fraction_change(tmp_path, monkeypatch):
     monkeypatch.setattr(tpgt, "DATA_FRACTION", 0.25)
     make_tree(tmp_path, {"train": [("n", "feasible")]})

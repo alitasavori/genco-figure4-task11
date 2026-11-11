@@ -40,9 +40,14 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
 
 Performance notes (Colab / large train split)
 ---------------------------------------------
-* **Split cache**: Stamps record ``DATA_FRACTION``, scenario limit, and train RPE scales;
-  stale Drive or ``/content/*_cache`` trees purge automatically when those change.
-  Loaded caches refresh ``network.rpe`` from branches + scales before use.
+* **Split cache**: Stamps record ``DATA_FRACTION``, scenario limit, and train RPE scales.
+  On Colab the Drive ``checkpoints/cache`` tree is mirrored to ``/content/*_cache`` once at
+  startup (and again after a purge); split ``.pt`` files rebuild only when stamps mismatch
+  (arch / ``checkpoint_version``, ``DATA_FRACTION``, dataset bytes, or ``CACHE_VERSION`` bump).
+  Legacy stamps missing only ``data_fraction`` or per-split RPE fields are patched in place.
+  Set ``GENCO_TPGT_REBUILD_CACHE=1`` to force a full rebuild. Loaded caches refresh
+  ``network.rpe`` from branches + scales before use; batch size and optimizer settings do not
+  affect split caches.
 * **Drive I/O**: The 48600-case train/valid tensors live under the checkpoint
   tree on Google Drive. ``torch.load`` from Drive is often minutes slower than
   from ``/content`` local disk. On Colab, ``split_cache_dirs`` mirrors ``.pt``
@@ -3154,23 +3159,36 @@ def split_cache_dirs(checkpoints: Path, spec: TaskSpec | None = None) -> tuple[P
     return persistent, persistent
 
 
+_SPLIT_CACHE_MIRRORED = False
+
+
 def _mirror_cache_file(source: Path, destination: Path) -> bool:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if not destination.exists() or source.stat().st_mtime > destination.stat().st_mtime:
-        shutil.copy2(source, destination)
-        return True
-    return False
+    if destination.exists():
+        try:
+            dest_stat = destination.stat()
+            src_stat = source.stat()
+            if dest_stat.st_size == src_stat.st_size and dest_stat.st_mtime >= src_stat.st_mtime:
+                return False
+        except OSError:
+            pass
+    shutil.copy2(source, destination)
+    return True
 
 
-def sync_split_cache_from_drive(persistent: Path, active: Path) -> None:
+def sync_split_cache_from_drive(persistent: Path, active: Path, *, force: bool = False) -> None:
     """Copy Drive split caches to local disk so ``torch.load`` is fast on Colab."""
+    global _SPLIT_CACHE_MIRRORED
     if persistent == active or not persistent.is_dir():
+        return
+    if _SPLIT_CACHE_MIRRORED and not force:
         return
     active.mkdir(parents=True, exist_ok=True)
     copied = 0
     for path in sorted(persistent.iterdir()):
         if path.is_file() and _mirror_cache_file(path, active / path.name):
             copied += 1
+    _SPLIT_CACHE_MIRRORED = True
     if copied:
         print(
             f"Mirrored {copied} split-cache file(s) from Drive ({persistent}) to {active}",
@@ -3196,6 +3214,14 @@ def split_cache_stamp_for_raw(raw: Path, limit: int) -> dict:
         "scenario_limit": limit,
         "data_fraction": float(DATA_FRACTION),
     }
+
+
+LEGACY_STAMP_REASONS = frozenset(
+    {
+        "missing data_fraction in stamp (legacy cache)",
+        "missing RPE scales in stamp (legacy cache)",
+    }
+)
 
 
 def split_cache_stamp_mismatch(
@@ -3227,6 +3253,55 @@ def split_cache_stamp_mismatch(
     return None
 
 
+def parse_split_cache_name(stem: str) -> tuple[str, str, str] | None:
+    """``train_n-1_feasible`` → (train, n-1, feasible)."""
+    if "_" not in stem:
+        return None
+    split_name, rest = stem.split("_", 1)
+    if "_" not in rest:
+        return None
+    topology, condition = rest.rsplit("_", 1)
+    if split_name not in ("train", "valid", "test"):
+        return None
+    return split_name, topology, condition
+
+
+def patch_legacy_split_stamp(
+    stamp_path: Path,
+    expected: dict,
+    rpe_scales: tuple[float, float] | None,
+) -> bool:
+    """Fill legacy stamp fields when core keys still match ``expected`` (keeps ``.pt`` on disk)."""
+    try:
+        saved = json.loads(stamp_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    is_train = stamp_path.stem.startswith("train_")
+    reason = split_cache_stamp_mismatch(saved, expected, rpe_scales=rpe_scales, is_train=is_train)
+    if reason not in LEGACY_STAMP_REASONS:
+        return False
+    changed = False
+    if saved.get("data_fraction") is None:
+        saved["data_fraction"] = expected["data_fraction"]
+        changed = True
+    if ("rpe_re_scale" not in saved or "rpe_im_scale" not in saved) and rpe_scales is not None:
+        saved["rpe_re_scale"] = rpe_scales[0]
+        saved["rpe_im_scale"] = rpe_scales[1]
+        changed = True
+    if not changed:
+        return False
+    stamp_path.write_text(json.dumps(saved), encoding="utf-8")
+    return True
+
+
+def parse_rebuild_cache() -> bool:
+    for arg in sys.argv:
+        if arg in ("--rebuild-cache",):
+            return True
+    env = os.environ.get("GENCO_TPGT_REBUILD_CACHE", "").strip().lower()
+    return env in ("1", "true", "yes")
+
+
 def purge_split_caches(active: Path, persistent: Path, reason: str) -> int:
     """Remove split ``.pt`` / ``.json`` caches (and train RPE scales) on both cache roots."""
     removed = 0
@@ -3240,6 +3315,8 @@ def purge_split_caches(active: Path, persistent: Path, reason: str) -> int:
                 path.unlink()
                 removed += 1
     if removed:
+        global _SPLIT_CACHE_MIRRORED
+        _SPLIT_CACHE_MIRRORED = False
         print(
             f"Purged {removed} split-cache file(s) ({reason}); splits will rebuild on load.",
             flush=True,
@@ -3267,6 +3344,11 @@ def refresh_split_rpe(
 
 def reconcile_split_caches(active: Path, persistent: Path, data_root: Path) -> None:
     """Drop stale caches when ``DATA_FRACTION``, architecture, or train RPE scales changed."""
+    global _SPLIT_CACHE_MIRRORED
+    if parse_rebuild_cache():
+        purge_split_caches(active, persistent, "GENCO_TPGT_REBUILD_CACHE=1")
+        _SPLIT_CACHE_MIRRORED = False
+        return
     folders = task_folders(data_root, "train")
     if not folders:
         return
@@ -3280,6 +3362,30 @@ def reconcile_split_caches(active: Path, persistent: Path, data_root: Path) -> N
     if limit is None:
         limit = full
     expected = split_cache_stamp_for_raw(raw, limit)
+    scales = load_rpe_global_scales(persistent) or load_rpe_global_scales(active)
+    patched = 0
+    for root in (persistent, active):
+        if not root.is_dir():
+            continue
+        for stamp_path in sorted(root.glob("*.json")):
+            if stamp_path.name == RPE_SCALES_FILE:
+                continue
+            parsed = parse_split_cache_name(stamp_path.stem)
+            if parsed is None:
+                continue
+            split_name, topo, cond = parsed
+            folder_raw = raw_dir(data_root, split_name, topo, cond)
+            if not folder_raw.joinpath("bus_data.parquet").is_file():
+                continue
+            folder_limit = scenario_limit(folder_raw)
+            if folder_limit is None:
+                folder_limit = scenario_count(folder_raw)
+            stamp_expected = split_cache_stamp_for_raw(folder_raw, folder_limit)
+            stamp_scales = None if split_name == "train" else scales
+            if patch_legacy_split_stamp(stamp_path, stamp_expected, stamp_scales):
+                patched += 1
+    if patched:
+        print(f"Patched {patched} legacy split-cache stamp(s) in place (reusing existing .pt).", flush=True)
 
     for root in (active, persistent):
         stamp_path = root / f"{name}.json"
@@ -3374,6 +3480,21 @@ def cached_split(
             rpe_scales=rpe_scales,
             is_train=is_train,
         )
+        if version_ok and limit == old_limit and stamp_reason in LEGACY_STAMP_REASONS:
+            scales_for_stamp = None if is_train else rpe_scales
+            if patch_legacy_split_stamp(stamp_path, stamp, scales_for_stamp):
+                saved = json.loads(stamp_path.read_text(encoding="utf-8"))
+                stamp_reason = split_cache_stamp_mismatch(
+                    saved,
+                    stamp,
+                    rpe_scales=rpe_scales,
+                    is_train=is_train,
+                )
+                peer = persistent / stamp_path.name
+                if persistent != active and peer.is_file():
+                    patch_legacy_split_stamp(peer, stamp, scales_for_stamp)
+                elif persistent != active:
+                    _mirror_cache_file(stamp_path, peer)
         if version_ok and limit == old_limit and stamp_reason is None:
             load_started = time.perf_counter()
             print(f"Loading cached {name} split from {tensor_path}", flush=True)
@@ -5213,6 +5334,7 @@ def main() -> None:
     print(f"Split cache (active): {active_cache}", flush=True)
     if persistent_cache != active_cache:
         print(f"Split cache (Drive): {persistent_cache}", flush=True)
+        sync_split_cache_from_drive(persistent_cache, active_cache)
     reconcile_split_caches(active_cache, persistent_cache, data)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training device: {device}", flush=True)
