@@ -1046,8 +1046,12 @@ class CorrectionStage(nn.Module):
                 exph_pair_id,
                 **kwargs,
             )
+        # Virt update MLP stays under ambient autocast; match message dtype to z_virt.
+        msg_v = msg_v.to(dtype=z_virt.dtype)
+        msg_r = msg_r.to(dtype=hidden.dtype)
         z_next = self.norm_virt(z_virt + self.update_virt(torch.cat((z_virt, msg_v), dim=-1)))
         return msg_r, z_next
+
 
     def _messages(
         self,

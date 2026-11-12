@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -155,6 +156,7 @@ def build_exphormer_pair_features(
     Real–real slots copy Zeff ``rpe``; virtual edges use learned ``virt_rpe``
     rows ``0..2 = t←U`` and ``3..5 = U←t``.
     """
+    virt_rpe = virt_rpe.to(dtype=rpe.dtype)
     if rpe.dim() == 3:
         n_real = int(rpe.shape[0])
         n_aug = int(allow.shape[0])
@@ -248,92 +250,96 @@ def dense_exphormer_messages(
     """Dense Exphormer attention with -inf mask.
 
     Returns ``(message_real, message_virt)`` with shapes matching ``hidden_real`` / ``z_virt``.
+    Runs in float32 under CUDA autocast (same rationale as the sparse kernel).
     """
+    out_dtype = hidden_real.dtype
     batch, n_real, width = hidden_real.shape
     n_virt = int(z_virt.shape[1])
     n_aug = n_real + n_virt
     heads = int(w_q.shape[1])
     d_a = int(w_q.shape[2])
-    y = torch.cat((hidden_real, z_virt), dim=1)
-    scores = y.new_full((batch, heads, n_aug, n_aug), float("-inf"))
+    hidden_f = hidden_real.float()
+    z_f = z_virt.float()
+    pair_f = pair_aug.float()
+    y = torch.cat((hidden_f, z_f), dim=1)
     allow_b = allow if allow.dim() == 2 else allow
     tau_b = tau if tau.dim() == 2 else tau
+    amp_off = torch.autocast(device_type="cuda", enabled=False) if y.is_cuda else nullcontext()
+    with amp_off:
+        scores = y.new_full((batch, heads, n_aug, n_aug), float("-inf"))
+        for recv_t in range(NUM_REAL_TYPES + 1):
+            for send_t in range(NUM_REAL_TYPES + 1):
+                if recv_t == TYPE_VIRTUAL and send_t == TYPE_VIRTUAL:
+                    continue
+                try:
+                    p = exph_pair_id(recv_t, send_t)
+                except ValueError:
+                    continue
+                receivers = torch.nonzero(types_aug == recv_t, as_tuple=False).view(-1)
+                senders = torch.nonzero(types_aug == send_t, as_tuple=False).view(-1)
+                if receivers.numel() == 0 or senders.numel() == 0:
+                    continue
+                block_allow = allow_b[receivers.view(-1, 1), senders.view(1, -1)]
+                if not bool(block_allow.any()):
+                    continue
+                query = torch.einsum("bnd,had->bhna", y[:, receivers], w_q[p].float())
+                key = torch.einsum("bnd,had->bhna", y[:, senders], w_k[p].float())
+                if pair_f.dim() == 3:
+                    edge = pair_f[receivers.view(-1, 1), senders.view(1, -1)].unsqueeze(0).unsqueeze(1)
+                    edge = edge.expand(batch, heads, -1, -1, -1)
+                else:
+                    edge = pair_f[:, receivers.view(-1, 1), senders.view(1, -1)].unsqueeze(1)
+                    edge = edge.expand(-1, heads, -1, -1, -1)
+                score = _score_mlp_block(
+                    query,
+                    key,
+                    edge,
+                    score_w1[p].float(),
+                    score_b1[p].float(),
+                    score_w2[p].float(),
+                    score_b2[p].float(),
+                    score_w3[p].float(),
+                    score_b3[p].float(),
+                )
+                block_tau = tau_b[receivers.view(-1, 1), senders.view(1, -1)]
+                bias = edge_bias.new_zeros((heads, receivers.numel(), senders.numel()), dtype=torch.float32)
+                for tau_id in range(NUM_EDGE_TAU):
+                    hit = block_tau == tau_id
+                    if bool(hit.any()):
+                        bias = bias + hit.to(bias.dtype).unsqueeze(0) * edge_bias[tau_id].float().view(heads, 1, 1)
+                score = score + bias.unsqueeze(0)
+                score = score.masked_fill(~block_allow.unsqueeze(0).unsqueeze(0), float("-inf"))
+                scores[:, :, receivers.view(-1, 1), senders.view(1, -1)] = score
 
-    for recv_t in range(NUM_REAL_TYPES + 1):
-        for send_t in range(NUM_REAL_TYPES + 1):
-            if recv_t == TYPE_VIRTUAL and send_t == TYPE_VIRTUAL:
-                continue
-            try:
-                p = exph_pair_id(recv_t, send_t)
-            except ValueError:
-                continue
-            receivers = torch.nonzero(types_aug == recv_t, as_tuple=False).view(-1)
-            senders = torch.nonzero(types_aug == send_t, as_tuple=False).view(-1)
-            if receivers.numel() == 0 or senders.numel() == 0:
-                continue
-            block_allow = allow_b[receivers.view(-1, 1), senders.view(1, -1)]
-            if not bool(block_allow.any()):
-                continue
-            query = torch.einsum("bnd,had->bhna", y[:, receivers], w_q[p])
-            key = torch.einsum("bnd,had->bhna", y[:, senders], w_k[p])
-            if pair_aug.dim() == 3:
-                edge = pair_aug[receivers.view(-1, 1), senders.view(1, -1)].unsqueeze(0).unsqueeze(1)
-                edge = edge.expand(batch, heads, -1, -1, -1)
-            else:
-                edge = pair_aug[:, receivers.view(-1, 1), senders.view(1, -1)].unsqueeze(1)
-                edge = edge.expand(-1, heads, -1, -1, -1)
-            edge = edge.to(dtype=query.dtype)
-            score = _score_mlp_block(
-                query,
-                key,
-                edge,
-                score_w1[p],
-                score_b1[p],
-                score_w2[p],
-                score_b2[p],
-                score_w3[p],
-                score_b3[p],
-            )
-            block_tau = tau_b[receivers.view(-1, 1), senders.view(1, -1)]
-            # Edge-type bias (phys/exp/virt); non-edges stay masked.
-            bias = edge_bias.new_zeros((heads, receivers.numel(), senders.numel()))
-            for tau_id in range(NUM_EDGE_TAU):
-                hit = block_tau == tau_id
-                if bool(hit.any()):
-                    bias = bias + hit.to(bias.dtype).unsqueeze(0) * edge_bias[tau_id].view(heads, 1, 1)
-            score = score + bias.unsqueeze(0)
-            score = score.masked_fill(~block_allow.unsqueeze(0).unsqueeze(0), float("-inf"))
-            scores[:, :, receivers.view(-1, 1), senders.view(1, -1)] = score.to(scores.dtype)
+        weights = torch.softmax(scores, dim=-1)
+        weights = torch.nan_to_num(weights, nan=0.0)
+        row_sum = weights.sum(dim=-1, keepdim=True)
+        weights = torch.where(row_sum > 0, weights / row_sum.clamp(min=1e-12), weights)
 
-    weights = torch.softmax(scores, dim=-1)
-    weights = torch.nan_to_num(weights, nan=0.0)
-    row_sum = weights.sum(dim=-1, keepdim=True)
-    weights = torch.where(row_sum > 0, weights / row_sum.clamp(min=1e-12), weights)
+        mixed = weights.new_zeros((batch, heads, n_aug, d_a))
+        for recv_t in range(NUM_REAL_TYPES + 1):
+            for send_t in range(NUM_REAL_TYPES + 1):
+                if recv_t == TYPE_VIRTUAL and send_t == TYPE_VIRTUAL:
+                    continue
+                try:
+                    p = exph_pair_id(recv_t, send_t)
+                except ValueError:
+                    continue
+                receivers = torch.nonzero(types_aug == recv_t, as_tuple=False).view(-1)
+                senders = torch.nonzero(types_aug == send_t, as_tuple=False).view(-1)
+                if receivers.numel() == 0 or senders.numel() == 0:
+                    continue
+                block_allow = allow_b[receivers.view(-1, 1), senders.view(1, -1)]
+                if not bool(block_allow.any()):
+                    continue
+                block_w = weights[:, :, receivers.view(-1, 1), senders.view(1, -1)]
+                block_w = block_w.masked_fill(~block_allow.unsqueeze(0).unsqueeze(0), 0.0)
+                value = torch.einsum("bnd,had->bhna", y[:, senders], w_v[p].float())
+                gathered = torch.einsum("bhnm,bhma->bhna", block_w, value)
+                mixed = mixed.index_add(2, receivers, gathered)
 
-    mixed = weights.new_zeros((batch, heads, n_aug, d_a))
-    for recv_t in range(NUM_REAL_TYPES + 1):
-        for send_t in range(NUM_REAL_TYPES + 1):
-            if recv_t == TYPE_VIRTUAL and send_t == TYPE_VIRTUAL:
-                continue
-            try:
-                p = exph_pair_id(recv_t, send_t)
-            except ValueError:
-                continue
-            receivers = torch.nonzero(types_aug == recv_t, as_tuple=False).view(-1)
-            senders = torch.nonzero(types_aug == send_t, as_tuple=False).view(-1)
-            if receivers.numel() == 0 or senders.numel() == 0:
-                continue
-            block_allow = allow_b[receivers.view(-1, 1), senders.view(1, -1)]
-            if not bool(block_allow.any()):
-                continue
-            block_w = weights[:, :, receivers.view(-1, 1), senders.view(1, -1)]
-            block_w = block_w.masked_fill(~block_allow.unsqueeze(0).unsqueeze(0), 0.0)
-            value = torch.einsum("bnd,had->bhna", y[:, senders], w_v[p])
-            gathered = torch.einsum("bhnm,bhma->bhna", block_w, value)
-            mixed = mixed.index_add(2, receivers, gathered.to(mixed.dtype))
-
-    message = torch.einsum("bhna,hda->bnd", mixed, w_o.to(dtype=mixed.dtype))
-    return message[:, :n_real], message[:, n_real:]
+        message = torch.einsum("bhna,hda->bnd", mixed, w_o.float())
+    return message[:, :n_real].to(dtype=out_dtype), message[:, n_real:].to(dtype=out_dtype)
 
 
 def sparse_edges_from_dense(
@@ -378,75 +384,78 @@ def sparse_exphormer_messages(
     score_b3: torch.Tensor,
     edge_bias: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sparse edge-list Exphormer attention (should match dense within atol)."""
+    """Sparse edge-list Exphormer attention (should match dense within atol).
+
+    Runs in float32 even under CUDA autocast so Half activations never mix with
+    Float32 parameters during gather / index_put / MLP scoring.
+    """
+    out_dtype = hidden_real.dtype
     batch, n_real, _ = hidden_real.shape
     n_virt = int(z_virt.shape[1])
     n_aug = n_real + n_virt
     heads = int(w_q.shape[1])
     d_a = int(w_q.shape[2])
-    y = torch.cat((hidden_real, z_virt), dim=1)
+    # Force fp32 compute; cast messages back to the caller activation dtype.
+    hidden_f = hidden_real.float()
+    z_f = z_virt.float()
+    pair_f = pair_aug.float()
+    y = torch.cat((hidden_f, z_f), dim=1)
     e = int(recv_idx.numel())
     if e == 0:
         return hidden_real.new_zeros(hidden_real.shape), z_virt.new_zeros(z_virt.shape)
 
-    # Per-edge scores (B, H, E). Use activation dtype explicitly so CUDA autocast
-    # and CPU float16 smoke tests do not mix Half buffers with Float32 parameters.
-    dtype = y.dtype
-    scores = y.new_zeros((batch, heads, e))
-    values = y.new_zeros((batch, heads, e, d_a))
-    for p in range(NUM_EXPH_PAIRS):
-        edge_mask = pair_ids == p
-        if not bool(edge_mask.any()):
-            continue
-        local = torch.nonzero(edge_mask, as_tuple=False).view(-1)
-        r = recv_idx[local]
-        s = send_idx[local]
-        wq = w_q[p].to(dtype=dtype)
-        wk = w_k[p].to(dtype=dtype)
-        wv = w_v[p].to(dtype=dtype)
-        sw1 = score_w1[p].to(dtype=dtype)
-        sb1 = score_b1[p].to(dtype=dtype)
-        sw2 = score_w2[p].to(dtype=dtype)
-        sb2 = score_b2[p].to(dtype=dtype)
-        sw3 = score_w3[p].to(dtype=dtype)
-        sb3 = score_b3[p].to(dtype=dtype)
-        # Unique receivers/senders for this pair, then map edges into the dense block path.
-        # For parity and simplicity: evaluate each edge with einsum over gathered endpoints.
-        q = torch.einsum("bed,had->bhea", y[:, r], wq)  # B,H,E_p,D_A
-        k = torch.einsum("bed,had->bhea", y[:, s], wk)
-        v = torch.einsum("bed,had->bhea", y[:, s], wv)
-        if pair_aug.dim() == 3:
-            edge_feat = pair_aug[r, s].unsqueeze(0).unsqueeze(1).expand(batch, heads, -1, -1)
-        else:
-            edge_feat = pair_aug[:, r, s].unsqueeze(1).expand(-1, heads, -1, -1)
-        edge_feat = edge_feat.to(dtype=dtype)
-        joint = torch.cat((q, k, edge_feat), dim=-1)
-        h1 = torch.relu(torch.einsum("bhes,has->bhea", joint, sw1) + sb1.view(1, heads, 1, -1))
-        h2 = torch.relu(torch.einsum("bhea,hca->bhec", h1, sw2) + sb2.view(1, heads, 1, -1))
-        score = torch.einsum("bhec,hc->bhe", h2, sw3[:, 0]) + sb3.view(1, heads, 1)
-        tau_e = edge_tau[local]
-        bias = edge_bias[tau_e].transpose(0, 1).unsqueeze(0).to(dtype=dtype)  # (1,H,E_p)
-        score = score + bias
-        scores[:, :, local] = score.to(dtype=scores.dtype)
-        values[:, :, local] = v.to(dtype=values.dtype)
+    # Disable surrounding CUDA autocast for the whole sparse kernel.
+    amp_off = torch.autocast(device_type="cuda", enabled=False) if y.is_cuda else nullcontext()
+    with amp_off:
+        scores = y.new_zeros((batch, heads, e))
+        values = y.new_zeros((batch, heads, e, d_a))
+        for p in range(NUM_EXPH_PAIRS):
+            edge_mask = pair_ids == p
+            if not bool(edge_mask.any()):
+                continue
+            local = torch.nonzero(edge_mask, as_tuple=False).view(-1)
+            r = recv_idx[local]
+            s = send_idx[local]
+            wq = w_q[p].float()
+            wk = w_k[p].float()
+            wv = w_v[p].float()
+            sw1 = score_w1[p].float()
+            sb1 = score_b1[p].float()
+            sw2 = score_w2[p].float()
+            sb2 = score_b2[p].float()
+            sw3 = score_w3[p].float()
+            sb3 = score_b3[p].float()
+            q = torch.einsum("bed,had->bhea", y[:, r], wq)
+            k = torch.einsum("bed,had->bhea", y[:, s], wk)
+            v = torch.einsum("bed,had->bhea", y[:, s], wv)
+            if pair_f.dim() == 3:
+                edge_feat = pair_f[r, s].unsqueeze(0).unsqueeze(1).expand(batch, heads, -1, -1)
+            else:
+                edge_feat = pair_f[:, r, s].unsqueeze(1).expand(-1, heads, -1, -1)
+            joint = torch.cat((q, k, edge_feat), dim=-1)
+            h1 = torch.relu(torch.einsum("bhes,has->bhea", joint, sw1) + sb1.view(1, heads, 1, -1))
+            h2 = torch.relu(torch.einsum("bhea,hca->bhec", h1, sw2) + sb2.view(1, heads, 1, -1))
+            score = torch.einsum("bhec,hc->bhe", h2, sw3[:, 0]) + sb3.view(1, heads, 1)
+            tau_e = edge_tau[local]
+            bias = edge_bias[tau_e].transpose(0, 1).unsqueeze(0).float()
+            score = score + bias
+            scores[:, :, local] = score
+            values[:, :, local] = v
 
-    # Softmax per receiver over its incident edges.
-    weights = y.new_zeros((batch, heads, e))
-    for node in range(n_aug):
-        local = torch.nonzero(recv_idx == node, as_tuple=False).view(-1)
-        if local.numel() == 0:
-            continue
-        logits = scores[:, :, local]
-        w = torch.softmax(logits, dim=-1)
-        w = torch.nan_to_num(w, nan=0.0)
-        weights[:, :, local] = w.to(dtype=weights.dtype)
+        weights = y.new_zeros((batch, heads, e))
+        for node in range(n_aug):
+            local = torch.nonzero(recv_idx == node, as_tuple=False).view(-1)
+            if local.numel() == 0:
+                continue
+            logits = scores[:, :, local]
+            w = torch.softmax(logits, dim=-1)
+            w = torch.nan_to_num(w, nan=0.0)
+            weights[:, :, local] = w
 
-    mixed = y.new_zeros((batch, heads, n_aug, d_a))
-    # Scatter-add α * v onto receivers.
-    for edge_i in range(e):
-        r = int(recv_idx[edge_i])
-        contrib = weights[:, :, edge_i].unsqueeze(-1) * values[:, :, edge_i]
-        mixed[:, :, r] = mixed[:, :, r] + contrib.to(dtype=mixed.dtype)
+        mixed = y.new_zeros((batch, heads, n_aug, d_a))
+        for edge_i in range(e):
+            r = int(recv_idx[edge_i])
+            mixed[:, :, r] = mixed[:, :, r] + weights[:, :, edge_i].unsqueeze(-1) * values[:, :, edge_i]
 
-    message = torch.einsum("bhna,hda->bnd", mixed, w_o.to(dtype=mixed.dtype))
-    return message[:, :n_real], message[:, n_real:]
+        message = torch.einsum("bhna,hda->bnd", mixed, w_o.float())
+    return message[:, :n_real].to(dtype=out_dtype), message[:, n_real:].to(dtype=out_dtype)
