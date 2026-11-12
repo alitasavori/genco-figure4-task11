@@ -149,6 +149,39 @@ def test_audit_rpe_correctness_small_graph():
     assert all(check.passed for check in checks)
 
 
+def test_move_to_preserves_global_rpe_scales_for_audit():
+    """Device copies must keep s_R/s_X; otherwise audit falls back to per-component norms and fails."""
+    branches = [(0, 1, 0.02, 0.06), (1, 2, 0.03, 0.08), (0, 2, 0.04, 0.1)]
+    ybus = np.zeros((3, 3), dtype=np.complex64)
+    # Global unit scales (train floor) differ from per-component peaks on this graph.
+    features, component = meshed_rpe(3, branches, ybus, re_scale=1.0, im_scale=1.0)
+    host = Network(
+        ybus=torch.from_numpy(ybus),
+        rpe=torch.from_numpy(features),
+        component=torch.from_numpy(component.astype(np.int64)),
+        types=torch.tensor([0, 1, 2], dtype=torch.long),
+        branches=tuple(branches),
+        rpe_re_scale=1.0,
+        rpe_im_scale=1.0,
+    )
+    assert all(check.passed for check in audit_rpe_correctness(host))
+    moved = tpgt.move_to(host, torch.device("cpu"))
+    assert moved.rpe_re_scale == 1.0 and moved.rpe_im_scale == 1.0
+    assert all(check.passed for check in audit_rpe_correctness(moved))
+    # Regression: dropping scales makes recompute_from_branches fail against globally scaled RPE.
+    dropped = Network(
+        ybus=moved.ybus,
+        rpe=moved.rpe,
+        component=moved.component,
+        types=moved.types,
+        branches=moved.branches,
+        rpe_re_scale=None,
+        rpe_im_scale=None,
+    )
+    recompute = next(check for check in audit_rpe_correctness(dropped) if check.name == "recompute_from_branches")
+    assert not recompute.passed
+
+
 def tiny_consistent_split(cases: int = 4) -> tuple[Split, Network]:
     """3-bus case whose P/Q labels exactly satisfy AC power flow for the sampled V, theta."""
     branches = [(0, 1, 0.02, 0.06), (1, 2, 0.03, 0.08), (0, 2, 0.04, 0.1)]

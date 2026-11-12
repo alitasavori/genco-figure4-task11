@@ -141,9 +141,22 @@ def test_copy_training_rpe_scales_from_checkpoint_cache(tmp_path):
     ckpt_cache.mkdir(parents=True)
     dest = tmp_path / "tpgt_task3.1_v9" / "cache"
     dest.mkdir(parents=True)
-    tpgt.save_rpe_global_scales(ckpt_cache, 1.25, 0.75)
+    tpgt.save_rpe_global_scales(ckpt_cache, 1.25, 0.75, raw_re=0.8, raw_im=0.75, source="train_fit")
     tpgt.copy_training_rpe_scales(dest, ckpt)
     assert tpgt.load_rpe_global_scales(dest) == (1.25, 0.75)
+    payload = tpgt.read_rpe_scales_payload(dest)
+    assert payload is not None
+    assert payload.get("rpe_re_peak_raw") == 0.8
+
+
+def test_load_rpe_global_scales_rejects_stale_version(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    tpgt.rpe_scales_path(cache).write_text(
+        '{"version": "old", "checkpoint_version": "x", "rpe_re_scale": 2, "rpe_im_scale": 2}',
+        encoding="utf-8",
+    )
+    assert tpgt.load_rpe_global_scales(cache) is None
 
 
 def test_cross_grid_checkpoint_root(tmp_path):

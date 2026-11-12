@@ -33,7 +33,12 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
 ------------------------------------------------------------------------
 * **Correction stages** (``DEPTH``), each with its own weights; the physics
   loss sums stage residuals with GENCO weights ``0.5**(K-i)`` (last stage 1).
-  Default ``DEPTH=4``; preset ``v8`` uses ``DEPTH=8`` with wider ``D/D_E/D_A/HEADS``.
+  Default ``DEPTH=4``; preset ``v8`` / ``v9`` / ``v10`` use ``DEPTH=8`` with wider
+  ``D/D_E/D_A/HEADS``.
+* **Attention**: ``grit`` (default; v7–v9) uses pair-modulated GRIT scores on
+  ``pair_encoder(RPE)``; ``v10`` uses Approach C joint MLP scores
+  ``MLP_{t_i←t_j}^{ℓ,h}([W_Q h_i ‖ W_K h_j ‖ r_ij])`` with **raw** RPE ``r_ij``
+  (no pair encoder). Softmax and type-pair blocks are unchanged.
 * **2-channel RPE**: ``Zeff_Re_norm``, ``Zeff_Im_norm`` (complex Laplacian effective impedance).
 * **RPE channel dropout**: during training each channel is zeroed with
   probability ``RPE_CHANNEL_DROPOUT`` per optimizer step; never at eval.
@@ -59,10 +64,10 @@ Performance notes (Colab / large train split)
 * **``meshed_rpe``**: Computed only when building or refreshing the split cache,
   once per *distinct* in-service topology (see ``read_split`` representatives),
   not per scenario and not per training batch.
-* **``pair_encoder``**: Runs once per forward on the static ``118×118`` RPEs of
-  the batch's topologies (stacked when several share bus types). Weights train, so
-  training must re-encode every step; in ``eval`` mode a single-topology batch
-  caches its encoded pairs on ``Network.pair_embed``.
+* **``pair_encoder``**: For GRIT arches, runs once per forward on the static
+  ``118×118`` RPEs (stacked when several share bus types). For ``v10`` / joint MLP
+  attention the encoder is ``Identity`` and stages see raw ``r_ij``. In ``eval``
+  mode a single-topology batch may cache pair features on ``Network.pair_embed``.
 * **Type-pair attention**: ``CorrectionStage._messages`` evaluates each of the
   nine type-pair weight sets only on its own receiver-type × sender-type block
   (both heads batched), then takes one softmax over all senders per receiver. With per-case
@@ -199,6 +204,11 @@ NODE_SHUNT_B_DIM = 1
 NODE_FEATURE_DIM = NODE_PQVT_DIM + NODE_SHUNT_B_DIM  # 5 = (P,Q,V,θ,Bs)
 NODE_ENCODER_FEATURE_NAMES = ("P", "Q", "V", "theta", "busBS")
 USE_NODE_SHUNT = False
+# ``grit``: ReLU(ρ(W_Q h_i + W_K h_j) ⊙ W_Ew e_ij + W_Eb e_ij) then linear score (default).
+# ``joint_mlp``: s_ij = MLP_{t_i←t_j}^{ℓ,h}([W_Q h_i ‖ W_K h_j ‖ r_ij]) on raw RPE (Approach C; v10).
+ATTENTION_KIND = "grit"
+# Hidden width of the joint score MLP (per type-pair, per head, per stage); input is 2*D_A + RPE_DIM.
+ATTENTION_MLP_HIDDEN = 48
 # Named width/depth presets (same math/loss/packing). ``GENCO_TPGT_ARCH`` / ``--arch`` selects one;
 # optional ``GENCO_TPGT_D`` / ``DEPTH`` / ``D_E`` / ``D_A`` / ``HEADS`` / ``RUN_TAG`` override fields.
 ARCH_PRESETS: dict[str, dict[str, int | str | bool]] = {
@@ -211,6 +221,7 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool]] = {
         "RUN_TAG": "v7",
         "CHECKPOINT_VERSION": "meshed-rpe-2-d4-v7",
         "USE_NODE_SHUNT": False,
+        "ATTENTION_KIND": "grit",
     },
     # Deeper iterative refine + wider type-pair attention; new Drive folder ``tpgt_task11_v8``.
     "v8": {
@@ -222,6 +233,7 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool]] = {
         "RUN_TAG": "v8",
         "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h4-v8",
         "USE_NODE_SHUNT": False,
+        "ATTENTION_KIND": "grit",
     },
     # v8 width/depth + (P,Q,V,θ,Bs) node features; Zeff Re/Im RPE; folder ``tpgt_task11_v9``.
     "v9": {
@@ -233,6 +245,7 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool]] = {
         "RUN_TAG": "v9",
         "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h4-pqvt-busBS-v9",
         "USE_NODE_SHUNT": True,
+        "ATTENTION_KIND": "grit",
     },
     # v9 node/RPE features with v7 depth (4 stages); separate ``RUN_TAG`` / checkpoint version.
     "v9d4": {
@@ -244,6 +257,20 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool]] = {
         "RUN_TAG": "v9d4",
         "CHECKPOINT_VERSION": "meshed-rpe-2-d4-w96-h4-pqvt-busBS-v9d4",
         "USE_NODE_SHUNT": True,
+        "ATTENTION_KIND": "grit",
+    },
+    # v9 capacity/features with joint MLP pair attention on raw RPE (Approach C; no pair encoder).
+    "v10": {
+        "D": 96,
+        "D_E": 48,  # unused by attention (kept for preset symmetry); pair_encoder is Identity.
+        "D_A": 48,
+        "HEADS": 4,
+        "DEPTH": 8,
+        "RUN_TAG": "v10",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h4-pqvt-busBS-mlpattn-rawrpe-v10",
+        "USE_NODE_SHUNT": True,
+        "ATTENTION_KIND": "joint_mlp",
+        "ATTENTION_MLP_HIDDEN": 48,
     },
 }
 # Fixed training subset scored with val's PBL metric each validation pass (overfitting check).
@@ -694,20 +721,50 @@ def _init_matrices(weight: torch.Tensor) -> None:
 
 
 class CorrectionStage(nn.Module):
-    """One unshared GRIT correction. Nine type pairs, each with its own head weights."""
+    """One unshared correction stage. Nine type pairs, each with its own head weights.
+
+    Attention kind is selected by ``ATTENTION_KIND`` at construction:
+    * ``grit`` (default): pair-conditioned GRIT scores and edge-augmented values.
+    * ``joint_mlp`` (v10): nine type-pair × head score MLPs
+      ``s_ij = MLP_{t_i←t_j}([W_Q h_i ‖ W_K h_j ‖ r_ij])`` on raw RPE; values ``W_V h_j`` only.
+    """
 
     def __init__(self) -> None:
         super().__init__()
+        self.attention_kind = ATTENTION_KIND
+        # Nine directed type-pairs × HEADS: each (pair, head) has its own Q/K/V and score MLP.
         shape = (9, HEADS)
         self.w_q = nn.Parameter(torch.empty(*shape, D_A, D))
         self.w_k = nn.Parameter(torch.empty(*shape, D_A, D))
         self.w_v = nn.Parameter(torch.empty(*shape, D_A, D))
-        self.w_ew = nn.Parameter(torch.empty(*shape, D_A, D_E))
-        self.w_eb = nn.Parameter(torch.empty(*shape, D_A, D_E))
-        self.w_a = nn.Parameter(torch.empty(*shape, 1, D_A))
-        self.w_ev = nn.Parameter(torch.empty(*shape, D_A, D_A))
         self.w_o = nn.Parameter(torch.empty(HEADS, D, D_A))
-        for parameter in (self.w_q, self.w_k, self.w_v, self.w_ew, self.w_eb, self.w_a, self.w_ev, self.w_o):
+        grit_params: list[nn.Parameter] = []
+        mlp_params: list[nn.Parameter] = []
+        if self.attention_kind == "joint_mlp":
+            hidden = int(ATTENTION_MLP_HIDDEN)
+            # Raw RPE channels (Zeff Re/Im), not pair_encoder(D_E) embeddings.
+            score_in = 2 * D_A + RPE_DIM
+            self.score_w1 = nn.Parameter(torch.empty(*shape, hidden, score_in))
+            self.score_b1 = nn.Parameter(torch.zeros(*shape, hidden))
+            self.score_w2 = nn.Parameter(torch.empty(*shape, 1, hidden))
+            self.score_b2 = nn.Parameter(torch.zeros(*shape, 1))
+            mlp_params = [self.score_w1, self.score_w2]
+            # Keep GRIT tensors absent so state_dict / param counts match the attention kind.
+            self.w_ew = None
+            self.w_eb = None
+            self.w_a = None
+            self.w_ev = None
+        else:
+            self.w_ew = nn.Parameter(torch.empty(*shape, D_A, D_E))
+            self.w_eb = nn.Parameter(torch.empty(*shape, D_A, D_E))
+            self.w_a = nn.Parameter(torch.empty(*shape, 1, D_A))
+            self.w_ev = nn.Parameter(torch.empty(*shape, D_A, D_A))
+            grit_params = [self.w_ew, self.w_eb, self.w_a, self.w_ev]
+            self.score_w1 = None
+            self.score_b1 = None
+            self.score_w2 = None
+            self.score_b2 = None
+        for parameter in (self.w_q, self.w_k, self.w_v, self.w_o, *grit_params, *mlp_params):
             _init_matrices(parameter)
         self.update = nn.ModuleList(MLP(D + D + 2, D) for _ in range(3))
         self.decode = nn.ModuleList(MLP(D, 2) for _ in range(3))
@@ -769,9 +826,43 @@ class CorrectionStage(nn.Module):
         (bus types differing per case) may overlap; each entry of a case is set by the one block of
         its types and weighted only there.
         """
+        if self.attention_kind == "joint_mlp":
+            return self._messages_joint_mlp(hidden, pair, blocks)
+        return self._messages_grit(hidden, pair, blocks)
+
+    def _scatter_block_scores(
+        self,
+        scores: torch.Tensor | None,
+        score: torch.Tensor,
+        block: TypePairBlock,
+        batch: int,
+        buses: int,
+    ) -> torch.Tensor:
+        receivers = block.receivers.view(-1, 1)
+        senders = block.senders.view(1, -1)
+        if scores is None:
+            scores = score.new_full((batch, HEADS, buses, buses), float("-inf"))
+        if block.mask.dim() == 2:
+            score = score.masked_fill(~block.mask, float("-inf"))
+            scores[:, :, receivers, senders] = score.to(scores.dtype)
+        else:
+            own = block.mask.unsqueeze(1)
+            scores[:, :, receivers, senders] = torch.where(
+                own, score.to(scores.dtype), scores[:, :, receivers, senders]
+            )
+        return scores
+
+    def _messages_grit(
+        self,
+        hidden: torch.Tensor,
+        pair: torch.Tensor,
+        blocks: list[TypePairBlock],
+    ) -> torch.Tensor:
         batch, buses, _ = hidden.shape
         scores: torch.Tensor | None = None
         interactions = []
+        assert self.w_ew is not None and self.w_eb is not None
+        assert self.w_a is not None and self.w_ev is not None
         for block in blocks:
             p = block.pair_id
             receivers = block.receivers.view(-1, 1)
@@ -789,16 +880,7 @@ class CorrectionStage(nn.Module):
                 bias = torch.einsum("bnme,hae->bhnma", edge, self.w_eb[p])
             interaction = torch.relu(mixed * projected + bias)
             score = torch.einsum("bhnma,ha->bhnm", interaction, self.w_a[p, :, 0])
-            if scores is None:
-                scores = score.new_full((batch, HEADS, buses, buses), float("-inf"))
-            if block.mask.dim() == 2:
-                score = score.masked_fill(~block.mask, float("-inf"))
-                scores[:, :, receivers, senders] = score.to(scores.dtype)
-            else:
-                own = block.mask.unsqueeze(1)
-                scores[:, :, receivers, senders] = torch.where(
-                    own, score.to(scores.dtype), scores[:, :, receivers, senders]
-                )
+            scores = self._scatter_block_scores(scores, score, block, batch, buses)
             interactions.append(interaction)
         if scores is None:
             return hidden.new_zeros(hidden.shape)
@@ -817,6 +899,64 @@ class CorrectionStage(nn.Module):
             gathered = torch.einsum("bhnm,bhma->bhna", block_weights, value)
             pooled = torch.einsum("bhnm,bhnma->bhna", block_weights, interaction)
             gathered = gathered + torch.einsum("bhna,hxa->bhnx", pooled, self.w_ev[p])
+            mixed_heads = mixed_heads.index_add(2, block.receivers, gathered.to(mixed_heads.dtype))
+        return torch.einsum("bhna,hda->bnd", mixed_heads, self.w_o)
+
+    def _messages_joint_mlp(
+        self,
+        hidden: torch.Tensor,
+        pair: torch.Tensor,
+        blocks: list[TypePairBlock],
+    ) -> torch.Tensor:
+        """Approach C: ``s_ij = MLP_{t_i←t_j}^{h}([q_i ‖ k_j ‖ r_ij])``; ``pair`` is raw RPE."""
+        batch, buses, _ = hidden.shape
+        scores: torch.Tensor | None = None
+        assert self.score_w1 is not None and self.score_b1 is not None
+        assert self.score_w2 is not None and self.score_b2 is not None
+        if pair.shape[-1] != RPE_DIM:
+            raise ValueError(
+                f"joint MLP attention expects raw RPE last-dim {RPE_DIM}, got {tuple(pair.shape)}"
+            )
+        for block in blocks:
+            p = block.pair_id
+            receivers = block.receivers.view(-1, 1)
+            senders = block.senders.view(1, -1)
+            query = torch.einsum("bnd,had->bhna", hidden[:, block.receivers], self.w_q[p])
+            key = torch.einsum("bnd,had->bhna", hidden[:, block.senders], self.w_k[p])
+            if pair.dim() == 3:
+                edge = pair[receivers, senders].unsqueeze(0).unsqueeze(1)
+                edge = edge.expand(batch, HEADS, -1, -1, -1)
+            else:
+                edge = pair[:, receivers, senders].unsqueeze(1).expand(-1, HEADS, -1, -1, -1)
+            # (B,H,Nr,Ns,2*D_A+RPE_DIM): one score MLP per type-pair (p) and head.
+            joint = torch.cat(
+                (
+                    query.unsqueeze(-2).expand(-1, -1, -1, key.shape[-2], -1),
+                    key.unsqueeze(-3).expand(-1, -1, query.shape[-2], -1, -1),
+                    edge,
+                ),
+                dim=-1,
+            )
+            hidden_act = torch.relu(
+                torch.einsum("bhnms,has->bhnma", joint, self.score_w1[p]) + self.score_b1[p].view(1, HEADS, 1, 1, -1)
+            )
+            score = torch.einsum("bhnma,ha->bhnm", hidden_act, self.score_w2[p, :, 0])
+            score = score + self.score_b2[p].view(1, HEADS, 1, 1)
+            scores = self._scatter_block_scores(scores, score, block, batch, buses)
+        if scores is None:
+            return hidden.new_zeros(hidden.shape)
+        weights = torch.softmax(scores, dim=-1)
+        weights = torch.nan_to_num(weights, nan=0.0)
+        row_sum = weights.sum(dim=-1, keepdim=True)
+        weights = torch.where(row_sum > 0, weights / row_sum.clamp(min=1e-12), weights)
+        mixed_heads = weights.new_zeros((batch, HEADS, buses, D_A))
+        for block in blocks:
+            p = block.pair_id
+            block_weights = weights[:, :, block.receivers.view(-1, 1), block.senders.view(1, -1)]
+            if block.mask.dim() == 3:
+                block_weights = block_weights.masked_fill(~block.mask.unsqueeze(1), 0.0)
+            value = torch.einsum("bnd,had->bhna", hidden[:, block.senders], self.w_v[p])
+            gathered = torch.einsum("bhnm,bhma->bhna", block_weights, value)
             mixed_heads = mixed_heads.index_add(2, block.receivers, gathered.to(mixed_heads.dtype))
         return torch.einsum("bhna,hda->bnd", mixed_heads, self.w_o)
 
@@ -873,8 +1013,14 @@ class TPGT(nn.Module):
         # v9: (P,Q,V,θ,Bs) for all types. Else: packed specified (2). No ground node.
         self.encoders = nn.ModuleList(MLP(node_in, D) for _ in range(3))
         self.use_node_shunt = USE_NODE_SHUNT
-        self.pair_encoder = MLP(RPE_DIM, D_E)
+        # v10 joint MLP attention consumes raw RPE; GRIT still uses a learned pair encoder.
+        self.use_raw_rpe = ATTENTION_KIND == "joint_mlp"
+        self.pair_encoder: nn.Module = nn.Identity() if self.use_raw_rpe else MLP(RPE_DIM, D_E)
         self.stages = nn.ModuleList(CorrectionStage() for _ in range(DEPTH))
+
+    def encode_pairs(self, rpe: torch.Tensor) -> torch.Tensor:
+        """Features passed into correction-stage attention (raw RPE for v10, else ``pair_encoder``)."""
+        return rpe if self.use_raw_rpe else self.pair_encoder(rpe)
 
     def forward(
         self,
@@ -893,7 +1039,7 @@ class TPGT(nn.Module):
         ``shunt_b`` is bus-shunt ``BS`` (N,) or (B, N); required for v9 node features.
         """
         if pair is None:
-            pair = self.pair_encoder(rpe)
+            pair = self.encode_pairs(rpe)
         if layout is None:
             if pair_type_masks is None:
                 raise ValueError("TPGT forward needs pair_type_masks or a layout")
@@ -1198,6 +1344,8 @@ def summarize_rpe(rpe: torch.Tensor) -> list[dict[str, float]]:
 
 def pair_encoder_input_weight_norms(model: TPGT) -> list[dict[str, float]]:
     """L2 norm of each column of the pair_encoder first layer (how strongly each RPE channel is wired in)."""
+    if getattr(model, "use_raw_rpe", False) or isinstance(model.pair_encoder, nn.Identity):
+        return [{"name": name, "weight_l2": 0.0} for name in RPE_FEATURE_NAMES]
     first = model.pair_encoder.net[0]
     if not isinstance(first, nn.Linear):
         raise TypeError("pair_encoder first layer must be Linear")
@@ -1314,7 +1462,7 @@ def collect_rpe_channel_ablation(
     for channel, name in enumerate(RPE_FEATURE_NAMES):
         rpe_ablated = network.rpe.clone()
         rpe_ablated[..., channel] = 0.0
-        ablated_pair = model.pair_encoder(rpe_ablated)
+        ablated_pair = model.encode_pairs(rpe_ablated)
         metrics = eval_batch_with_pair(model, split, network, index, device, ablated_pair)
         rows.append(
             {
@@ -1333,9 +1481,14 @@ def format_rpe_effectiveness_diagnostics(
     baseline: dict[str, float] | None,
     ablation_rows: list[dict[str, float]] | None,
 ) -> str:
-    lines = ["Pair-encoder input weight L2 per RPE channel (structural; not causal):"]
-    for row in sorted(weight_rows, key=lambda item: item["weight_l2"], reverse=True):
-        lines.append(f"  {row['name']:12s} weight_l2 {row['weight_l2']:.4g}")
+    if ATTENTION_KIND == "joint_mlp":
+        lines = [
+            "Pair-encoder weights: skipped (v10 / joint MLP attention uses raw RPE r_ij; no pair encoder)."
+        ]
+    else:
+        lines = ["Pair-encoder input weight L2 per RPE channel (structural; not causal):"]
+        for row in sorted(weight_rows, key=lambda item: item["weight_l2"], reverse=True):
+            lines.append(f"  {row['name']:12s} weight_l2 {row['weight_l2']:.4g}")
     if baseline is None or ablation_rows is None:
         lines.append(
             "RPE channel ablation: not run (use --diagnose, --rpe-ablation, or GENCO_TPGT_RPE_ABLATION=1)."
@@ -2337,7 +2490,15 @@ def global_zeff_rpe_scales(
     branch_lists: list[list[tuple[int, int, float, float]]],
     bus_count: int = 118,
 ) -> tuple[float, float]:
-    """``s_R``, ``s_X`` = max off-diagonal |Re| and |Im| of ``Z_eff`` over every topology."""
+    """``s_R``, ``s_X`` = max off-diagonal |Re| and |Im| of ``Z_eff`` over every topology (floored at 1)."""
+    _s_r, _s_x, _raw_r, _raw_x = fit_global_zeff_rpe_scales_from_branch_lists(branch_lists, bus_count)
+    return _s_r, _s_x
+
+
+def fit_global_zeff_rpe_scales_from_branch_lists(
+    branch_lists: list[list[tuple[int, int, float, float]]],
+    bus_count: int,
+) -> tuple[float, float, float, float]:
     max_re = 0.0
     max_im = 0.0
     for branches in branch_lists:
@@ -2347,7 +2508,27 @@ def global_zeff_rpe_scales(
         peak_re, peak_im = meshed_zeff_peak_abs(z_eff, component, bus_count)
         max_re = max(max_re, peak_re)
         max_im = max(max_im, peak_im)
-    return (max(max_re, 1.0), max(max_im, 1.0))
+    return max(max_re, 1.0), max(max_im, 1.0), max_re, max_im
+
+
+def fit_global_zeff_rpe_scales_from_networks(
+    networks: list[Network],
+) -> tuple[float, float, float, float]:
+    """Train-fit max |Z_eff| peaks across every ``Network`` (correct ``bus_count`` per grid)."""
+    max_re = 0.0
+    max_im = 0.0
+    for network in networks:
+        if not network.branches:
+            continue
+        bus_count = int(network.ybus.shape[0])
+        z_eff, component = _meshed_zeff_and_component(bus_count, list(network.branches))
+        peak_re, peak_im = meshed_zeff_peak_abs(z_eff, component, bus_count)
+        max_re = max(max_re, peak_re)
+        max_im = max(max_im, peak_im)
+    if not any(network.branches for network in networks):
+        print("  RPE scale fit: no branch lists on train networks; using s_R=s_X=1.0", flush=True)
+        return 1.0, 1.0, 0.0, 0.0
+    return max(max_re, 1.0), max(max_im, 1.0), max_re, max_im
 
 
 def meshed_rpe(
@@ -2416,7 +2597,15 @@ def rpe_scales_path(persistent: Path) -> Path:
     return persistent / RPE_SCALES_FILE
 
 
-def save_rpe_global_scales(persistent: Path, re_scale: float, im_scale: float) -> None:
+def save_rpe_global_scales(
+    persistent: Path,
+    re_scale: float,
+    im_scale: float,
+    *,
+    raw_re: float | None = None,
+    raw_im: float | None = None,
+    source: str = "train_fit",
+) -> None:
     """Persist train-fit ``s_R,s_X`` for valid/test cache builds (Drive ``checkpoints/cache``)."""
     persistent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -2424,21 +2613,70 @@ def save_rpe_global_scales(persistent: Path, re_scale: float, im_scale: float) -
         "checkpoint_version": CHECKPOINT_VERSION,
         "rpe_re_scale": re_scale,
         "rpe_im_scale": im_scale,
+        "source": source,
     }
+    if raw_re is not None:
+        payload["rpe_re_peak_raw"] = raw_re
+    if raw_im is not None:
+        payload["rpe_im_peak_raw"] = raw_im
     rpe_scales_path(persistent).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def load_rpe_global_scales(persistent: Path) -> tuple[float, float] | None:
-    path = rpe_scales_path(persistent)
+def read_rpe_scales_payload(cache_dir: Path) -> dict | None:
+    path = rpe_scales_path(cache_dir)
     if not path.is_file():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+
+
+def load_rpe_global_scales(persistent: Path) -> tuple[float, float] | None:
+    payload = read_rpe_scales_payload(persistent)
+    if payload is None:
         return None
     if payload.get("version") != CACHE_VERSION or payload.get("checkpoint_version") != CHECKPOINT_VERSION:
         return None
     return float(payload["rpe_re_scale"]), float(payload["rpe_im_scale"])
+
+
+def log_rpe_scales_provenance(cache_dir: Path, *, context: str) -> None:
+    """Explain where ``s_R,s_X`` came from (file vs missing vs version mismatch vs unit floor)."""
+    path = rpe_scales_path(cache_dir)
+    payload = read_rpe_scales_payload(cache_dir)
+    if payload is None:
+        if not path.is_file():
+            print(f"  RPE scales ({context}): no {RPE_SCALES_FILE} under {cache_dir}", flush=True)
+        else:
+            print(
+                f"  RPE scales ({context}): {path.name} present but unreadable or wrong "
+                f"{CACHE_VERSION}/{CHECKPOINT_VERSION}",
+                flush=True,
+            )
+        return
+    if payload.get("version") != CACHE_VERSION or payload.get("checkpoint_version") != CHECKPOINT_VERSION:
+        print(
+            f"  RPE scales ({context}): ignoring stale {path} "
+            f"(want {CACHE_VERSION}+{CHECKPOINT_VERSION}, "
+            f"got {payload.get('version')}+{payload.get('checkpoint_version')})",
+            flush=True,
+        )
+        return
+    re_scale = float(payload["rpe_re_scale"])
+    im_scale = float(payload["rpe_im_scale"])
+    raw_re = payload.get("rpe_re_peak_raw")
+    raw_im = payload.get("rpe_im_peak_raw")
+    source = payload.get("source", "unknown")
+    note = f"s_R={re_scale:.6g} s_X={im_scale:.6g} source={source} file={path}"
+    if raw_re is not None and raw_im is not None:
+        note += f" (train peaks raw={float(raw_re):.6g}, {float(raw_im):.6g}"
+        if re_scale == 1.0 and im_scale == 1.0 and (float(raw_re) < 1.0 or float(raw_im) < 1.0):
+            note += "; applied max(peak,1) floor, not a default"
+        note += ")"
+    elif re_scale == 1.0 and im_scale == 1.0:
+        note += " (unit scales: refit train or inspect peaks; not used when file missing — build would fail)"
+    print(f"  RPE scales ({context}): {note}", flush=True)
 
 
 def cross_grid_checkpoint_root(checkpoints: Path, ckpt_root: Path | None) -> bool:
@@ -2459,9 +2697,21 @@ def copy_training_rpe_scales(persistent: Path, weight_run: Path) -> None:
     for folder in candidates:
         scales = load_rpe_global_scales(folder)
         if scales is not None:
-            save_rpe_global_scales(persistent, scales[0], scales[1])
+            payload = read_rpe_scales_payload(folder)
+            raw_re = None if payload is None else payload.get("rpe_re_peak_raw")
+            raw_im = None if payload is None else payload.get("rpe_im_peak_raw")
+            source = "copied_from_" + folder.name
+            save_rpe_global_scales(
+                persistent,
+                scales[0],
+                scales[1],
+                raw_re=float(raw_re) if raw_re is not None else None,
+                raw_im=float(raw_im) if raw_im is not None else None,
+                source=source,
+            )
+            log_rpe_scales_provenance(folder, context="weight run")
             print(
-                f"RPE scales for eval caches: s_R={scales[0]:.6g} s_X={scales[1]:.6g} (from {folder})",
+                f"RPE scales for eval caches: copied from {folder} -> {rpe_scales_path(persistent)}",
                 flush=True,
             )
             return
@@ -2498,6 +2748,7 @@ def warm_split_caches(
             flush=True,
         )
         copy_training_rpe_scales(persistent, weight_run)
+        log_rpe_scales_provenance(persistent, context="Task 3.1 eval cache")
         scales_path = rpe_scales_path(persistent)
         if persistent != active and scales_path.is_file():
             _mirror_cache_file(scales_path, active / RPE_SCALES_FILE)
@@ -2536,10 +2787,10 @@ def unify_network_rpe(
     if rpe_scales is not None:
         global_re, global_im = rpe_scales
     else:
-        branch_lists = [list(network.branches) for network in networks if network.branches]
-        if not branch_lists:
+        if not any(network.branches for network in networks):
+            print("  unify_network_rpe: no branches; using s_R=s_X=1.0", flush=True)
             return 1.0, 1.0
-        global_re, global_im = global_zeff_rpe_scales(branch_lists)
+        global_re, global_im, _raw_r, _raw_x = fit_global_zeff_rpe_scales_from_networks(networks)
     for network in networks:
         if network.branches is None:
             continue
@@ -2632,11 +2883,16 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
         )
         max_diff = float(np.max(np.abs(expected - rpe)))
         recompute_ok = max_diff <= recompute_atol and np.array_equal(expected_component, component)
+        scale_note = (
+            f"s_R={re_s} s_X={im_s}"
+            if re_s is not None and im_s is not None
+            else "scales missing (per-component fallback; check move_to preserves rpe_*_scale)"
+        )
         checks.append(
             CorrectnessCheck(
                 "recompute_from_branches",
                 recompute_ok,
-                f"max |recomputed - cached| = {max_diff:.3e} (tol {recompute_atol:.0e})",
+                f"max |recomputed - cached| = {max_diff:.3e} (tol {recompute_atol:.0e}; {scale_note})",
             )
         )
     else:
@@ -2737,7 +2993,8 @@ def parse_arch_name() -> str | None:
 
 def apply_architecture_config() -> str:
     """Apply ``ARCH_PRESETS`` / per-dim env overrides. Same residual, packing, and loss logic."""
-    global D, D_E, D_A, HEADS, DEPTH, RUN_TAG, RUN_DIR_NAME, CHECKPOINT_VERSION, USE_NODE_SHUNT
+    global D, D_E, D_A, HEADS, DEPTH, RUN_TAG, RUN_DIR_NAME, CHECKPOINT_VERSION
+    global USE_NODE_SHUNT, ATTENTION_KIND, ATTENTION_MLP_HIDDEN
     name = parse_arch_name()
     if name:
         if name not in ARCH_PRESETS:
@@ -2752,6 +3009,8 @@ def apply_architecture_config() -> str:
         RUN_TAG = str(preset["RUN_TAG"])
         CHECKPOINT_VERSION = str(preset["CHECKPOINT_VERSION"])
         USE_NODE_SHUNT = bool(preset.get("USE_NODE_SHUNT", False))
+        ATTENTION_KIND = str(preset.get("ATTENTION_KIND", "grit"))
+        ATTENTION_MLP_HIDDEN = int(preset.get("ATTENTION_MLP_HIDDEN", D_A))
     else:
         name = RUN_TAG
 
@@ -2761,6 +3020,7 @@ def apply_architecture_config() -> str:
         ("GENCO_TPGT_D_A", "D_A"),
         ("GENCO_TPGT_HEADS", "HEADS"),
         ("GENCO_TPGT_DEPTH", "DEPTH"),
+        ("GENCO_TPGT_ATTENTION_MLP_HIDDEN", "ATTENTION_MLP_HIDDEN"),
     ):
         raw = os.environ.get(env_key, "").strip()
         if raw:
@@ -2773,24 +3033,39 @@ def apply_architecture_config() -> str:
         USE_NODE_SHUNT = True
     elif shunt_override in ("0", "false", "no"):
         USE_NODE_SHUNT = False
+    attn_override = os.environ.get("GENCO_TPGT_ATTENTION", "").strip().lower()
+    if attn_override:
+        ATTENTION_KIND = attn_override
     # Re-read after overrides (globals() assignments above).
     D = int(globals()["D"])
     D_E = int(globals()["D_E"])
     D_A = int(globals()["D_A"])
     HEADS = int(globals()["HEADS"])
     DEPTH = int(globals()["DEPTH"])
+    ATTENTION_MLP_HIDDEN = int(globals()["ATTENTION_MLP_HIDDEN"])
+    ATTENTION_KIND = str(globals()["ATTENTION_KIND"]).strip().lower()
+    if ATTENTION_KIND not in ("grit", "joint_mlp"):
+        raise ValueError(f"unknown ATTENTION_KIND {ATTENTION_KIND!r}; use grit or joint_mlp")
     RUN_DIR_NAME = f"tpgt_task11_{RUN_TAG}"
-    if DEPTH < 1 or HEADS < 1 or D < 1 or D_E < 1 or D_A < 1:
-        raise ValueError(f"invalid architecture dims D={D} D_E={D_E} D_A={D_A} HEADS={HEADS} DEPTH={DEPTH}")
+    if DEPTH < 1 or HEADS < 1 or D < 1 or D_E < 1 or D_A < 1 or ATTENTION_MLP_HIDDEN < 1:
+        raise ValueError(
+            f"invalid architecture dims D={D} D_E={D_E} D_A={D_A} HEADS={HEADS} "
+            f"DEPTH={DEPTH} ATTENTION_MLP_HIDDEN={ATTENTION_MLP_HIDDEN}"
+        )
     return name
 
 
 def architecture_summary() -> str:
     node_in = NODE_FEATURE_DIM if USE_NODE_SHUNT else NODE_SPECIFIED_DIM
     node_txt = "P,Q,V,θ,busBS" if USE_NODE_SHUNT else "spec"
+    attn_txt = (
+        f"joint_mlp(H={ATTENTION_MLP_HIDDEN}, raw_rpe={RPE_DIM})"
+        if ATTENTION_KIND == "joint_mlp"
+        else "grit"
+    )
     return (
         f"arch {RUN_TAG}: DEPTH={DEPTH} D={D} D_E={D_E} D_A={D_A} HEADS={HEADS} "
-        f"node_in={node_in} ({node_txt}) "
+        f"node_in={node_in} ({node_txt}) attn={attn_txt} "
         f"checkpoint_version={CHECKPOINT_VERSION}"
     )
 
@@ -3819,10 +4094,20 @@ def load_task_split(data_root: Path, split_name: str, active: Path, persistent: 
             flush=True,
         )
     if split_name == "train":
-        re_scale, im_scale = split_rpe_scales(split)
-        save_rpe_global_scales(persistent, re_scale, im_scale)
+        re_scale, im_scale, raw_re, raw_im = fit_global_zeff_rpe_scales_from_networks(split.networks)
+        unify_rpe_normalization(split, (re_scale, im_scale))
+        save_rpe_global_scales(
+            persistent,
+            re_scale,
+            im_scale,
+            raw_re=raw_re,
+            raw_im=raw_im,
+            source=f"train_fit_{split_name}",
+        )
+        log_rpe_scales_provenance(persistent, context=f"saved {split_name}")
         print(
-            f"{split_name}: saved RPE scales s_R={re_scale:.6g} s_X={im_scale:.6g} -> {rpe_scales_path(persistent)}",
+            f"{split_name}: saved RPE scales s_R={re_scale:.6g} s_X={im_scale:.6g} "
+            f"(raw peaks {raw_re:.6g}, {raw_im:.6g}) -> {rpe_scales_path(persistent)}",
             flush=True,
         )
     elif train_scales is not None:
@@ -4018,6 +4303,10 @@ def move_to(network: Network, device: torch.device) -> Network:
         pair_embed=pair_embed,
         branches=getattr(network, "branches", None),
         shunt_b=None if shunt is None else host_to_device(shunt, device),
+        # Keep train-fit Zeff scales: audit_rpe_correctness recomputes meshed_rpe with these;
+        # dropping them falls back to per-component norms and falsely fails recompute_from_branches.
+        rpe_re_scale=getattr(network, "rpe_re_scale", None),
+        rpe_im_scale=getattr(network, "rpe_im_scale", None),
         type_key=network_type_key(network),
         layout=shared_layout(types, masks, types_np=network.types.detach().cpu().numpy()),
     )
@@ -4103,10 +4392,10 @@ def clear_pair_embed_cache(networks: list[Network] | DeviceNetworks) -> None:
 
 
 def pair_features(model: TPGT, network: Network) -> torch.Tensor:
-    """Edge embeddings for this topology; cached in eval on that Network object only."""
+    """Edge features for this topology (raw RPE for v10); cached in eval on that Network object only."""
     if not model.training and network.pair_embed is not None:
         return network.pair_embed
-    encoded = model.pair_encoder(network.rpe)
+    encoded = model.encode_pairs(network.rpe)
     if not model.training:
         network.pair_embed = encoded
     return encoded
@@ -4206,10 +4495,10 @@ def stacked_pair_and_ybus(
     networks: list[Network],
     keep: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pair embeddings (U, N, N, D_E) from one pair-encoder call and complex128 Ybus (U, N, N)."""
+    """Pair features (U, N, N, *) via ``encode_pairs`` and complex128 Ybus (U, N, N)."""
     rpe = torch.stack([network.rpe for network in networks])
     rpe = rpe_channel_dropout(rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
-    pair = model.pair_encoder(rpe)
+    pair = model.encode_pairs(rpe)
     ybus = torch.stack([network.ybus for network in networks]).to(torch.complex128)
     return pair, ybus
 
@@ -4259,16 +4548,16 @@ class PassBatch:
         return len(self.cases)
 
     def encode(self, model: TPGT, keep: torch.Tensor | None = None) -> torch.Tensor:
-        """Pair embeddings: (N, N, D_E) for one topology (cached in eval), else (U, N, N, D_E) in one call."""
+        """Pair features for attention: raw RPE (v10) or ``pair_encoder`` output (GRIT)."""
         if self.kind == "single":
             network = self.networks[0]
             if not model.training:
                 return pair_features(model, network)
             rpe = rpe_channel_dropout(network.rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
-            return model.pair_encoder(rpe)
+            return model.encode_pairs(rpe)
         rpe = torch.stack([network.rpe for network in self.networks])
         rpe = rpe_channel_dropout(rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
-        return model.pair_encoder(rpe)
+        return model.encode_pairs(rpe)
 
     def run(
         self,
