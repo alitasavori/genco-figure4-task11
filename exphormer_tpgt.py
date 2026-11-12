@@ -282,6 +282,7 @@ def dense_exphormer_messages(
             else:
                 edge = pair_aug[:, receivers.view(-1, 1), senders.view(1, -1)].unsqueeze(1)
                 edge = edge.expand(-1, heads, -1, -1, -1)
+            edge = edge.to(dtype=query.dtype)
             score = _score_mlp_block(
                 query,
                 key,
@@ -407,6 +408,8 @@ def sparse_exphormer_messages(
             edge_feat = pair_aug[r, s].unsqueeze(0).unsqueeze(1).expand(batch, heads, -1, -1)
         else:
             edge_feat = pair_aug[:, r, s].unsqueeze(1).expand(-1, heads, -1, -1)
+        # Match activation dtype under CUDA autocast (pair/RPE may stay float32).
+        edge_feat = edge_feat.to(dtype=q.dtype)
         joint = torch.cat((q, k, edge_feat), dim=-1)
         h1 = torch.relu(
             torch.einsum("bhes,has->bhea", joint, score_w1[p]) + score_b1[p].view(1, heads, 1, -1)
@@ -416,10 +419,11 @@ def sparse_exphormer_messages(
         )
         score = torch.einsum("bhec,hc->bhe", h2, score_w3[p, :, 0]) + score_b3[p].view(1, heads, 1)
         tau_e = edge_tau[local]
-        bias = edge_bias[tau_e].transpose(0, 1).unsqueeze(0)  # (1,H,E_p)
+        bias = edge_bias[tau_e].transpose(0, 1).unsqueeze(0).to(dtype=score.dtype)  # (1,H,E_p)
         score = score + bias
-        scores[:, :, local] = score
-        values[:, :, local] = v
+        # Autocast: buffers follow y (often Half); MLP/bias math may promote to Float.
+        scores[:, :, local] = score.to(dtype=scores.dtype)
+        values[:, :, local] = v.to(dtype=values.dtype)
 
     # Softmax per receiver over its incident edges.
     weights = y.new_zeros((batch, heads, e))
@@ -430,13 +434,14 @@ def sparse_exphormer_messages(
         logits = scores[:, :, local]
         w = torch.softmax(logits, dim=-1)
         w = torch.nan_to_num(w, nan=0.0)
-        weights[:, :, local] = w
+        weights[:, :, local] = w.to(dtype=weights.dtype)
 
     mixed = y.new_zeros((batch, heads, n_aug, d_a))
     # Scatter-add α * v onto receivers.
     for edge_i in range(e):
         r = int(recv_idx[edge_i])
-        mixed[:, :, r] = mixed[:, :, r] + weights[:, :, edge_i].unsqueeze(-1) * values[:, :, edge_i]
+        contrib = weights[:, :, edge_i].unsqueeze(-1) * values[:, :, edge_i]
+        mixed[:, :, r] = mixed[:, :, r] + contrib.to(dtype=mixed.dtype)
 
     message = torch.einsum("bhna,hda->bnd", mixed, w_o)
     return message[:, :n_real], message[:, n_real:]

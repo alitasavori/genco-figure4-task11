@@ -332,3 +332,45 @@ def test_sparse_default_toggle() -> None:
         assert model.use_dense_exph is False
     finally:
         _restore_default_arch()
+
+
+def test_sparse_messages_under_float16_buffers() -> None:
+    """Mimic CUDA autocast: Half activation buffers, Float32 RPE / bias math."""
+    try:
+        _activate_arch("v12", dense=False)
+        torch.manual_seed(11)
+        buses = 6
+        branches, component = _two_island_branches()
+        types = torch.tensor([0, 0, 1, 0, 1, 2], dtype=torch.long)
+        allow_np, tau_np, n_virt = exph.build_exphormer_graph(
+            buses, branches, component, d_exp=4, seed=5
+        )
+        types_aug = np.concatenate(
+            [types.numpy(), np.full(n_virt, exph.TYPE_VIRTUAL, dtype=np.int64)]
+        )
+        recv, send, edge_tau, pair_ids = exph.sparse_edges_from_dense(allow_np, tau_np, types_aug)
+        model = tpgt.TPGT()
+        stage = model.stages[0]
+        hidden = torch.randn(2, buses, tpgt.D, dtype=torch.float16)
+        z_virt = torch.randn(2, n_virt, tpgt.D, dtype=torch.float16)
+        pair = torch.randn(buses, buses, tpgt.RPE_DIM, dtype=torch.float32)
+        allow = torch.from_numpy(allow_np)
+        tau = torch.from_numpy(tau_np)
+        msg_r, msg_v = stage._messages_exphormer(
+            hidden,
+            z_virt,
+            pair,
+            types,
+            allow,
+            tau,
+            model.virt_rpe,
+            exph_recv=torch.from_numpy(recv),
+            exph_send=torch.from_numpy(send),
+            exph_edge_tau=torch.from_numpy(edge_tau),
+            exph_pair_id=torch.from_numpy(pair_ids),
+            use_dense=False,
+        )
+        assert msg_r.dtype == torch.float16 and msg_v.dtype == torch.float16
+        assert torch.isfinite(msg_r.float()).all() and torch.isfinite(msg_v.float()).all()
+    finally:
+        _restore_default_arch()
