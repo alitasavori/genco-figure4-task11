@@ -335,7 +335,7 @@ def test_sparse_default_toggle() -> None:
 
 
 def test_sparse_messages_under_float16_buffers() -> None:
-    """Mimic CUDA autocast: Half activation buffers, Float32 RPE / bias math."""
+    """Mimic CUDA autocast buffers: Half activations with Float32 RPE (kernel only)."""
     try:
         _activate_arch("v12", dense=False)
         torch.manual_seed(11)
@@ -345,10 +345,12 @@ def test_sparse_messages_under_float16_buffers() -> None:
         allow_np, tau_np, n_virt = exph.build_exphormer_graph(
             buses, branches, component, d_exp=4, seed=5
         )
-        types_aug = np.concatenate(
+        types_aug_np = np.concatenate(
             [types.numpy(), np.full(n_virt, exph.TYPE_VIRTUAL, dtype=np.int64)]
         )
-        recv, send, edge_tau, pair_ids = exph.sparse_edges_from_dense(allow_np, tau_np, types_aug)
+        recv, send, edge_tau, pair_ids = exph.sparse_edges_from_dense(
+            allow_np, tau_np, types_aug_np
+        )
         model = tpgt.TPGT()
         stage = model.stages[0]
         hidden = torch.randn(2, buses, tpgt.D, dtype=torch.float16)
@@ -356,19 +358,30 @@ def test_sparse_messages_under_float16_buffers() -> None:
         pair = torch.randn(buses, buses, tpgt.RPE_DIM, dtype=torch.float32)
         allow = torch.from_numpy(allow_np)
         tau = torch.from_numpy(tau_np)
-        msg_r, msg_v = stage._messages_exphormer(
+        types_aug = torch.from_numpy(types_aug_np)
+        pair_aug = exph.build_exphormer_pair_features(
+            pair, allow, tau, types_aug, model.virt_rpe
+        )
+        msg_r, msg_v = exph.sparse_exphormer_messages(
             hidden,
             z_virt,
-            pair,
-            types,
-            allow,
-            tau,
-            model.virt_rpe,
-            exph_recv=torch.from_numpy(recv),
-            exph_send=torch.from_numpy(send),
-            exph_edge_tau=torch.from_numpy(edge_tau),
-            exph_pair_id=torch.from_numpy(pair_ids),
-            use_dense=False,
+            pair_aug,
+            types_aug,
+            torch.from_numpy(recv),
+            torch.from_numpy(send),
+            torch.from_numpy(edge_tau),
+            torch.from_numpy(pair_ids),
+            w_q=stage.w_q,
+            w_k=stage.w_k,
+            w_v=stage.w_v,
+            w_o=stage.w_o,
+            score_w1=stage.score_w1,
+            score_b1=stage.score_b1,
+            score_w2=stage.score_w2,
+            score_b2=stage.score_b2,
+            score_w3=stage.score_w3,
+            score_b3=stage.score_b3,
+            edge_bias=stage.edge_bias,
         )
         assert msg_r.dtype == torch.float16 and msg_v.dtype == torch.float16
         assert torch.isfinite(msg_r.float()).all() and torch.isfinite(msg_v.float()).all()
