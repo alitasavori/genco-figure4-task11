@@ -37,11 +37,14 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
   ``D/D_E/D_A/HEADS``.
 * **Attention**: ``grit`` (default; v7–v9) uses pair-modulated GRIT scores on
   ``pair_encoder(RPE)``; ``v10`` uses Approach C joint MLP scores on **raw** RPE
-  ``r_ij`` (no pair encoder). Q/K/V are type-pair-specific:
+  ``r_ij`` (no pair encoder); ``v11`` uses Park et al. GRPE (shared hop/edge
+  ``P/E`` in score and values); ``v11e`` adds stage ``U_Q/U_K/U_V`` on Zeff ``r_ij``.
+  Q/K/V are type-pair-specific:
   ``q_{i|t_j}^{(ℓ,h)}=W_Q^{(ℓ,h,t_i←t_j)} h_i^{(ℓ-1)}``,
-  ``k_{j|t_i}^{(ℓ,h)}=W_K^{(ℓ,h,t_i←t_j)} h_j^{(ℓ-1)}``, then
-  ``s_{ij}^{(ℓ,h)}=MLP_{t_i←t_j}^{(ℓ,h)}([q_{i|t_j}‖k_{j|t_i}‖r_{ij}])``.
-  Softmax and type-pair blocks are unchanged. Angle step uses ``η_angle=1``.
+  ``k_{j|t_i}^{(ℓ,h)}=W_K^{(ℓ,h,t_i←t_j)} h_j^{(ℓ-1)}``.
+  v10: ``s=MLP([q‖k‖r])``; v11: ``s=(q·k + q·(P^Q+E^Q) + k·(P^K+E^K))/√D_A`` with
+  ``o=Σ α (v+P^V+E^V)``. Softmax and type-pair blocks are unchanged. Angle step
+  uses ``η_angle=1``.
 * **2-channel RPE**: ``Zeff_Re_norm``, ``Zeff_Im_norm`` (complex Laplacian effective impedance).
 * **RPE channel dropout**: during training each channel is zeroed with
   probability ``RPE_CHANNEL_DROPOUT`` per optimizer step; never at eval.
@@ -68,9 +71,10 @@ Performance notes (Colab / large train split)
   once per *distinct* in-service topology (see ``read_split`` representatives),
   not per scenario and not per training batch.
 * **``pair_encoder``**: For GRIT arches, runs once per forward on the static
-  ``118×118`` RPEs (stacked when several share bus types). For ``v10`` / joint MLP
-  attention the encoder is ``Identity`` and stages see raw ``r_ij``. In ``eval``
-  mode a single-topology batch may cache pair features on ``Network.pair_embed``.
+  ``118×118`` RPEs (stacked when several share bus types). For ``v10`` / ``v11`` /
+  ``v11e`` the encoder is ``Identity`` (raw ``r_ij`` path; GRPE also uses
+  ``hop_id``/``edge_id``). In ``eval`` mode a single-topology batch may cache
+  pair features on ``Network.pair_embed``.
 * **Type-pair attention**: ``CorrectionStage._messages`` evaluates each of the
   nine type-pair weight sets only on its own receiver-type × sender-type block
   (both heads batched), then takes one softmax over all senders per receiver. With per-case
@@ -187,7 +191,7 @@ LAMBDA_PHYS = 0.5
 PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
-CACHE_VERSION = "tpgt-cache-9"
+CACHE_VERSION = "tpgt-cache-10"
 RPE_FEATURE_NAMES = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_DIM = len(RPE_FEATURE_NAMES)
 # Per optimizer step, each RPE channel is zeroed (whole 118x118 plane, no rescaling) with this
@@ -210,7 +214,26 @@ USE_NODE_SHUNT = False
 # ``grit``: ReLU(ρ(W_Q^{t_i←t_j} h_i + W_K^{t_i←t_j} h_j) ⊙ W_Ew e_ij + W_Eb e_ij) then linear score.
 # ``joint_mlp``: q_{i|t_j}=W_Q^{t_i←t_j} h_i, k_{j|t_i}=W_K^{t_i←t_j} h_j;
 #   s_ij = MLP_{t_i←t_j}^{ℓ,h}([q_{i|t_j} ‖ k_{j|t_i} ‖ r_ij]) on raw RPE (Approach C; v10).
+# ``grpe``: Park et al. GRPE — shared hop/edge embeddings in score and values (v11).
+# ``grpe_elec``: GRPE + stage-specific Zeff bilinear U_Q/U_K/U_V (v11e).
 ATTENTION_KIND = "grit"
+# Attention kinds that use Identity pair encoder (raw RPE still stored on Network for Zeff / elec).
+RAW_RPE_ATTENTION_KINDS = frozenset({"joint_mlp", "grpe", "grpe_elec"})
+GRPE_ATTENTION_KINDS = frozenset({"grpe", "grpe_elec"})
+# Shortest-path hop bins: 0..GRPE_MAX_HOP plus one overflow bin (hop > max or unreachable).
+GRPE_MAX_HOP = 8
+GRPE_EDGE_SELF = 0
+GRPE_EDGE_BRANCH = 1
+GRPE_EDGE_NONADJ = 2
+GRPE_NUM_EDGE_TYPES = 3
+
+
+def grpe_num_hop_bins(max_hop: int | None = None) -> int:
+    """Bins ``0..max_hop`` plus one overflow bin (``max_hop+1`` for hop>max or unreachable)."""
+    limit = GRPE_MAX_HOP if max_hop is None else int(max_hop)
+    return limit + 2
+
+
 # Joint score MLP hidden widths (per type-pair, per head, per stage).
 # Input is 2*D_A + RPE_DIM (=98 for D_A=48); output is a scalar. v10: 98 → 128 → 64 → 1.
 ATTENTION_MLP_HIDDENS: tuple[int, ...] = (128, 64)
@@ -276,6 +299,30 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "USE_NODE_SHUNT": True,
         "ATTENTION_KIND": "joint_mlp",
         "ATTENTION_MLP_HIDDENS": (128, 64),
+    },
+    # Park et al. GRPE (shared hop/edge embeddings + graph-encoded values); HEADS=2.
+    "v11": {
+        "D": 96,
+        "D_E": 48,  # unused by attention; pair_encoder is Identity.
+        "D_A": 48,
+        "HEADS": 2,
+        "DEPTH": 8,
+        "RUN_TAG": "v11",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h2-pqvt-busBS-grpe-full-v11",
+        "USE_NODE_SHUNT": True,
+        "ATTENTION_KIND": "grpe",
+    },
+    # v11 GRPE + electrical Zeff bilinear extension (stage-specific U_Q/U_K/U_V).
+    "v11e": {
+        "D": 96,
+        "D_E": 48,
+        "D_A": 48,
+        "HEADS": 2,
+        "DEPTH": 8,
+        "RUN_TAG": "v11e",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h2-pqvt-busBS-grpe-elec-v11e",
+        "USE_NODE_SHUNT": True,
+        "ATTENTION_KIND": "grpe_elec",
     },
 }
 # Fixed training subset scored with val's PBL metric each validation pass (overfitting check).
@@ -725,6 +772,62 @@ def _init_matrices(weight: torch.Tensor) -> None:
         nn.init.xavier_uniform_(matrix)
 
 
+@dataclass
+class GrpePairFeatures:
+    """Looked-up shared GRPE embeddings for one forward.
+
+    Each tensor is ``(HEADS, N, N, D_A)`` (shared topology) or ``(B, HEADS, N, N, D_A)``.
+    """
+
+    p_q: torch.Tensor
+    p_k: torch.Tensor
+    p_v: torch.Tensor
+    e_q: torch.Tensor
+    e_k: torch.Tensor
+    e_v: torch.Tensor
+
+
+class GrpeEncodings(nn.Module):
+    """Shared hop / edge-relation embeddings ``P^{Q,K,V}`` and ``E^{Q,K,V}`` (Park et al. GRPE)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        hop_bins = grpe_num_hop_bins()
+        self.p_q = nn.Parameter(torch.empty(hop_bins, HEADS, D_A))
+        self.p_k = nn.Parameter(torch.empty(hop_bins, HEADS, D_A))
+        self.p_v = nn.Parameter(torch.empty(hop_bins, HEADS, D_A))
+        self.e_q = nn.Parameter(torch.empty(GRPE_NUM_EDGE_TYPES, HEADS, D_A))
+        self.e_k = nn.Parameter(torch.empty(GRPE_NUM_EDGE_TYPES, HEADS, D_A))
+        self.e_v = nn.Parameter(torch.empty(GRPE_NUM_EDGE_TYPES, HEADS, D_A))
+        for parameter in (self.p_q, self.p_k, self.p_v, self.e_q, self.e_k, self.e_v):
+            _init_matrices(parameter)
+
+    @staticmethod
+    def _lookup(table: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        """``table[index]`` → ``(H,N,N,D_A)`` or ``(B,H,N,N,D_A)``."""
+        emb = table[index]
+        if emb.dim() == 4:
+            return emb.permute(2, 0, 1, 3).contiguous()
+        return emb.permute(0, 3, 1, 2, 4).contiguous()
+
+    def forward(self, hop_id: torch.Tensor, edge_id: torch.Tensor) -> GrpePairFeatures:
+        return GrpePairFeatures(
+            p_q=self._lookup(self.p_q, hop_id),
+            p_k=self._lookup(self.p_k, hop_id),
+            p_v=self._lookup(self.p_v, hop_id),
+            e_q=self._lookup(self.e_q, edge_id),
+            e_k=self._lookup(self.e_k, edge_id),
+            e_v=self._lookup(self.e_v, edge_id),
+        )
+
+
+def _gather_grpe_block(emb: torch.Tensor, receivers: torch.Tensor, senders: torch.Tensor) -> torch.Tensor:
+    """Slice pair embeddings to a type-pair block: ``(H,Nr,Ns,D_A)`` or ``(B,H,Nr,Ns,D_A)``."""
+    if emb.dim() == 4:
+        return emb[:, receivers][:, :, senders]
+    return emb[:, :, receivers][:, :, :, senders]
+
+
 class CorrectionStage(nn.Module):
     """One unshared correction stage. Nine type pairs, each with its own head weights.
 
@@ -733,12 +836,14 @@ class CorrectionStage(nn.Module):
     * ``joint_mlp`` (v10): nine type-pair × head score MLPs on raw RPE;
       ``q_{i|t_j}=W_Q^{t_i←t_j} h_i``, ``k_{j|t_i}=W_K^{t_i←t_j} h_j``,
       ``s_ij = MLP_{t_i←t_j}([q_{i|t_j} ‖ k_{j|t_i} ‖ r_ij])``; values ``W_V^{t_i←t_j} h_j``.
+    * ``grpe`` (v11): Park GRPE with shared hop/edge embeddings in score and values.
+    * ``grpe_elec`` (v11e): GRPE plus stage-specific Zeff bilinear ``U_Q/U_K/U_V``.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.attention_kind = ATTENTION_KIND
-        # Nine directed type-pairs × HEADS: each (pair, head) has its own Q/K/V and score MLP.
+        # Nine directed type-pairs × HEADS: each (pair, head) has its own Q/K/V (and score params).
         shape = (9, HEADS)
         self.w_q = nn.Parameter(torch.empty(*shape, D_A, D))
         self.w_k = nn.Parameter(torch.empty(*shape, D_A, D))
@@ -746,6 +851,12 @@ class CorrectionStage(nn.Module):
         self.w_o = nn.Parameter(torch.empty(HEADS, D, D_A))
         grit_params: list[nn.Parameter] = []
         mlp_params: list[nn.Parameter] = []
+        grpe_params: list[nn.Parameter] = []
+        # Defaults: absent unless the active attention kind needs them.
+        self.score_w1 = self.score_b1 = self.score_w2 = self.score_b2 = None
+        self.score_w3 = self.score_b3 = None
+        self.u_q = self.u_k = self.u_v = None
+        self.w_ew = self.w_eb = self.w_a = self.w_ev = None
         if self.attention_kind == "joint_mlp":
             h1, h2 = (int(ATTENTION_MLP_HIDDENS[0]), int(ATTENTION_MLP_HIDDENS[1]))
             # Raw RPE channels (Zeff Re/Im), not pair_encoder(D_E) embeddings.
@@ -758,24 +869,22 @@ class CorrectionStage(nn.Module):
             self.score_w3 = nn.Parameter(torch.empty(*shape, 1, h2))
             self.score_b3 = nn.Parameter(torch.zeros(*shape, 1))
             mlp_params = [self.score_w1, self.score_w2, self.score_w3]
-            # Keep GRIT tensors absent so state_dict / param counts match the attention kind.
-            self.w_ew = None
-            self.w_eb = None
-            self.w_a = None
-            self.w_ev = None
+        elif self.attention_kind == "grpe":
+            # Shared P/E live on TPGT.grpe_encodings; stage keeps type-pair Q/K/V only.
+            pass
+        elif self.attention_kind == "grpe_elec":
+            # Stage-specific electrical extension on raw Zeff RPE.
+            self.u_q = nn.Parameter(torch.empty(*shape, D_A, RPE_DIM))
+            self.u_k = nn.Parameter(torch.empty(*shape, D_A, RPE_DIM))
+            self.u_v = nn.Parameter(torch.empty(*shape, D_A, RPE_DIM))
+            grpe_params = [self.u_q, self.u_k, self.u_v]
         else:
             self.w_ew = nn.Parameter(torch.empty(*shape, D_A, D_E))
             self.w_eb = nn.Parameter(torch.empty(*shape, D_A, D_E))
             self.w_a = nn.Parameter(torch.empty(*shape, 1, D_A))
             self.w_ev = nn.Parameter(torch.empty(*shape, D_A, D_A))
             grit_params = [self.w_ew, self.w_eb, self.w_a, self.w_ev]
-            self.score_w1 = None
-            self.score_b1 = None
-            self.score_w2 = None
-            self.score_b2 = None
-            self.score_w3 = None
-            self.score_b3 = None
-        for parameter in (self.w_q, self.w_k, self.w_v, self.w_o, *grit_params, *mlp_params):
+        for parameter in (self.w_q, self.w_k, self.w_v, self.w_o, *grit_params, *mlp_params, *grpe_params):
             _init_matrices(parameter)
         self.update = nn.ModuleList(MLP(D + D + 2, D) for _ in range(3))
         self.decode = nn.ModuleList(MLP(D, 2) for _ in range(3))
@@ -789,9 +898,10 @@ class CorrectionStage(nn.Module):
         pair: torch.Tensor,
         layout: TypeLayout,
         ybus: torch.Tensor,
+        grpe: GrpePairFeatures | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         residual_in = nodal_residual(specified, unknown, layout, ybus)
-        message = self._messages(hidden, pair, layout.blocks)
+        message = self._messages(hidden, pair, layout.blocks, grpe=grpe)
         updated = torch.zeros_like(hidden)
         for type_id, update in enumerate(self.update):
             if not layout.present[type_id]:
@@ -828,6 +938,7 @@ class CorrectionStage(nn.Module):
         hidden: torch.Tensor,
         pair: torch.Tensor,
         blocks: list[TypePairBlock],
+        grpe: GrpePairFeatures | None = None,
     ) -> torch.Tensor:
         """Each type pair's weights see only its own receiver-type x sender-type block.
 
@@ -839,6 +950,10 @@ class CorrectionStage(nn.Module):
         """
         if self.attention_kind == "joint_mlp":
             return self._messages_joint_mlp(hidden, pair, blocks)
+        if self.attention_kind in GRPE_ATTENTION_KINDS:
+            if grpe is None:
+                raise ValueError(f"{self.attention_kind} attention requires shared GrpePairFeatures")
+            return self._messages_grpe(hidden, pair, blocks, grpe)
         return self._messages_grit(hidden, pair, blocks)
 
     def _scatter_block_scores(
@@ -984,6 +1099,98 @@ class CorrectionStage(nn.Module):
             mixed_heads = mixed_heads.index_add(2, block.receivers, gathered.to(mixed_heads.dtype))
         return torch.einsum("bhna,hda->bnd", mixed_heads, self.w_o)
 
+    def _messages_grpe(
+        self,
+        hidden: torch.Tensor,
+        pair: torch.Tensor,
+        blocks: list[TypePairBlock],
+        grpe: GrpePairFeatures,
+    ) -> torch.Tensor:
+        """Park et al. GRPE score/values; optional electrical Zeff terms when ``grpe_elec``.
+
+        Shared topology/edge embeddings:
+        ``s_ij = (q·k + q·(P^Q+E^Q) + k·(P^K+E^K)) / √D_A``,
+        ``o_i = Σ_j α_ij (v_j + P^V + E^V)``.
+
+        ``grpe_elec`` adds stage ``U_Q/U_K/U_V`` bilinear terms on raw RPE ``pair``.
+        """
+        batch, buses, _ = hidden.shape
+        scores: torch.Tensor | None = None
+        electrical = self.attention_kind == "grpe_elec"
+        if electrical:
+            assert self.u_q is not None and self.u_k is not None and self.u_v is not None
+            if pair.shape[-1] != RPE_DIM:
+                raise ValueError(
+                    f"grpe_elec expects raw RPE last-dim {RPE_DIM}, got {tuple(pair.shape)}"
+                )
+        scale = float(D_A) ** 0.5
+        for block in blocks:
+            p = block.pair_id
+            receivers = block.receivers.view(-1, 1)
+            senders = block.senders.view(1, -1)
+            query = torch.einsum("bnd,had->bhna", hidden[:, block.receivers], self.w_q[p])
+            key = torch.einsum("bnd,had->bhna", hidden[:, block.senders], self.w_k[p])
+            pq = _gather_grpe_block(grpe.p_q, block.receivers, block.senders)
+            pk = _gather_grpe_block(grpe.p_k, block.receivers, block.senders)
+            eq = _gather_grpe_block(grpe.e_q, block.receivers, block.senders)
+            ek = _gather_grpe_block(grpe.e_k, block.receivers, block.senders)
+            if pq.dim() == 4:
+                pq = pq.unsqueeze(0).expand(batch, -1, -1, -1, -1)
+                pk = pk.unsqueeze(0).expand(batch, -1, -1, -1, -1)
+                eq = eq.unsqueeze(0).expand(batch, -1, -1, -1, -1)
+                ek = ek.unsqueeze(0).expand(batch, -1, -1, -1, -1)
+            topo_q = pq + eq
+            topo_k = pk + ek
+            node_dot = torch.einsum("bhna,bhma->bhnm", query, key)
+            q_topo = torch.einsum("bhra,bhrsa->bhrs", query, topo_q)
+            k_topo = torch.einsum("bhsa,bhrsa->bhrs", key, topo_k)
+            score = (node_dot + q_topo + k_topo) / scale
+            if electrical:
+                if pair.dim() == 3:
+                    edge = pair[receivers, senders].unsqueeze(0).unsqueeze(1)
+                    edge = edge.expand(batch, HEADS, -1, -1, -1)
+                else:
+                    edge = pair[:, receivers, senders].unsqueeze(1).expand(-1, HEADS, -1, -1, -1)
+                uk_e = torch.einsum("bhnme,hae->bhnma", edge, self.u_k[p])
+                uq_e = torch.einsum("bhnme,hae->bhnma", edge, self.u_q[p])
+                q_edge = torch.einsum("bhna,bhnma->bhnm", query, uk_e)
+                k_edge = torch.einsum("bhma,bhnma->bhnm", key, uq_e)
+                score = score + (q_edge + k_edge) / scale
+            scores = self._scatter_block_scores(scores, score, block, batch, buses)
+        if scores is None:
+            return hidden.new_zeros(hidden.shape)
+        weights = torch.softmax(scores, dim=-1)
+        weights = torch.nan_to_num(weights, nan=0.0)
+        row_sum = weights.sum(dim=-1, keepdim=True)
+        weights = torch.where(row_sum > 0, weights / row_sum.clamp(min=1e-12), weights)
+        mixed_heads = weights.new_zeros((batch, HEADS, buses, D_A))
+        for block in blocks:
+            p = block.pair_id
+            receivers = block.receivers.view(-1, 1)
+            senders = block.senders.view(1, -1)
+            block_weights = weights[:, :, receivers, senders]
+            if block.mask.dim() == 3:
+                block_weights = block_weights.masked_fill(~block.mask.unsqueeze(1), 0.0)
+            value = torch.einsum("bnd,had->bhna", hidden[:, block.senders], self.w_v[p])
+            pv = _gather_grpe_block(grpe.p_v, block.receivers, block.senders)
+            ev = _gather_grpe_block(grpe.e_v, block.receivers, block.senders)
+            if pv.dim() == 4:
+                pv = pv.unsqueeze(0).expand(batch, -1, -1, -1, -1)
+                ev = ev.unsqueeze(0).expand(batch, -1, -1, -1, -1)
+            # (B,H,Nr,Ns,D_A): v_j + P^V_ij + E^V_ij (+ U_V r for grpe_elec).
+            value_ij = value.unsqueeze(-3) + pv + ev
+            if electrical:
+                if pair.dim() == 3:
+                    edge = pair[receivers, senders].unsqueeze(0).unsqueeze(1)
+                    edge = edge.expand(batch, HEADS, -1, -1, -1)
+                else:
+                    edge = pair[:, receivers, senders].unsqueeze(1).expand(-1, HEADS, -1, -1, -1)
+                uv_e = torch.einsum("bhnme,hae->bhnma", edge, self.u_v[p])
+                value_ij = value_ij + uv_e
+            gathered = torch.einsum("bhnm,bhnma->bhna", block_weights, value_ij)
+            mixed_heads = mixed_heads.index_add(2, block.receivers, gathered.to(mixed_heads.dtype))
+        return torch.einsum("bhna,hda->bnd", mixed_heads, self.w_o)
+
 
 def bus_shunt_gb(ybus: torch.Tensor) -> torch.Tensor:
     """Per-bus shunt+charging ``(G, B)`` from the Ybus row-sum (series branch terms cancel).
@@ -1037,14 +1244,28 @@ class TPGT(nn.Module):
         # v9: (P,Q,V,θ,Bs) for all types. Else: packed specified (2). No ground node.
         self.encoders = nn.ModuleList(MLP(node_in, D) for _ in range(3))
         self.use_node_shunt = USE_NODE_SHUNT
-        # v10 joint MLP attention consumes raw RPE; GRIT still uses a learned pair encoder.
-        self.use_raw_rpe = ATTENTION_KIND == "joint_mlp"
+        self.attention_kind = ATTENTION_KIND
+        # v10/v11/v11e consume raw RPE path; GRIT still uses a learned pair encoder.
+        self.use_raw_rpe = ATTENTION_KIND in RAW_RPE_ATTENTION_KINDS
         self.pair_encoder: nn.Module = nn.Identity() if self.use_raw_rpe else MLP(RPE_DIM, D_E)
+        self.grpe_encodings: GrpeEncodings | None = (
+            GrpeEncodings() if ATTENTION_KIND in GRPE_ATTENTION_KINDS else None
+        )
         self.stages = nn.ModuleList(CorrectionStage() for _ in range(DEPTH))
 
     def encode_pairs(self, rpe: torch.Tensor) -> torch.Tensor:
-        """Features passed into correction-stage attention (raw RPE for v10, else ``pair_encoder``)."""
+        """Features for correction-stage attention (raw RPE for v10/v11/v11e, else ``pair_encoder``)."""
         return rpe if self.use_raw_rpe else self.pair_encoder(rpe)
+
+    def encode_grpe(
+        self,
+        hop_id: torch.Tensor,
+        edge_id: torch.Tensor,
+    ) -> GrpePairFeatures | None:
+        """Lookup shared hop/edge embeddings when attention is GRPE."""
+        if self.grpe_encodings is None:
+            return None
+        return self.grpe_encodings(hop_id, edge_id)
 
     def forward(
         self,
@@ -1056,11 +1277,15 @@ class TPGT(nn.Module):
         pair: torch.Tensor | None = None,
         layout: TypeLayout | None = None,
         shunt_b: torch.Tensor | None = None,
+        hop_id: torch.Tensor | None = None,
+        edge_id: torch.Tensor | None = None,
+        grpe: GrpePairFeatures | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """``types`` (N,) with ``pair_type_masks`` (9, N, N), or per case (B, N) with (B, 9, N, N).
 
         ``layout`` (precomputed by ``move_to`` / ``PassBatch``) replaces ``types`` and the masks.
         ``shunt_b`` is bus-shunt ``BS`` (N,) or (B, N); required for v9 node features.
+        ``hop_id`` / ``edge_id`` (or precomputed ``grpe``) required for ``grpe`` / ``grpe_elec``.
         """
         if pair is None:
             pair = self.encode_pairs(rpe)
@@ -1068,6 +1293,10 @@ class TPGT(nn.Module):
             if pair_type_masks is None:
                 raise ValueError("TPGT forward needs pair_type_masks or a layout")
             layout = type_layout(types, pair_type_masks)
+        if grpe is None and self.grpe_encodings is not None:
+            if hop_id is None or edge_id is None:
+                raise ValueError("GRPE attention requires hop_id and edge_id (or grpe=...)")
+            grpe = self.encode_grpe(hop_id, edge_id)
         act_dtype = autocast_activation_dtype(specified)
         hidden = torch.zeros(
             specified.shape[0],
@@ -1089,7 +1318,9 @@ class TPGT(nn.Module):
             hidden = write_type(hidden, layout, type_id, encoder(gather_type(node_feats, layout, type_id)))
         residuals = []
         for stage in self.stages:
-            hidden, unknown, residual = stage(hidden, unknown, specified, pair, layout, ybus)
+            hidden, unknown, residual = stage(
+                hidden, unknown, specified, pair, layout, ybus, grpe=grpe
+            )
             residuals.append(residual)
         return unknown, residuals
 
@@ -1400,6 +1631,7 @@ def eval_batch_with_pair(
     specified, target = pack_case(power_p, power_q, voltage, angle, network.types)
     if shunt_b is None:
         shunt_b = network_shunt_b(network)
+    hop_id, edge_id = ensure_network_grpe_ids(network)
     with torch.no_grad():
         prediction, residuals = model(
             specified,
@@ -1409,6 +1641,8 @@ def eval_batch_with_pair(
             network.ybus,
             pair=pair,
             shunt_b=shunt_b,
+            hop_id=hop_id,
+            edge_id=edge_id,
         )
         breakdown = task_loss(prediction, target, residuals, network.types)
         final_pbl = pbl_stats(residuals[-1])
@@ -1505,9 +1739,16 @@ def format_rpe_effectiveness_diagnostics(
     baseline: dict[str, float] | None,
     ablation_rows: list[dict[str, float]] | None,
 ) -> str:
-    if ATTENTION_KIND == "joint_mlp":
+    if ATTENTION_KIND in GRPE_ATTENTION_KINDS:
         lines = [
-            "Pair-encoder weights: skipped (v10 / joint MLP attention uses raw RPE r_ij; no pair encoder)."
+            f"Pair-encoder weights: skipped ({ATTENTION_KIND}: Identity pair path; "
+            "topology via shared hop/edge embeddings"
+            + ("; Zeff r_ij via stage U_*" if ATTENTION_KIND == "grpe_elec" else "")
+            + ")."
+        ]
+    elif ATTENTION_KIND in RAW_RPE_ATTENTION_KINDS:
+        lines = [
+            f"Pair-encoder weights: skipped ({ATTENTION_KIND} attention uses raw RPE r_ij; no pair encoder)."
         ]
     else:
         lines = ["Pair-encoder input weight L2 per RPE channel (structural; not causal):"]
@@ -2404,6 +2645,9 @@ class Network:
     # Global Zeff normalizers used when building ``rpe`` (shared across topologies in a split).
     rpe_re_scale: float | None = field(default=None, repr=False)
     rpe_im_scale: float | None = field(default=None, repr=False)
+    # GRPE topology bins (Park et al.): hop distance id and discrete edge-relation id.
+    hop_id: torch.Tensor | None = field(default=None, repr=False)
+    edge_id: torch.Tensor | None = field(default=None, repr=False)
     type_key: bytes | None = field(default=None, repr=False, compare=False)
     layout: TypeLayout | None = field(default=None, repr=False, compare=False)
 
@@ -2553,6 +2797,71 @@ def fit_global_zeff_rpe_scales_from_networks(
         print("  RPE scale fit: no branch lists on train networks; using s_R=s_X=1.0", flush=True)
         return 1.0, 1.0, 0.0, 0.0
     return max(max_re, 1.0), max(max_im, 1.0), max_re, max_im
+
+
+def build_grpe_graph_ids(
+    bus_count: int,
+    branches: list[tuple[int, int, float, float]] | tuple[tuple[int, int, float, float], ...],
+    *,
+    max_hop: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """All-pairs hop ids and discrete edge-relation ids for Park GRPE.
+
+    * ``hop_id[i,j]`` ∈ ``{0..max_hop, max_hop+1}`` (overflow / unreachable).
+    * ``edge_id[i,j]`` ∈ ``{self=0, in-service branch=1, non-adjacent=2}``.
+    Cross-component attention is still blocked by existing component masks.
+    """
+    from scipy.sparse.csgraph import shortest_path
+
+    hop_limit = GRPE_MAX_HOP if max_hop is None else int(max_hop)
+    overflow = hop_limit + 1
+    adjacency = np.zeros((bus_count, bus_count), dtype=bool)
+    table = np.asarray(branches, dtype=np.float64).reshape(-1, 4) if branches else np.zeros((0, 4))
+    for origin, destination, resistance, reactance in table:
+        impedance = resistance + 1j * reactance
+        if abs(impedance) <= 0.0:
+            continue
+        i = int(origin)
+        j = int(destination)
+        adjacency[i, j] = True
+        adjacency[j, i] = True
+
+    if bus_count == 0:
+        empty = np.zeros((0, 0), dtype=np.int64)
+        return empty, empty.copy()
+
+    dist = shortest_path(adjacency.astype(np.float64), directed=False, unweighted=True)
+    hop = np.full((bus_count, bus_count), overflow, dtype=np.int64)
+    finite = np.isfinite(dist)
+    hop[finite] = np.minimum(dist[finite].astype(np.int64), overflow)
+    np.fill_diagonal(hop, 0)
+
+    edge = np.full((bus_count, bus_count), GRPE_EDGE_NONADJ, dtype=np.int64)
+    edge[adjacency] = GRPE_EDGE_BRANCH
+    np.fill_diagonal(edge, GRPE_EDGE_SELF)
+    return hop, edge
+
+
+def attach_grpe_graph_ids(network: Network, *, max_hop: int | None = None) -> Network:
+    """Set ``network.hop_id`` / ``edge_id`` from in-service ``branches`` (CPU long tensors)."""
+    bus_count = int(network.types.shape[-1])
+    branches = list(network.branches) if network.branches is not None else []
+    hop, edge = build_grpe_graph_ids(bus_count, branches, max_hop=max_hop)
+    network.hop_id = torch.from_numpy(hop)
+    network.edge_id = torch.from_numpy(edge)
+    return network
+
+
+def ensure_network_grpe_ids(network: Network) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return hop/edge ids, building them once if a cached Network lacks the fields."""
+    hop = getattr(network, "hop_id", None)
+    edge = getattr(network, "edge_id", None)
+    if hop is None or edge is None:
+        attach_grpe_graph_ids(network)
+        hop = network.hop_id
+        edge = network.edge_id
+    assert hop is not None and edge is not None
+    return hop, edge
 
 
 def meshed_rpe(
@@ -2831,6 +3140,7 @@ def unify_network_rpe(
         network.rpe_re_scale = global_re
         network.rpe_im_scale = global_im
         network.pair_embed = None
+        attach_grpe_graph_ids(network)
     return global_re, global_im
 
 
@@ -3036,7 +3346,7 @@ def _parse_mlp_hiddens(raw: object, default: tuple[int, ...] = (128, 64)) -> tup
 def apply_architecture_config() -> str:
     """Apply ``ARCH_PRESETS`` / per-dim env overrides. Same residual, packing, and loss logic."""
     global D, D_E, D_A, HEADS, DEPTH, RUN_TAG, RUN_DIR_NAME, CHECKPOINT_VERSION
-    global USE_NODE_SHUNT, ATTENTION_KIND, ATTENTION_MLP_HIDDENS
+    global USE_NODE_SHUNT, ATTENTION_KIND, ATTENTION_MLP_HIDDENS, GRPE_MAX_HOP
     name = parse_arch_name()
     if name:
         if name not in ARCH_PRESETS:
@@ -3088,6 +3398,9 @@ def apply_architecture_config() -> str:
     attn_override = os.environ.get("GENCO_TPGT_ATTENTION", "").strip().lower()
     if attn_override:
         ATTENTION_KIND = attn_override
+    hop_env = os.environ.get("GENCO_TPGT_GRPE_MAX_HOP", "").strip()
+    if hop_env:
+        GRPE_MAX_HOP = int(hop_env)
     # Re-read after overrides (globals() assignments above).
     D = int(globals()["D"])
     D_E = int(globals()["D_E"])
@@ -3096,8 +3409,14 @@ def apply_architecture_config() -> str:
     DEPTH = int(globals()["DEPTH"])
     ATTENTION_MLP_HIDDENS = _parse_mlp_hiddens(globals()["ATTENTION_MLP_HIDDENS"])
     ATTENTION_KIND = str(globals()["ATTENTION_KIND"]).strip().lower()
-    if ATTENTION_KIND not in ("grit", "joint_mlp"):
-        raise ValueError(f"unknown ATTENTION_KIND {ATTENTION_KIND!r}; use grit or joint_mlp")
+    GRPE_MAX_HOP = int(globals()["GRPE_MAX_HOP"])
+    if ATTENTION_KIND not in ("grit", "joint_mlp", "grpe", "grpe_elec"):
+        raise ValueError(
+            f"unknown ATTENTION_KIND {ATTENTION_KIND!r}; "
+            "use grit, joint_mlp, grpe, or grpe_elec"
+        )
+    if GRPE_MAX_HOP < 0:
+        raise ValueError(f"GRPE_MAX_HOP must be >= 0, got {GRPE_MAX_HOP}")
     RUN_DIR_NAME = f"tpgt_task11_{RUN_TAG}"
     if DEPTH < 1 or HEADS < 1 or D < 1 or D_E < 1 or D_A < 1:
         raise ValueError(
@@ -3112,11 +3431,21 @@ def architecture_summary() -> str:
     node_txt = "P,Q,V,θ,busBS" if USE_NODE_SHUNT else "spec"
     h1, h2 = ATTENTION_MLP_HIDDENS
     score_in = 2 * D_A + RPE_DIM
-    attn_txt = (
-        f"joint_mlp({score_in}->{h1}->{h2}->1, raw_rpe={RPE_DIM})"
-        if ATTENTION_KIND == "joint_mlp"
-        else "grit"
-    )
+    hop_bins = grpe_num_hop_bins()
+    if ATTENTION_KIND == "joint_mlp":
+        attn_txt = f"joint_mlp({score_in}->{h1}->{h2}->1, raw_rpe={RPE_DIM})"
+    elif ATTENTION_KIND == "grpe":
+        attn_txt = (
+            f"grpe(Park P/E hop_bins={hop_bins} edge_types={GRPE_NUM_EDGE_TYPES})/"
+            f"sqrt({D_A})"
+        )
+    elif ATTENTION_KIND == "grpe_elec":
+        attn_txt = (
+            f"grpe_elec(Park P/E + stage U r)/sqrt({D_A}), raw_rpe={RPE_DIM}, "
+            f"hop_bins={hop_bins}"
+        )
+    else:
+        attn_txt = "grit"
     return (
         f"arch {RUN_TAG}: DEPTH={DEPTH} D={D} D_E={D_E} D_A={D_A} HEADS={HEADS} "
         f"node_in={node_in} ({node_txt}) attn={attn_txt} "
@@ -3598,6 +3927,7 @@ def _representative_networks(
     networks: list[Network] = []
     for local, types, branches, ybus in rep_specs:
         features, component = meshed_rpe(bus_count, branches, ybus, re_scale=global_re, im_scale=global_im)
+        hop_id, edge_id = build_grpe_graph_ids(bus_count, branches)
         networks.append(
             Network(
                 ybus=torch.from_numpy(ybus),
@@ -3608,6 +3938,8 @@ def _representative_networks(
                 shunt_b=torch.from_numpy(np.asarray(shunt_b[local], dtype=np.float32)),
                 rpe_re_scale=global_re,
                 rpe_im_scale=global_im,
+                hop_id=torch.from_numpy(hop_id),
+                edge_id=torch.from_numpy(edge_id),
             )
         )
     return networks
@@ -4348,6 +4680,7 @@ def move_to(network: Network, device: torch.device) -> Network:
     else:
         masks = masks.to(device)
     shunt = getattr(network, "shunt_b", None)
+    hop_id, edge_id = ensure_network_grpe_ids(network)
     return Network(
         ybus=host_to_device(network.ybus, device),
         rpe=host_to_device(network.rpe, device).to(dtype=torch.float32),
@@ -4361,6 +4694,8 @@ def move_to(network: Network, device: torch.device) -> Network:
         # dropping them falls back to per-component norms and falsely fails recompute_from_branches.
         rpe_re_scale=getattr(network, "rpe_re_scale", None),
         rpe_im_scale=getattr(network, "rpe_im_scale", None),
+        hop_id=host_to_device(hop_id, device),
+        edge_id=host_to_device(edge_id, device),
         type_key=network_type_key(network),
         layout=shared_layout(types, masks, types_np=network.types.detach().cpu().numpy()),
     )
@@ -4465,6 +4800,8 @@ def forward_cases(
     ybus: torch.Tensor | None = None,
     layout: TypeLayout | None = None,
     shunt_b: torch.Tensor | None = None,
+    hop_id: torch.Tensor | None = None,
+    edge_id: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
     """Prediction, target and stage residuals of ``index`` on ``network``'s bus types.
 
@@ -4486,6 +4823,8 @@ def forward_cases(
     specified, target = pack_case(power_p, power_q, voltage, angle, layout)
     if shunt_b is None:
         shunt_b = network_shunt_b(network)
+    if hop_id is None or edge_id is None:
+        hop_id, edge_id = ensure_network_grpe_ids(network)
     prediction, residuals = model(
         specified,
         layout.types,
@@ -4495,6 +4834,8 @@ def forward_cases(
         pair=pair,
         layout=layout,
         shunt_b=shunt_b,
+        hop_id=hop_id,
+        edge_id=edge_id,
     )
     return prediction, target, residuals
 
@@ -4523,13 +4864,25 @@ def run_batch_residuals(
     ybus: torch.Tensor | None = None,
     layout: TypeLayout | None = None,
     shunt_b: torch.Tensor | None = None,
+    hop_id: torch.Tensor | None = None,
+    edge_id: torch.Tensor | None = None,
 ) -> tuple[TaskLossBreakdown, list[torch.Tensor]]:
     if pair is None:
         pair = pair_features(model, network)
     if layout is None:
         layout = network_layout(network)
     prediction, target, residuals = forward_cases(
-        model, split, network, index, device, pair, ybus, layout, shunt_b=shunt_b
+        model,
+        split,
+        network,
+        index,
+        device,
+        pair,
+        ybus,
+        layout,
+        shunt_b=shunt_b,
+        hop_id=hop_id,
+        edge_id=edge_id,
     )
     return task_loss(prediction, target, residuals, layout), residuals
 
@@ -4573,6 +4926,8 @@ class PassBatch:
         self.select: torch.Tensor | None = None
         self.member_layout: TypeLayout | None = None
         self.shunt_b: torch.Tensor | None = None
+        self.hop_id: torch.Tensor | None = None
+        self.edge_id: torch.Tensor | None = None
         if len(networks) == 1:
             self.kind = "single"
             return
@@ -4580,6 +4935,8 @@ class PassBatch:
         self.kind = "shared" if len(keys) == 1 else "mixed"
         self.ybus = torch.stack([network.ybus for network in networks]).to(torch.complex128)
         self.shunt_b = torch.stack([network_shunt_b(network) for network in networks])
+        self.hop_id = torch.stack([ensure_network_grpe_ids(network)[0] for network in networks])
+        self.edge_id = torch.stack([ensure_network_grpe_ids(network)[1] for network in networks])
         self.select = host_to_device(torch.as_tensor(self.owner, dtype=torch.long), self.ybus.device)
         if self.kind == "mixed":
             layouts = [network_layout(network) for network in networks]
@@ -4628,7 +4985,7 @@ class PassBatch:
             return run_batch_residuals(model, split, self.networks[0], chunk, device, pair=pair)
         select = self.select[start:stop]
         layout = None if self.member_layout is None else self.member_layout.take(select)
-        assert self.shunt_b is not None
+        assert self.shunt_b is not None and self.hop_id is not None and self.edge_id is not None
         return run_batch_residuals(
             model,
             split,
@@ -4639,6 +4996,8 @@ class PassBatch:
             ybus=self.ybus[select],
             layout=layout,
             shunt_b=self.shunt_b[select],
+            hop_id=self.hop_id[select],
+            edge_id=self.edge_id[select],
         )
 
 
@@ -5288,7 +5647,7 @@ def train_epoch_loss_line(
     timing_text = "" if timing is None else f"  {timing}"
     return (
         f"seed {seed} epoch {epoch_number}/{EPOCHS}  "
-        f"state {state_mse / n:.4f}  phys_w {physics_sum / n:.4f}  {stage_text}  "
+        f"epoch_avg state {state_mse / n:.4f}  phys_w {physics_sum / n:.4f}  {stage_text}  "
         f"train {train_total / n:.4f}  val_pbl {val_display}{lr_text}{timing_text}"
     )
 
@@ -5654,14 +6013,17 @@ def train_seed(
                     or now - last_progress >= PROGRESS_EVERY_SECONDS
                 ):
                     timing = timer.summary("window")
-                    totals = running.detach().cpu().tolist()
+                    # Progress lines: this step only (not a running epoch mean — that
+                    # was misleading when early-epoch spikes polluted later prints).
+                    step_total = float(breakdown.total.detach().cpu())
+                    step_state = float(breakdown.state_mse.detach().cpu())
                     elapsed = time.perf_counter() - epoch_started
                     eta = elapsed / batches * (n_steps - batches)
                     topologies = "" if len(step_groups) == 1 else f", {len(step_groups)} topologies"
                     print(
                         f"  seed {seed} epoch {epoch + 1} step {batches}/{n_steps} "
                         f"({cases} cases{topologies}; {cases_seen}/{train_split.count} done)  "
-                        f"state {totals[1] / batches:.4f}  train {totals[0] / batches:.4f}  "
+                        f"state {step_state:.4f}  train {step_total:.4f}  "
                         f"elapsed {format_duration(elapsed)}  ETA {format_duration(eta)}  {timing}",
                         flush=True,
                     )

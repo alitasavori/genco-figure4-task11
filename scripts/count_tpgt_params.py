@@ -19,6 +19,14 @@ def mlp_params(in_f: int, out_f: int, width: int = t.D) -> int:
     return in_f * width + width + width * width + width + width * out_f + out_f
 
 
+def shared_grpe_params() -> int:
+    """Shared hop/edge P^{Q,K,V} and E^{Q,K,V} tables on TPGT."""
+    hop_bins = t.grpe_num_hop_bins()
+    per_hop = hop_bins * t.HEADS * t.D_A
+    per_edge = t.GRPE_NUM_EDGE_TYPES * t.HEADS * t.D_A
+    return 3 * per_hop + 3 * per_edge
+
+
 def stage_attn_params() -> int:
     """Attention weights for one correction stage under the active ``ATTENTION_KIND``."""
     total = 0
@@ -32,6 +40,12 @@ def stage_attn_params() -> int:
         # 98→h1→h2→1: W1/b1, W2/b2, W3/b3 — per type-pair head.
         per = h1 * score_in + h1 + h2 * h1 + h2 + 1 * h2 + 1
         total += 9 * t.HEADS * per
+    elif t.ATTENTION_KIND == "grpe":
+        # Shared P/E live on TPGT; stage has type-pair Q/K/V + W_O only.
+        pass
+    elif t.ATTENTION_KIND == "grpe_elec":
+        # Stage U_Q, U_K, U_V: (D_A, RPE_DIM) per type-pair head.
+        total += 9 * t.HEADS * 3 * t.D_A * t.RPE_DIM
     else:
         for extra in (
             (t.D_A, t.D_E),
@@ -52,7 +66,8 @@ def main() -> None:
 
     node_in = t.NODE_FEATURE_DIM if t.USE_NODE_SHUNT else t.NODE_SPECIFIED_DIM
     enc_one = mlp_params(node_in, t.D)
-    pe_one = 0 if t.ATTENTION_KIND == "joint_mlp" else mlp_params(t.RPE_DIM, t.D_E)
+    pe_one = 0 if t.ATTENTION_KIND in t.RAW_RPE_ATTENTION_KINDS else mlp_params(t.RPE_DIM, t.D_E)
+    grpe_shared = shared_grpe_params() if t.ATTENTION_KIND in t.GRPE_ATTENTION_KINDS else 0
 
     model = t.TPGT()
     total = sum(p.numel() for p in model.parameters())
@@ -70,11 +85,17 @@ def main() -> None:
             pe_one,
             1,
         ),
-        ("Correction stage: type-pair attention", attn, t.DEPTH),
-        ("Correction stage: update MLPs (3 x)", update, t.DEPTH),
-        ("Correction stage: decode MLPs (3 x)", decode, t.DEPTH),
-        ("Correction stage: LayerNorm(D)", ln, t.DEPTH),
     ]
+    if grpe_shared:
+        rows.append(("Shared GRPE hop/edge encodings (P/E QKV)", grpe_shared, 1))
+    rows.extend(
+        [
+            ("Correction stage: type-pair attention", attn, t.DEPTH),
+            ("Correction stage: update MLPs (3 x)", update, t.DEPTH),
+            ("Correction stage: decode MLPs (3 x)", decode, t.DEPTH),
+            ("Correction stage: LayerNorm(D)", ln, t.DEPTH),
+        ]
+    )
 
     print(f"{'Component':<48} {'Per unit':>12} {' x':>4} {'Subtotal':>12}")
     print("-" * 80)
@@ -99,6 +120,17 @@ def main() -> None:
             f"W_Q/W_K/W_V: ({t.D_A},{t.D}), score MLP "
             f"({score_in} -> {h1} -> {h2} -> 1) with r_ij dim={t.RPE_DIM}, "
             f"W_O: ({t.D},{t.D_A}). No pair encoder."
+        )
+    elif t.ATTENTION_KIND == "grpe":
+        print(
+            "Attention (Park GRPE): shared hop/edge P^{Q,K,V}+E^{Q,K,V}; "
+            f"per stage W_Q/W_K/W_V: ({t.D_A},{t.D}), W_O: ({t.D},{t.D_A}); "
+            f"hop_bins={t.grpe_num_hop_bins()}, edge_types={t.GRPE_NUM_EDGE_TYPES}."
+        )
+    elif t.ATTENTION_KIND == "grpe_elec":
+        print(
+            "Attention (GRPE + Zeff): shared P/E plus per-stage U_Q/U_K/U_V "
+            f"({t.D_A},{t.RPE_DIM}) on raw RPE; hop_bins={t.grpe_num_hop_bins()}."
         )
     else:
         print(
