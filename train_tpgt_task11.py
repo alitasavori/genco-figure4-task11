@@ -22,7 +22,10 @@ A progress line (about once a minute, and every 50 steps) and the epoch line bre
 into network moves, pair encoder, forward, backward and optimizer (``StepTimer``). Checkpoint
 epochs also write a bar plot against the
 published numbers (latest under ``results/``, plus a per-epoch copy under
-``bar_plots/seed_*/epoch_*/``) and IEEE 118 bus error maps.
+``bar_plots/seed_*/epoch_*/``), IEEE 118 bus error maps, and every console
+report (epoch/step lines, test PBL, forward/contingency diagnostics, comparison)
+under ``seed_*/training_log.txt``, ``seed_*/metrics.jsonl``, and
+``seed_*/reports/epoch_*/`` on Drive.
 The hidden sizes, depth, batch, and epoch cap below are implementation
 choices so a Colab GPU can finish a run. They are not paper hyperparameters.
 
@@ -2117,14 +2120,19 @@ def collect_forward_diagnostics(
         flat = flat_start(specified, types)
         flat_pbl = pbl_from_unknown(specified, flat, types, ybus)
         pair = pair_features(model, network)
+        hop_id, edge_id = ensure_network_grpe_ids(network)
+        layout = network_layout(network)
         prediction, residuals = model(
             specified,
             types,
             network.rpe,
-            network.pair_type_masks,
+            network_masks(network),
             ybus,
             pair=pair,
+            layout=layout,
             shunt_b=network_shunt_b(network),
+            hop_id=hop_id,
+            edge_id=edge_id,
         )
         breakdown = task_loss(prediction, target, residuals, types)
         stage_pbl = [pbl_stats(r) for r in residuals]
@@ -2352,14 +2360,18 @@ def audit_residual_correctness(
         )
 
         pair = pair_features(model, network)
+        hop_id, edge_id = ensure_network_grpe_ids(network)
         prediction, residuals = model(
             specified,
             types,
             network.rpe,
-            network.pair_type_masks,
+            network_masks(network),
             ybus,
             pair=pair,
+            layout=network_layout(network),
             shunt_b=network_shunt_b(network),
+            hop_id=hop_id,
+            edge_id=edge_id,
         )
         recomputed = nodal_residual(specified, prediction, types, ybus)
         scale = float(residuals[-1].abs().max().clamp(min=1.0))
@@ -2388,7 +2400,7 @@ def format_correctness_checks(title: str, checks: list[CorrectnessCheck], failur
     return "\n".join(lines)
 
 
-def print_forward_diagnostics(
+def build_forward_diagnostics_text(
     model: TPGT,
     split: Split,
     network: Network,
@@ -2398,7 +2410,7 @@ def print_forward_diagnostics(
     *,
     rpe_ablation: bool = False,
     shunt_ablation: bool = False,
-) -> None:
+) -> str:
     report = collect_forward_diagnostics(model, split, network, index, device)
     text = format_forward_diagnostics(tag, report)
     weight_rows = pair_encoder_input_weight_norms(model)
@@ -2419,7 +2431,39 @@ def print_forward_diagnostics(
         audit_residual_correctness(model, split, network, index, device),
         "Fix nodal_residual, units, or Ybus grouping before trusting PBL numbers.",
     )
-    print(text, flush=True)
+    return text
+
+
+def print_forward_diagnostics(
+    model: TPGT,
+    split: Split,
+    network: Network,
+    index: np.ndarray,
+    device: torch.device,
+    tag: str,
+    *,
+    rpe_ablation: bool = False,
+    shunt_ablation: bool = False,
+    seed_dir: Path | None = None,
+    epoch: int | None = None,
+) -> str:
+    text = build_forward_diagnostics_text(
+        model,
+        split,
+        network,
+        index,
+        device,
+        tag,
+        rpe_ablation=rpe_ablation,
+        shunt_ablation=shunt_ablation,
+    )
+    if seed_dir is None:
+        print(text, flush=True)
+    else:
+        append_seed_log(seed_dir, text)
+        if epoch is not None and saves_checkpoint_epoch(int(epoch)):
+            write_seed_report(seed_dir, int(epoch), "forward_diagnostics.txt", text)
+    return text
 
 
 def wants_debug_diagnostics() -> bool:
@@ -2535,7 +2579,9 @@ def print_contingency_diagnostics(
     *,
     networks_per_class: int = 3,
     cases_per_network: int = 8,
-) -> None:
+    seed_dir: Path | None = None,
+    epoch: int | None = None,
+) -> str:
     """PBL by contingency class, plus RPE/residual audits and RPE ablation on the largest groups of each class."""
     lines = [f"=== Contingency diagnostics {label} ({split.count} cases, {len(networks)} topologies) ==="]
     classes = [contingency_class(network, reference) for network in split.networks]
@@ -2628,7 +2674,15 @@ def print_contingency_diagnostics(
             "not the pair features. For line outages, large shift plus large ΔPBL marks the channels that "
             "move under outages and that the model depends on."
         )
-    print("\n".join(lines), flush=True)
+    text = "\n".join(lines)
+    if seed_dir is None:
+        print(text, flush=True)
+    else:
+        append_seed_log(seed_dir, text)
+        if epoch is not None and saves_checkpoint_epoch(int(epoch)):
+            safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in label.strip()) or "contingency"
+            write_seed_report(seed_dir, int(epoch), f"contingency_{safe}.txt", text)
+    return text
 
 
 @dataclass
@@ -2853,7 +2907,11 @@ def attach_grpe_graph_ids(network: Network, *, max_hop: int | None = None) -> Ne
 
 
 def ensure_network_grpe_ids(network: Network) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return hop/edge ids, building them once if a cached Network lacks the fields."""
+    """Return hop/edge ids, building them once if a cached Network lacks the fields.
+
+    Lazily built ids are moved onto ``network.types``'s device so diagnostics on a
+    GPU-resident Network do not pass CPU index tensors into GRPE attention.
+    """
     hop = getattr(network, "hop_id", None)
     edge = getattr(network, "edge_id", None)
     if hop is None or edge is None:
@@ -2861,6 +2919,13 @@ def ensure_network_grpe_ids(network: Network) -> tuple[torch.Tensor, torch.Tenso
         hop = network.hop_id
         edge = network.edge_id
     assert hop is not None and edge is not None
+    device = network.types.device
+    if hop.device != device:
+        hop = hop.to(device=device, non_blocking=device.type == "cuda")
+        network.hop_id = hop
+    if edge.device != device:
+        edge = edge.to(device=device, non_blocking=device.type == "cuda")
+        network.edge_id = edge
     return hop, edge
 
 
@@ -5609,6 +5674,45 @@ def saves_checkpoint_epoch(epoch_number: int) -> bool:
     return epoch_number == EPOCHS or epoch_number % CHECKPOINT_EVERY == 0
 
 
+def seed_report_dir(seed_dir: Path, epoch: int) -> Path:
+    """``seed_*/reports/epoch_N/`` on the Drive run folder (created on demand)."""
+    path = seed_dir / "reports" / f"epoch_{int(epoch)}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def append_seed_log(seed_dir: Path, text: str, *, also_print: bool = True) -> None:
+    """Append console report text to ``seed_*/training_log.txt`` (Drive-backed) and optionally print."""
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    body = text if text.endswith("\n") else text + "\n"
+    with (seed_dir / "training_log.txt").open("a", encoding="utf-8") as handle:
+        handle.write(body)
+        handle.flush()
+    if also_print:
+        print(text, flush=True)
+
+
+def write_seed_report(seed_dir: Path, epoch: int, filename: str, text: str) -> Path:
+    """Write a durable per-checkpoint report file under ``reports/epoch_N/``."""
+    path = seed_report_dir(seed_dir, epoch) / filename
+    path.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+    return path
+
+
+def append_seed_metrics(seed_dir: Path, row: dict) -> None:
+    """Append one epoch (or checkpoint) metrics object to ``seed_*/metrics.jsonl``."""
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    with (seed_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        handle.flush()
+
+
+def write_seed_json(seed_dir: Path, epoch: int, filename: str, payload: dict | list) -> Path:
+    path = seed_report_dir(seed_dir, epoch) / filename
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path
+
+
 def test_pbl_line(seed: int, epoch_number: int, scores: dict[str, float]) -> str:
     return (
         f"seed {seed} epoch {epoch_number} test PBL  "
@@ -5778,6 +5882,10 @@ def train_seed(
     model_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = model_dir / "last.pt"
     done_path = model_dir / "complete.json"
+
+    def log(text: str) -> None:
+        append_seed_log(model_dir, text)
+
     seed_all(seed)
     configure_cuda_training(device)
     if device.type == "cuda":
@@ -5785,10 +5893,7 @@ def train_seed(
         torch.cuda.empty_cache()
     model = TPGT().to(device)
     if wants_torch_compile():
-        print(
-            "torch.compile enabled (GENCO_TPGT_COMPILE=1, GENCO_TPGT_FAST=1, or --compile / --fast)",
-            flush=True,
-        )
+        log("torch.compile enabled (GENCO_TPGT_COMPILE=1, GENCO_TPGT_FAST=1, or --compile / --fast)")
         model = torch.compile(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = make_lr_schedule(optimizer)
@@ -5798,10 +5903,9 @@ def train_seed(
         if scheduler.plateau_enabled
         else "plateau off (GENCO_TPGT_LR_PLATEAU=0)"
     )
-    print(
+    log(
         f"optim: Adam lr {LEARNING_RATE:.1e} → {LEARNING_RATE * LR_COSINE_MIN_RATIO:.1e} "
-        f"cosine ceiling/{EPOCHS}ep, {plateau_note}, grad_clip_norm={GRAD_CLIP_NORM:g}",
-        flush=True,
+        f"cosine ceiling/{EPOCHS}ep, {plateau_note}, grad_clip_norm={GRAD_CLIP_NORM:g}"
     )
     cache_budget = device_cache_budget(device)
     train_share = len(train_split.networks) / max(len(train_split.networks) + len(val_split.networks), 1)
@@ -5809,31 +5913,23 @@ def train_seed(
     val_networks = DeviceNetworks(
         val_split.networks, device, budget_bytes=cache_budget - int(cache_budget * train_share)
     )
-    print(
+    log(
         f"device network cache (budget {cache_budget / 1024**2:.0f} MB): "
-        f"train {train_networks.describe()}; valid {val_networks.describe()}",
-        flush=True,
+        f"train {train_networks.describe()}; valid {val_networks.describe()}"
     )
     train_probe = train_probe_split(train_split, min(val_split.count, TRAIN_PROBE_CASES))
     mix_topologies = mix_topologies_per_step(len(train_split.networks))
     if mix_topologies:
-        print(
-            f"train steps: mix topologies (global shuffle, up to {BATCH_SIZE} cases/step)",
-            flush=True,
-        )
+        log(f"train steps: mix topologies (global shuffle, up to {BATCH_SIZE} cases/step)")
     else:
         max_topologies, max_cases = pack_step_limits()
         if max_topologies <= 1:
-            print(
-                f"train steps: one topology per step ({len(train_split.networks)} topologies)",
-                flush=True,
-            )
+            log(f"train steps: one topology per step ({len(train_split.networks)} topologies)")
         else:
-            print(
+            log(
                 f"train steps: up to {max_topologies} same-type topologies and {max_cases} cases "
                 f"per step ({len(train_split.networks)} topologies; a chunk of {max_cases}+ cases "
-                f"stays one topology; GENCO_TPGT_PACK_TOPOLOGIES=1 forces one topology per step)",
-                flush=True,
+                f"stays one topology; GENCO_TPGT_PACK_TOPOLOGIES=1 forces one topology per step)"
             )
     start_epoch = 0
     best_val = float("inf")
@@ -5908,9 +6004,8 @@ def train_seed(
         }
         torch.save(payload, epoch_path)
         torch.save(payload, checkpoint_path)
-        print(
-            f"Saved seed {seed} epoch {epoch_number} checkpoint to {epoch_path} and {checkpoint_path}",
-            flush=True,
+        log(
+            f"Saved seed {seed} epoch {epoch_number} checkpoint to {epoch_path} and {checkpoint_path}"
         )
         if after_periodic_checkpoint is not None:
             if test_scores is None:
@@ -5974,9 +6069,8 @@ def train_seed(
             n_steps = len(steps)
             packed_steps = sum(len(groups) > 1 for groups in steps)
             pack_note = f", {packed_steps} multi-topology" if packed_steps else ""
-            print(
-                f"  seed {seed} epoch {epoch + 1}: {n_steps} steps ({train_split.count} cases{pack_note})",
-                flush=True,
+            log(
+                f"  seed {seed} epoch {epoch + 1}: {n_steps} steps ({train_split.count} cases{pack_note})"
             )
             batches = 0
             cases_seen = 0
@@ -6020,22 +6114,18 @@ def train_seed(
                     elapsed = time.perf_counter() - epoch_started
                     eta = elapsed / batches * (n_steps - batches)
                     topologies = "" if len(step_groups) == 1 else f", {len(step_groups)} topologies"
-                    print(
+                    log(
                         f"  seed {seed} epoch {epoch + 1} step {batches}/{n_steps} "
                         f"({cases} cases{topologies}; {cases_seen}/{train_split.count} done)  "
                         f"state {step_state:.4f}  train {step_total:.4f}  "
-                        f"elapsed {format_duration(elapsed)}  ETA {format_duration(eta)}  {timing}",
-                        flush=True,
+                        f"elapsed {format_duration(elapsed)}  ETA {format_duration(eta)}  {timing}"
                     )
                     last_progress = time.perf_counter()
             running_total, running_state, running_phys, *running_phys_stages = running.tolist()
             epoch_timing = timer.summary("epoch")
             run_validation = val_every <= 1 or (epoch + 1) % val_every == 0 or (epoch + 1) == EPOCHS
             if run_validation:
-                print(
-                    f"  seed {seed} epoch {epoch + 1}: validating {val_split.count} cases",
-                    flush=True,
-                )
+                log(f"  seed {seed} epoch {epoch + 1}: validating {val_split.count} cases")
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 val_score = evaluate_pbl(
@@ -6066,21 +6156,38 @@ def train_seed(
                 val_display = "skipped"
             val_for_lr = val_score if run_validation else None
             scheduler.step_epoch(epoch + 1, val_for_lr)
-            print(
-                train_epoch_loss_line(
-                    seed,
-                    epoch + 1,
-                    batches,
-                    running_state,
-                    running_phys,
-                    running_phys_stages,
-                    running_total,
-                    val_display,
-                    lr=current_lr(optimizer),
-                    timing=epoch_timing,
-                ),
-                flush=True,
+            epoch_line = train_epoch_loss_line(
+                seed,
+                epoch + 1,
+                batches,
+                running_state,
+                running_phys,
+                running_phys_stages,
+                running_total,
+                val_display,
+                lr=current_lr(optimizer),
+                timing=epoch_timing,
             )
+            log(epoch_line)
+            n_batches = max(batches, 1)
+            epoch_metrics = {
+                "seed": seed,
+                "epoch": epoch + 1,
+                "batches": batches,
+                "state_mse": running_state / n_batches,
+                "physics_sum": running_phys / n_batches,
+                "physics_stages": [value / n_batches for value in running_phys_stages],
+                "train_total": running_total / n_batches,
+                "val_pbl": None if not run_validation else float(val_score),
+                "train_probe_pbl": None if not run_validation else float(train_probe_score),
+                "lr": current_lr(optimizer),
+                "timing": epoch_timing,
+                "checkpoint_epoch": saves_checkpoint_epoch(epoch + 1),
+            }
+            append_seed_metrics(model_dir, epoch_metrics)
+            if saves_checkpoint_epoch(epoch + 1):
+                write_seed_report(model_dir, epoch + 1, "epoch_line.txt", epoch_line)
+                write_seed_json(model_dir, epoch + 1, "epoch_metrics.json", epoch_metrics)
             if debug_diagnostics and saves_checkpoint_epoch(epoch + 1):
                 val_net = dominant_network_id(val_split)
                 sample = debug_sample_index(val_split, network_id=val_net)
@@ -6093,6 +6200,8 @@ def train_seed(
                     tag=f"seed {seed} epoch {epoch + 1} ({len(sample)} valid cases, network {val_net})",
                     rpe_ablation=wants_rpe_ablation(default=True),
                     shunt_ablation=wants_shunt_ablation(default=True),
+                    seed_dir=model_dir,
+                    epoch=epoch + 1,
                 )
             start_epoch = epoch + 1
             finish_checkpoint_epoch(start_epoch)
@@ -6191,26 +6300,43 @@ def write_summary(results: Path, spec: TaskSpec | None = None) -> list[dict]:
     return summary
 
 
-def print_comparison(summary: list[dict], spec: TaskSpec | None = None) -> None:
+def format_comparison(summary: list[dict], spec: TaskSpec | None = None) -> str:
     spec = spec or TASKS["1.1"]
     categories = categories_for(spec.task_id)
-    print(f"\nTask {spec.label} mean power-balance loss (per unit)", flush=True)
-    print("PUBLISHED", flush=True)
+    lines = [f"Task {spec.label} mean power-balance loss (per unit)", "PUBLISHED"]
     for model, scores in PUBLISHED.get(spec.task_id, {}).items():
         parts = [f"{category} {scores[category][0]:.4g} ± {scores[category][1]:.4g}" for category in categories]
-        print(f"  {model}: " + "; ".join(parts), flush=True)
-    print("TPGT this run", flush=True)
+        lines.append(f"  {model}: " + "; ".join(parts))
+    lines.append("TPGT this run")
     by_category = {row["test_category"]: row for row in summary}
     if any(category not in by_category for category in categories):
-        print("  TPGT has no finished reported-category seed yet.", flush=True)
-        return
+        lines.append("  TPGT has no finished reported-category seed yet.")
+        return "\n".join(lines)
     parts = []
     for category in categories:
         row = by_category[category]
         parts.append(
             f"{category} {float(row['mean_across_seeds']):.4g} ± {float(row['std_across_seeds']):.4g} (n={row['n_seeds']})"
         )
-    print("  TPGT: " + "; ".join(parts), flush=True)
+    lines.append("  TPGT: " + "; ".join(parts))
+    return "\n".join(lines)
+
+
+def print_comparison(
+    summary: list[dict],
+    spec: TaskSpec | None = None,
+    *,
+    seed_dir: Path | None = None,
+    epoch: int | None = None,
+) -> str:
+    text = format_comparison(summary, spec)
+    if seed_dir is None:
+        print(text, flush=True)
+    else:
+        append_seed_log(seed_dir, text)
+        if epoch is not None and saves_checkpoint_epoch(int(epoch)):
+            write_seed_report(seed_dir, int(epoch), "comparison.txt", text)
+    return text
 
 
 def comparison_figure_path(results: Path, spec: TaskSpec | None = None) -> Path:
@@ -6550,6 +6676,8 @@ def main() -> None:
             continue
 
         def on_epoch_end(model: TPGT, epoch_number: int, seed: int = seed) -> tuple[dict[str, float], dict[str, int]]:
+            seed_dir = checkpoints / f"seed_{seed}"
+
             def after_test_split(
                 label: str,
                 split: Split,
@@ -6567,6 +6695,8 @@ def main() -> None:
                         device,
                         reference_network,
                         per_network,
+                        seed_dir=seed_dir,
+                        epoch=epoch_number,
                     )
 
             scores, counts = test_model(
@@ -6583,9 +6713,29 @@ def main() -> None:
             if spec.task_id == "3.1":
                 for grid in ("57", "118", "500"):
                     subset = {category: reported[f"{grid} {category}"] for category in CATEGORIES}
-                    print(f"case {grid}  " + test_pbl_line(seed, epoch_number, subset), flush=True)
+                    line = f"case {grid}  " + test_pbl_line(seed, epoch_number, subset)
+                    append_seed_log(seed_dir, line)
+                    write_seed_report(seed_dir, epoch_number, f"test_pbl_case{grid}.txt", line)
             else:
-                print(test_pbl_line(seed, epoch_number, reported), flush=True)
+                line = test_pbl_line(seed, epoch_number, reported)
+                append_seed_log(seed_dir, line)
+                write_seed_report(seed_dir, epoch_number, "test_pbl.txt", line)
+            write_seed_json(
+                seed_dir,
+                epoch_number,
+                "test_scores.json",
+                {"scores": reported, "counts": counts, "seed": seed, "epoch": epoch_number},
+            )
+            append_seed_metrics(
+                seed_dir,
+                {
+                    "seed": seed,
+                    "epoch": epoch_number,
+                    "kind": "test",
+                    "scores": reported,
+                    "counts": counts,
+                },
+            )
             return scores, counts
 
         def publish_checkpoint(
@@ -6597,14 +6747,24 @@ def main() -> None:
             seed: int = seed,
         ) -> None:
             # record_seed / summary CSV / plots only on Drive checkpoint epochs (not every epoch).
+            seed_dir = checkpoints / f"seed_{seed}"
             record_seed(results, seed, scores, counts, checkpoint, epoch_number, spec)
             summary = write_summary(results, spec)
-            print_comparison(summary, spec)
+            print_comparison(summary, spec, seed_dir=seed_dir, epoch=epoch_number)
+            write_seed_json(
+                seed_dir,
+                epoch_number,
+                "summary_snapshot.json",
+                {"seed": seed, "epoch": epoch_number, "summary": summary, "checkpoint": str(checkpoint)},
+            )
             bar_archive = checkpoints / "bar_plots" / f"seed_{seed}" / f"epoch_{epoch_number}"
             try:
                 plot_comparison(results, summary, spec, archive_dir=bar_archive)
             except Exception as error:
-                print(f"Bar plot skipped for epoch {epoch_number}: {type(error).__name__}: {error}", flush=True)
+                append_seed_log(
+                    seed_dir,
+                    f"Bar plot skipped for epoch {epoch_number}: {type(error).__name__}: {error}",
+                )
             n1_split = held_splits.pop("N-1", None)
             if n1_split is not None:
                 write_checkpoint_bus_maps(
