@@ -258,15 +258,21 @@ def dense_exphormer_messages(
     n_aug = n_real + n_virt
     heads = int(w_q.shape[1])
     d_a = int(w_q.shape[2])
-    hidden_f = hidden_real.float()
-    z_f = z_virt.float()
-    pair_f = pair_aug.float()
-    y = torch.cat((hidden_f, z_f), dim=1)
     allow_b = allow if allow.dim() == 2 else allow
     tau_b = tau if tau.dim() == 2 else tau
-    amp_off = torch.autocast(device_type="cuda", enabled=False) if y.is_cuda else nullcontext()
+    # Casts must sit inside amp_off: ambient autocast can re-promote .float() ops to Half.
+    amp_off = (
+        torch.autocast(device_type="cuda", enabled=False) if hidden_real.is_cuda else nullcontext()
+    )
     with amp_off:
-        scores = y.new_full((batch, heads, n_aug, n_aug), float("-inf"))
+        y = torch.cat((hidden_real.to(dtype=torch.float32), z_virt.to(dtype=torch.float32)), dim=1)
+        pair_f = pair_aug.to(dtype=torch.float32)
+        scores = torch.full(
+            (batch, heads, n_aug, n_aug),
+            float("-inf"),
+            device=y.device,
+            dtype=torch.float32,
+        )
         for recv_t in range(NUM_REAL_TYPES + 1):
             for send_t in range(NUM_REAL_TYPES + 1):
                 if recv_t == TYPE_VIRTUAL and send_t == TYPE_VIRTUAL:
@@ -282,8 +288,8 @@ def dense_exphormer_messages(
                 block_allow = allow_b[receivers.view(-1, 1), senders.view(1, -1)]
                 if not bool(block_allow.any()):
                     continue
-                query = torch.einsum("bnd,had->bhna", y[:, receivers], w_q[p].float())
-                key = torch.einsum("bnd,had->bhna", y[:, senders], w_k[p].float())
+                query = torch.einsum("bnd,had->bhna", y[:, receivers], w_q[p].to(dtype=torch.float32))
+                key = torch.einsum("bnd,had->bhna", y[:, senders], w_k[p].to(dtype=torch.float32))
                 if pair_f.dim() == 3:
                     edge = pair_f[receivers.view(-1, 1), senders.view(1, -1)].unsqueeze(0).unsqueeze(1)
                     edge = edge.expand(batch, heads, -1, -1, -1)
@@ -294,19 +300,25 @@ def dense_exphormer_messages(
                     query,
                     key,
                     edge,
-                    score_w1[p].float(),
-                    score_b1[p].float(),
-                    score_w2[p].float(),
-                    score_b2[p].float(),
-                    score_w3[p].float(),
-                    score_b3[p].float(),
+                    score_w1[p].to(dtype=torch.float32),
+                    score_b1[p].to(dtype=torch.float32),
+                    score_w2[p].to(dtype=torch.float32),
+                    score_b2[p].to(dtype=torch.float32),
+                    score_w3[p].to(dtype=torch.float32),
+                    score_b3[p].to(dtype=torch.float32),
                 )
                 block_tau = tau_b[receivers.view(-1, 1), senders.view(1, -1)]
-                bias = edge_bias.new_zeros((heads, receivers.numel(), senders.numel()), dtype=torch.float32)
+                bias = torch.zeros(
+                    (heads, receivers.numel(), senders.numel()),
+                    device=y.device,
+                    dtype=torch.float32,
+                )
                 for tau_id in range(NUM_EDGE_TAU):
                     hit = block_tau == tau_id
                     if bool(hit.any()):
-                        bias = bias + hit.to(bias.dtype).unsqueeze(0) * edge_bias[tau_id].float().view(heads, 1, 1)
+                        bias = bias + hit.to(dtype=torch.float32).unsqueeze(0) * edge_bias[tau_id].to(
+                            dtype=torch.float32
+                        ).view(heads, 1, 1)
                 score = score + bias.unsqueeze(0)
                 score = score.masked_fill(~block_allow.unsqueeze(0).unsqueeze(0), float("-inf"))
                 scores[:, :, receivers.view(-1, 1), senders.view(1, -1)] = score
@@ -316,7 +328,7 @@ def dense_exphormer_messages(
         row_sum = weights.sum(dim=-1, keepdim=True)
         weights = torch.where(row_sum > 0, weights / row_sum.clamp(min=1e-12), weights)
 
-        mixed = weights.new_zeros((batch, heads, n_aug, d_a))
+        mixed = torch.zeros((batch, heads, n_aug, d_a), device=y.device, dtype=torch.float32)
         for recv_t in range(NUM_REAL_TYPES + 1):
             for send_t in range(NUM_REAL_TYPES + 1):
                 if recv_t == TYPE_VIRTUAL and send_t == TYPE_VIRTUAL:
@@ -334,11 +346,13 @@ def dense_exphormer_messages(
                     continue
                 block_w = weights[:, :, receivers.view(-1, 1), senders.view(1, -1)]
                 block_w = block_w.masked_fill(~block_allow.unsqueeze(0).unsqueeze(0), 0.0)
-                value = torch.einsum("bnd,had->bhna", y[:, senders], w_v[p].float())
+                value = torch.einsum(
+                    "bnd,had->bhna", y[:, senders], w_v[p].to(dtype=torch.float32)
+                )
                 gathered = torch.einsum("bhnm,bhma->bhna", block_w, value)
                 mixed = mixed.index_add(2, receivers, gathered)
 
-        message = torch.einsum("bhna,hda->bnd", mixed, w_o.float())
+        message = torch.einsum("bhna,hda->bnd", mixed, w_o.to(dtype=torch.float32))
     return message[:, :n_real].to(dtype=out_dtype), message[:, n_real:].to(dtype=out_dtype)
 
 
@@ -395,20 +409,23 @@ def sparse_exphormer_messages(
     n_aug = n_real + n_virt
     heads = int(w_q.shape[1])
     d_a = int(w_q.shape[2])
-    # Force fp32 compute; cast messages back to the caller activation dtype.
-    hidden_f = hidden_real.float()
-    z_f = z_virt.float()
-    pair_f = pair_aug.float()
-    y = torch.cat((hidden_f, z_f), dim=1)
     e = int(recv_idx.numel())
     if e == 0:
         return hidden_real.new_zeros(hidden_real.shape), z_virt.new_zeros(z_virt.shape)
 
-    # Disable surrounding CUDA autocast for the whole sparse kernel.
-    amp_off = torch.autocast(device_type="cuda", enabled=False) if y.is_cuda else nullcontext()
+    # Casts must sit inside amp_off: ambient autocast can re-promote .float() / cat to Half,
+    # leaving score buffers Half while MLP math is Float32 (async index_put failure).
+    amp_off = (
+        torch.autocast(device_type="cuda", enabled=False) if hidden_real.is_cuda else nullcontext()
+    )
     with amp_off:
-        scores = y.new_zeros((batch, heads, e))
-        values = y.new_zeros((batch, heads, e, d_a))
+        y = torch.cat(
+            (hidden_real.to(dtype=torch.float32), z_virt.to(dtype=torch.float32)),
+            dim=1,
+        )
+        pair_f = pair_aug.to(dtype=torch.float32)
+        scores = torch.zeros((batch, heads, e), device=y.device, dtype=torch.float32)
+        values = torch.zeros((batch, heads, e, d_a), device=y.device, dtype=torch.float32)
         for p in range(NUM_EXPH_PAIRS):
             edge_mask = pair_ids == p
             if not bool(edge_mask.any()):
@@ -416,15 +433,15 @@ def sparse_exphormer_messages(
             local = torch.nonzero(edge_mask, as_tuple=False).view(-1)
             r = recv_idx[local]
             s = send_idx[local]
-            wq = w_q[p].float()
-            wk = w_k[p].float()
-            wv = w_v[p].float()
-            sw1 = score_w1[p].float()
-            sb1 = score_b1[p].float()
-            sw2 = score_w2[p].float()
-            sb2 = score_b2[p].float()
-            sw3 = score_w3[p].float()
-            sb3 = score_b3[p].float()
+            wq = w_q[p].to(dtype=torch.float32)
+            wk = w_k[p].to(dtype=torch.float32)
+            wv = w_v[p].to(dtype=torch.float32)
+            sw1 = score_w1[p].to(dtype=torch.float32)
+            sb1 = score_b1[p].to(dtype=torch.float32)
+            sw2 = score_w2[p].to(dtype=torch.float32)
+            sb2 = score_b2[p].to(dtype=torch.float32)
+            sw3 = score_w3[p].to(dtype=torch.float32)
+            sb3 = score_b3[p].to(dtype=torch.float32)
             q = torch.einsum("bed,had->bhea", y[:, r], wq)
             k = torch.einsum("bed,had->bhea", y[:, s], wk)
             v = torch.einsum("bed,had->bhea", y[:, s], wv)
@@ -437,12 +454,12 @@ def sparse_exphormer_messages(
             h2 = torch.relu(torch.einsum("bhea,hca->bhec", h1, sw2) + sb2.view(1, heads, 1, -1))
             score = torch.einsum("bhec,hc->bhe", h2, sw3[:, 0]) + sb3.view(1, heads, 1)
             tau_e = edge_tau[local]
-            bias = edge_bias[tau_e].transpose(0, 1).unsqueeze(0).float()
+            bias = edge_bias[tau_e].transpose(0, 1).unsqueeze(0).to(dtype=torch.float32)
             score = score + bias
             scores[:, :, local] = score
             values[:, :, local] = v
 
-        weights = y.new_zeros((batch, heads, e))
+        weights = torch.zeros((batch, heads, e), device=y.device, dtype=torch.float32)
         for node in range(n_aug):
             local = torch.nonzero(recv_idx == node, as_tuple=False).view(-1)
             if local.numel() == 0:
@@ -452,10 +469,10 @@ def sparse_exphormer_messages(
             w = torch.nan_to_num(w, nan=0.0)
             weights[:, :, local] = w
 
-        mixed = y.new_zeros((batch, heads, n_aug, d_a))
+        mixed = torch.zeros((batch, heads, n_aug, d_a), device=y.device, dtype=torch.float32)
         for edge_i in range(e):
             r = int(recv_idx[edge_i])
             mixed[:, :, r] = mixed[:, :, r] + weights[:, :, edge_i].unsqueeze(-1) * values[:, :, edge_i]
 
-        message = torch.einsum("bhna,hda->bnd", mixed, w_o.float())
+        message = torch.einsum("bhna,hda->bnd", mixed, w_o.to(dtype=torch.float32))
     return message[:, :n_real].to(dtype=out_dtype), message[:, n_real:].to(dtype=out_dtype)
