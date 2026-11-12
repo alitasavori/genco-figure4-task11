@@ -31,7 +31,7 @@ def _restore_default_arch() -> None:
     tpgt.CHECKPOINT_VERSION = "meshed-rpe-2-d4-v7"
     tpgt.USE_NODE_SHUNT = False
     tpgt.ATTENTION_KIND = "grit"
-    tpgt.ATTENTION_MLP_HIDDEN = 24
+    tpgt.ATTENTION_MLP_HIDDENS = (24, 12)
     tpgt.RUN_DIR_NAME = "tpgt_task11_v7"
 
 
@@ -41,9 +41,13 @@ def test_v10_attention_kind_is_joint_mlp() -> None:
         assert tpgt.ATTENTION_KIND == "joint_mlp"
         stage = tpgt.CorrectionStage()
         assert stage.attention_kind == "joint_mlp"
-        assert stage.score_w1 is not None
+        assert stage.score_w1 is not None and stage.score_w2 is not None and stage.score_w3 is not None
         assert stage.score_w1.shape[0] == 9 and stage.score_w1.shape[1] == tpgt.HEADS
         assert stage.score_w1.shape[-1] == 2 * tpgt.D_A + tpgt.RPE_DIM
+        h1, h2 = tpgt.ATTENTION_MLP_HIDDENS
+        assert stage.score_w1.shape[-2] == h1
+        assert stage.score_w2.shape[-2:] == (h2, h1)
+        assert stage.score_w3.shape[-2:] == (1, h2)
         assert stage.w_ew is None
     finally:
         _restore_default_arch()

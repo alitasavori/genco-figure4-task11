@@ -28,9 +28,10 @@ def stage_attn_params() -> int:
     total += t.HEADS * t.D * t.D_A
     if t.ATTENTION_KIND == "joint_mlp":
         score_in = 2 * t.D_A + t.RPE_DIM
-        hidden = int(t.ATTENTION_MLP_HIDDEN)
-        # W1 (hidden, score_in) + b1; W2 (1, hidden) + b2 — per type-pair head.
-        total += 9 * t.HEADS * (hidden * score_in + hidden + 1 * hidden + 1)
+        h1, h2 = (int(t.ATTENTION_MLP_HIDDENS[0]), int(t.ATTENTION_MLP_HIDDENS[1]))
+        # 98→h1→h2→1: W1/b1, W2/b2, W3/b3 — per type-pair head.
+        per = h1 * score_in + h1 + h2 * h1 + h2 + 1 * h2 + 1
+        total += 9 * t.HEADS * per
     else:
         for extra in (
             (t.D_A, t.D_E),
@@ -92,10 +93,11 @@ def main() -> None:
     )
     if t.ATTENTION_KIND == "joint_mlp":
         score_in = 2 * t.D_A + t.RPE_DIM
+        h1, h2 = t.ATTENTION_MLP_HIDDENS
         print(
             "Attention (joint MLP on raw RPE): 9 type-pairs x HEADS x DEPTH, "
             f"W_Q/W_K/W_V: ({t.D_A},{t.D}), score MLP "
-            f"({score_in} -> {t.ATTENTION_MLP_HIDDEN} -> 1) with r_ij dim={t.RPE_DIM}, "
+            f"({score_in} -> {h1} -> {h2} -> 1) with r_ij dim={t.RPE_DIM}, "
             f"W_O: ({t.D},{t.D_A}). No pair encoder."
         )
     else:

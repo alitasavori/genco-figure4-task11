@@ -36,9 +36,12 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
   Default ``DEPTH=4``; preset ``v8`` / ``v9`` / ``v10`` use ``DEPTH=8`` with wider
   ``D/D_E/D_A/HEADS``.
 * **Attention**: ``grit`` (default; v7–v9) uses pair-modulated GRIT scores on
-  ``pair_encoder(RPE)``; ``v10`` uses Approach C joint MLP scores
-  ``MLP_{t_i←t_j}^{ℓ,h}([W_Q h_i ‖ W_K h_j ‖ r_ij])`` with **raw** RPE ``r_ij``
-  (no pair encoder). Softmax and type-pair blocks are unchanged.
+  ``pair_encoder(RPE)``; ``v10`` uses Approach C joint MLP scores on **raw** RPE
+  ``r_ij`` (no pair encoder). Q/K/V are type-pair-specific:
+  ``q_{i|t_j}^{(ℓ,h)}=W_Q^{(ℓ,h,t_i←t_j)} h_i^{(ℓ-1)}``,
+  ``k_{j|t_i}^{(ℓ,h)}=W_K^{(ℓ,h,t_i←t_j)} h_j^{(ℓ-1)}``, then
+  ``s_{ij}^{(ℓ,h)}=MLP_{t_i←t_j}^{(ℓ,h)}([q_{i|t_j}‖k_{j|t_i}‖r_{ij}])``.
+  Softmax and type-pair blocks are unchanged. Angle step uses ``η_angle=1``.
 * **2-channel RPE**: ``Zeff_Re_norm``, ``Zeff_Im_norm`` (complex Laplacian effective impedance).
 * **RPE channel dropout**: during training each channel is zeroed with
   probability ``RPE_CHANNEL_DROPOUT`` per optimizer step; never at eval.
@@ -204,14 +207,16 @@ NODE_SHUNT_B_DIM = 1
 NODE_FEATURE_DIM = NODE_PQVT_DIM + NODE_SHUNT_B_DIM  # 5 = (P,Q,V,θ,Bs)
 NODE_ENCODER_FEATURE_NAMES = ("P", "Q", "V", "theta", "busBS")
 USE_NODE_SHUNT = False
-# ``grit``: ReLU(ρ(W_Q h_i + W_K h_j) ⊙ W_Ew e_ij + W_Eb e_ij) then linear score (default).
-# ``joint_mlp``: s_ij = MLP_{t_i←t_j}^{ℓ,h}([W_Q h_i ‖ W_K h_j ‖ r_ij]) on raw RPE (Approach C; v10).
+# ``grit``: ReLU(ρ(W_Q^{t_i←t_j} h_i + W_K^{t_i←t_j} h_j) ⊙ W_Ew e_ij + W_Eb e_ij) then linear score.
+# ``joint_mlp``: q_{i|t_j}=W_Q^{t_i←t_j} h_i, k_{j|t_i}=W_K^{t_i←t_j} h_j;
+#   s_ij = MLP_{t_i←t_j}^{ℓ,h}([q_{i|t_j} ‖ k_{j|t_i} ‖ r_ij]) on raw RPE (Approach C; v10).
 ATTENTION_KIND = "grit"
-# Hidden width of the joint score MLP (per type-pair, per head, per stage); input is 2*D_A + RPE_DIM.
-ATTENTION_MLP_HIDDEN = 48
+# Joint score MLP hidden widths (per type-pair, per head, per stage).
+# Input is 2*D_A + RPE_DIM (=98 for D_A=48); output is a scalar. v10: 98 → 128 → 64 → 1.
+ATTENTION_MLP_HIDDENS: tuple[int, ...] = (128, 64)
 # Named width/depth presets (same math/loss/packing). ``GENCO_TPGT_ARCH`` / ``--arch`` selects one;
 # optional ``GENCO_TPGT_D`` / ``DEPTH`` / ``D_E`` / ``D_A`` / ``HEADS`` / ``RUN_TAG`` override fields.
-ARCH_PRESETS: dict[str, dict[str, int | str | bool]] = {
+ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
     "v7": {
         "D": 48,
         "D_E": 24,
@@ -264,13 +269,13 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool]] = {
         "D": 96,
         "D_E": 48,  # unused by attention (kept for preset symmetry); pair_encoder is Identity.
         "D_A": 48,
-        "HEADS": 4,
+        "HEADS": 2,
         "DEPTH": 8,
         "RUN_TAG": "v10",
-        "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h4-pqvt-busBS-mlpattn-rawrpe-v10",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h2-pqvt-busBS-mlpattn-128-64-rawrpe-v10",
         "USE_NODE_SHUNT": True,
         "ATTENTION_KIND": "joint_mlp",
-        "ATTENTION_MLP_HIDDEN": 48,
+        "ATTENTION_MLP_HIDDENS": (128, 64),
     },
 }
 # Fixed training subset scored with val's PBL metric each validation pass (overfitting check).
@@ -725,8 +730,9 @@ class CorrectionStage(nn.Module):
 
     Attention kind is selected by ``ATTENTION_KIND`` at construction:
     * ``grit`` (default): pair-conditioned GRIT scores and edge-augmented values.
-    * ``joint_mlp`` (v10): nine type-pair × head score MLPs
-      ``s_ij = MLP_{t_i←t_j}([W_Q h_i ‖ W_K h_j ‖ r_ij])`` on raw RPE; values ``W_V h_j`` only.
+    * ``joint_mlp`` (v10): nine type-pair × head score MLPs on raw RPE;
+      ``q_{i|t_j}=W_Q^{t_i←t_j} h_i``, ``k_{j|t_i}=W_K^{t_i←t_j} h_j``,
+      ``s_ij = MLP_{t_i←t_j}([q_{i|t_j} ‖ k_{j|t_i} ‖ r_ij])``; values ``W_V^{t_i←t_j} h_j``.
     """
 
     def __init__(self) -> None:
@@ -741,14 +747,17 @@ class CorrectionStage(nn.Module):
         grit_params: list[nn.Parameter] = []
         mlp_params: list[nn.Parameter] = []
         if self.attention_kind == "joint_mlp":
-            hidden = int(ATTENTION_MLP_HIDDEN)
+            h1, h2 = (int(ATTENTION_MLP_HIDDENS[0]), int(ATTENTION_MLP_HIDDENS[1]))
             # Raw RPE channels (Zeff Re/Im), not pair_encoder(D_E) embeddings.
+            # Score MLP: (2*D_A+RPE_DIM) → h1 → h2 → 1  (v10 default: 98 → 128 → 64 → 1).
             score_in = 2 * D_A + RPE_DIM
-            self.score_w1 = nn.Parameter(torch.empty(*shape, hidden, score_in))
-            self.score_b1 = nn.Parameter(torch.zeros(*shape, hidden))
-            self.score_w2 = nn.Parameter(torch.empty(*shape, 1, hidden))
-            self.score_b2 = nn.Parameter(torch.zeros(*shape, 1))
-            mlp_params = [self.score_w1, self.score_w2]
+            self.score_w1 = nn.Parameter(torch.empty(*shape, h1, score_in))
+            self.score_b1 = nn.Parameter(torch.zeros(*shape, h1))
+            self.score_w2 = nn.Parameter(torch.empty(*shape, h2, h1))
+            self.score_b2 = nn.Parameter(torch.zeros(*shape, h2))
+            self.score_w3 = nn.Parameter(torch.empty(*shape, 1, h2))
+            self.score_b3 = nn.Parameter(torch.zeros(*shape, 1))
+            mlp_params = [self.score_w1, self.score_w2, self.score_w3]
             # Keep GRIT tensors absent so state_dict / param counts match the attention kind.
             self.w_ew = None
             self.w_eb = None
@@ -764,6 +773,8 @@ class CorrectionStage(nn.Module):
             self.score_b1 = None
             self.score_w2 = None
             self.score_b2 = None
+            self.score_w3 = None
+            self.score_b3 = None
         for parameter in (self.w_q, self.w_k, self.w_v, self.w_o, *grit_params, *mlp_params):
             _init_matrices(parameter)
         self.update = nn.ModuleList(MLP(D + D + 2, D) for _ in range(3))
@@ -908,11 +919,18 @@ class CorrectionStage(nn.Module):
         pair: torch.Tensor,
         blocks: list[TypePairBlock],
     ) -> torch.Tensor:
-        """Approach C: ``s_ij = MLP_{t_i←t_j}^{h}([q_i ‖ k_j ‖ r_ij])``; ``pair`` is raw RPE."""
+        """Approach C on raw RPE ``pair``.
+
+        Type-pair Q/K (receiver ``i``, sender ``j``):
+        ``q_{i|t_j}^{h}=W_Q^{h,t_i←t_j} h_i``, ``k_{j|t_i}^{h}=W_K^{h,t_i←t_j} h_j``,
+        then ``s_ij^{h}=MLP_{t_i←t_j}^{h}([q_{i|t_j} ‖ k_{j|t_i} ‖ r_ij])``
+        with widths ``ATTENTION_MLP_HIDDENS`` (default 98→128→64→1).
+        """
         batch, buses, _ = hidden.shape
         scores: torch.Tensor | None = None
         assert self.score_w1 is not None and self.score_b1 is not None
         assert self.score_w2 is not None and self.score_b2 is not None
+        assert self.score_w3 is not None and self.score_b3 is not None
         if pair.shape[-1] != RPE_DIM:
             raise ValueError(
                 f"joint MLP attention expects raw RPE last-dim {RPE_DIM}, got {tuple(pair.shape)}"
@@ -937,11 +955,17 @@ class CorrectionStage(nn.Module):
                 ),
                 dim=-1,
             )
-            hidden_act = torch.relu(
-                torch.einsum("bhnms,has->bhnma", joint, self.score_w1[p]) + self.score_b1[p].view(1, HEADS, 1, 1, -1)
+            h1 = torch.relu(
+                torch.einsum("bhnms,has->bhnma", joint, self.score_w1[p])
+                + self.score_b1[p].view(1, HEADS, 1, 1, -1)
             )
-            score = torch.einsum("bhnma,ha->bhnm", hidden_act, self.score_w2[p, :, 0])
-            score = score + self.score_b2[p].view(1, HEADS, 1, 1)
+            # score_w2[p]: (HEADS, h2, h1); avoid reusing subscript ``b`` (batch).
+            h2 = torch.relu(
+                torch.einsum("bhnma,hca->bhnmc", h1, self.score_w2[p])
+                + self.score_b2[p].view(1, HEADS, 1, 1, -1)
+            )
+            score = torch.einsum("bhnmc,hc->bhnm", h2, self.score_w3[p, :, 0])
+            score = score + self.score_b3[p].view(1, HEADS, 1, 1)
             scores = self._scatter_block_scores(scores, score, block, batch, buses)
         if scores is None:
             return hidden.new_zeros(hidden.shape)
@@ -2991,10 +3015,28 @@ def parse_arch_name() -> str | None:
     return env or None
 
 
+def _parse_mlp_hiddens(raw: object, default: tuple[int, ...] = (128, 64)) -> tuple[int, ...]:
+    """Parse score-MLP hidden widths from preset/env (``128,64`` or a sequence)."""
+    if raw is None:
+        return tuple(int(x) for x in default)
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.replace("x", ",").split(",") if p.strip()]
+        widths = tuple(int(p) for p in parts)
+    elif isinstance(raw, (list, tuple)):
+        widths = tuple(int(x) for x in raw)
+    else:
+        widths = (int(raw),)
+    if len(widths) != 2 or any(w < 1 for w in widths):
+        raise ValueError(
+            f"ATTENTION_MLP_HIDDENS must be two positive ints (h1,h2), got {raw!r}"
+        )
+    return widths
+
+
 def apply_architecture_config() -> str:
     """Apply ``ARCH_PRESETS`` / per-dim env overrides. Same residual, packing, and loss logic."""
     global D, D_E, D_A, HEADS, DEPTH, RUN_TAG, RUN_DIR_NAME, CHECKPOINT_VERSION
-    global USE_NODE_SHUNT, ATTENTION_KIND, ATTENTION_MLP_HIDDEN
+    global USE_NODE_SHUNT, ATTENTION_KIND, ATTENTION_MLP_HIDDENS
     name = parse_arch_name()
     if name:
         if name not in ARCH_PRESETS:
@@ -3010,7 +3052,9 @@ def apply_architecture_config() -> str:
         CHECKPOINT_VERSION = str(preset["CHECKPOINT_VERSION"])
         USE_NODE_SHUNT = bool(preset.get("USE_NODE_SHUNT", False))
         ATTENTION_KIND = str(preset.get("ATTENTION_KIND", "grit"))
-        ATTENTION_MLP_HIDDEN = int(preset.get("ATTENTION_MLP_HIDDEN", D_A))
+        ATTENTION_MLP_HIDDENS = _parse_mlp_hiddens(
+            preset.get("ATTENTION_MLP_HIDDENS", ATTENTION_MLP_HIDDENS)
+        )
     else:
         name = RUN_TAG
 
@@ -3020,11 +3064,19 @@ def apply_architecture_config() -> str:
         ("GENCO_TPGT_D_A", "D_A"),
         ("GENCO_TPGT_HEADS", "HEADS"),
         ("GENCO_TPGT_DEPTH", "DEPTH"),
-        ("GENCO_TPGT_ATTENTION_MLP_HIDDEN", "ATTENTION_MLP_HIDDEN"),
     ):
         raw = os.environ.get(env_key, "").strip()
         if raw:
             globals()[global_name] = int(raw)
+    mlp_env = os.environ.get("GENCO_TPGT_ATTENTION_MLP_HIDDENS", "").strip()
+    if not mlp_env:
+        # Backward-compatible single-width env: interpret as (H, H//2) if set.
+        legacy = os.environ.get("GENCO_TPGT_ATTENTION_MLP_HIDDEN", "").strip()
+        if legacy:
+            h = int(legacy)
+            mlp_env = f"{h},{max(1, h // 2)}"
+    if mlp_env:
+        ATTENTION_MLP_HIDDENS = _parse_mlp_hiddens(mlp_env)
     run_override = os.environ.get("GENCO_TPGT_RUN_TAG", "").strip()
     if run_override:
         RUN_TAG = run_override
@@ -3042,15 +3094,15 @@ def apply_architecture_config() -> str:
     D_A = int(globals()["D_A"])
     HEADS = int(globals()["HEADS"])
     DEPTH = int(globals()["DEPTH"])
-    ATTENTION_MLP_HIDDEN = int(globals()["ATTENTION_MLP_HIDDEN"])
+    ATTENTION_MLP_HIDDENS = _parse_mlp_hiddens(globals()["ATTENTION_MLP_HIDDENS"])
     ATTENTION_KIND = str(globals()["ATTENTION_KIND"]).strip().lower()
     if ATTENTION_KIND not in ("grit", "joint_mlp"):
         raise ValueError(f"unknown ATTENTION_KIND {ATTENTION_KIND!r}; use grit or joint_mlp")
     RUN_DIR_NAME = f"tpgt_task11_{RUN_TAG}"
-    if DEPTH < 1 or HEADS < 1 or D < 1 or D_E < 1 or D_A < 1 or ATTENTION_MLP_HIDDEN < 1:
+    if DEPTH < 1 or HEADS < 1 or D < 1 or D_E < 1 or D_A < 1:
         raise ValueError(
             f"invalid architecture dims D={D} D_E={D_E} D_A={D_A} HEADS={HEADS} "
-            f"DEPTH={DEPTH} ATTENTION_MLP_HIDDEN={ATTENTION_MLP_HIDDEN}"
+            f"DEPTH={DEPTH} ATTENTION_MLP_HIDDENS={ATTENTION_MLP_HIDDENS}"
         )
     return name
 
@@ -3058,8 +3110,10 @@ def apply_architecture_config() -> str:
 def architecture_summary() -> str:
     node_in = NODE_FEATURE_DIM if USE_NODE_SHUNT else NODE_SPECIFIED_DIM
     node_txt = "P,Q,V,θ,busBS" if USE_NODE_SHUNT else "spec"
+    h1, h2 = ATTENTION_MLP_HIDDENS
+    score_in = 2 * D_A + RPE_DIM
     attn_txt = (
-        f"joint_mlp(H={ATTENTION_MLP_HIDDEN}, raw_rpe={RPE_DIM})"
+        f"joint_mlp({score_in}->{h1}->{h2}->1, raw_rpe={RPE_DIM})"
         if ATTENTION_KIND == "joint_mlp"
         else "grit"
     )
