@@ -43,7 +43,7 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
   ``r_ij`` (no pair encoder); ``v11`` uses Park et al. GRPE (shared hop/edge
   ``P/E`` in score and values); ``v11e`` adds stage ``U_Q/U_K/U_V`` on Zeff ``r_ij``;
   ``v12`` keeps the v10 MLP on an Exphormer phys∪expander∪virtual graph (15 pairs;
-  sparse edge-list default, dense ``-inf`` mask via ``GENCO_TPGT_EXPHORMER_DENSE=1``).
+  dense ``-inf`` mask default; sparse via ``GENCO_TPGT_EXPHORMER_DENSE=0``).
   Q/K/V are type-pair-specific:
   ``q_{i|t_j}^{(ℓ,h)}=W_Q^{(ℓ,h,t_i←t_j)} h_i^{(ℓ-1)}``,
   ``k_{j|t_i}^{(ℓ,h)}=W_K^{(ℓ,h,t_i←t_j)} h_j^{(ℓ-1)}``.
@@ -234,9 +234,10 @@ GRPE_EDGE_SELF = 0
 GRPE_EDGE_BRANCH = 1
 GRPE_EDGE_NONADJ = 2
 GRPE_NUM_EDGE_TYPES = 3
-# Exphormer (v12): expander degree and dense-vs-sparse kernel (sparse default after dense parity).
+# Exphormer (v12): expander degree and dense-vs-sparse kernel.
+# Dense -inf mask is the default for IEEE-118 speed (batched GEMMs). Sparse remains for large N.
 EXPHORMER_D_EXP = 4
-EXPHORMER_DENSE = False
+EXPHORMER_DENSE = True
 EXPHORMER_NUM_PAIRS = 15
 
 
@@ -336,7 +337,7 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "USE_NODE_SHUNT": True,
         "ATTENTION_KIND": "grpe_elec",
     },
-    # v10 joint MLP + Exphormer phys∪expander∪virtual attention graph (sparse after dense parity).
+    # v10 joint MLP + Exphormer phys∪expander∪virtual attention graph (dense mask default).
     "v12": {
         "D": 96,
         "D_E": 48,
@@ -344,7 +345,7 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "HEADS": 2,
         "DEPTH": 8,
         "RUN_TAG": "v12",
-        "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h2-pqvt-busBS-exphormer-sparse-v12",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h2-pqvt-busBS-exphormer-dense-v12",
         "USE_NODE_SHUNT": True,
         "ATTENTION_KIND": "exphormer",
         "ATTENTION_MLP_HIDDENS": (128, 64),
@@ -3722,14 +3723,14 @@ def apply_architecture_config() -> str:
     ATTENTION_MLP_HIDDENS = _parse_mlp_hiddens(globals()["ATTENTION_MLP_HIDDENS"])
     ATTENTION_KIND = str(globals()["ATTENTION_KIND"]).strip().lower()
     GRPE_MAX_HOP = int(globals()["GRPE_MAX_HOP"])
-    # Sparse is the v12 default after dense/sparse parity; env forces dense or sparse.
+    # Dense is the v12 default (fast on IEEE 118); env forces dense or sparse.
     dense_env = os.environ.get("GENCO_TPGT_EXPHORMER_DENSE", "").strip().lower()
     if dense_env in ("0", "false", "no"):
         EXPHORMER_DENSE = False
     elif dense_env in ("1", "true", "yes"):
         EXPHORMER_DENSE = True
     else:
-        EXPHORMER_DENSE = False
+        EXPHORMER_DENSE = True
     d_exp_env = os.environ.get("GENCO_TPGT_EXPHORMER_D_EXP", "").strip()
     if d_exp_env:
         EXPHORMER_D_EXP = int(d_exp_env)

@@ -65,7 +65,7 @@ def test_v12_preset_and_stage_shapes() -> None:
     try:
         _activate_arch("v12")
         assert tpgt.ATTENTION_KIND == "exphormer"
-        assert tpgt.EXPHORMER_DENSE is False
+        assert tpgt.EXPHORMER_DENSE is True
         assert tpgt.ETA_ANGLE == 1.0
         assert tpgt.HEADS == 2 and tpgt.DEPTH == 8 and tpgt.D == 96
         stage = tpgt.CorrectionStage()
@@ -76,7 +76,7 @@ def test_v12_preset_and_stage_shapes() -> None:
         model = tpgt.TPGT()
         assert model.theta_u is not None and model.virt_rpe is not None
         assert model.virt_rpe.shape == (6, tpgt.RPE_DIM)
-        assert model.use_raw_rpe and not model.use_dense_exph
+        assert model.use_raw_rpe and model.use_dense_exph
     finally:
         _restore_default_arch()
 

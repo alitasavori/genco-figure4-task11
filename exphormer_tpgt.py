@@ -473,20 +473,24 @@ def sparse_exphormer_messages(
             scores[:, :, local] = score
             values[:, :, local] = v
 
-        weights = torch.zeros((batch, heads, e), device=y.device, dtype=torch.float32)
-        for node in range(n_aug):
-            local = torch.nonzero(recv_idx == node, as_tuple=False).view(-1)
-            if local.numel() == 0:
-                continue
-            logits = scores[:, :, local]
-            w = torch.softmax(logits, dim=-1)
-            w = torch.nan_to_num(w, nan=0.0)
-            weights[:, :, local] = w
+        # Segment-softmax over edges that share a receiver (no Python node loop).
+        recv_exp = recv_idx.view(1, 1, -1).expand(batch, heads, -1)
+        max_per_recv = torch.full(
+            (batch, heads, n_aug), float("-inf"), device=y.device, dtype=torch.float32
+        )
+        max_per_recv.scatter_reduce_(2, recv_exp, scores, reduce="amax", include_self=True)
+        shifted = scores - max_per_recv.gather(2, recv_exp)
+        exp_scores = torch.exp(shifted)
+        sum_per_recv = torch.zeros((batch, heads, n_aug), device=y.device, dtype=torch.float32)
+        sum_per_recv.scatter_add_(2, recv_exp, exp_scores)
+        weights = exp_scores / sum_per_recv.gather(2, recv_exp).clamp(min=1e-12)
+        weights = torch.nan_to_num(weights, nan=0.0)
 
+        # Scatter-add α·v onto receivers (no Python edge loop).
+        contrib = weights.unsqueeze(-1) * values
+        recv_val = recv_idx.view(1, 1, -1, 1).expand(batch, heads, -1, d_a)
         mixed = torch.zeros((batch, heads, n_aug, d_a), device=y.device, dtype=torch.float32)
-        for edge_i in range(e):
-            r = int(recv_idx[edge_i])
-            mixed[:, :, r] = mixed[:, :, r] + weights[:, :, edge_i].unsqueeze(-1) * values[:, :, edge_i]
+        mixed.scatter_add_(2, recv_val, contrib)
 
         message = torch.einsum("bhna,hda->bnd", mixed, w_o.to(dtype=torch.float32))
     return message[:, :n_real].to(dtype=out_dtype), message[:, n_real:].to(dtype=out_dtype)
