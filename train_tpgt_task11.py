@@ -39,9 +39,11 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
   Default ``DEPTH=4``; preset ``v8`` / ``v9`` / ``v10`` use ``DEPTH=8`` with wider
   ``D/D_E/D_A/HEADS``.
 * **Attention**: ``grit`` (default; v7–v9) uses pair-modulated GRIT scores on
-  ``pair_encoder(RPE)``; ``v10`` uses Approach C joint MLP scores on **raw** RPE
+  ``pair_encoder(RPE)``;   ``v10`` uses Approach C joint MLP scores on **raw** RPE
   ``r_ij`` (no pair encoder); ``v11`` uses Park et al. GRPE (shared hop/edge
-  ``P/E`` in score and values); ``v11e`` adds stage ``U_Q/U_K/U_V`` on Zeff ``r_ij``.
+  ``P/E`` in score and values); ``v11e`` adds stage ``U_Q/U_K/U_V`` on Zeff ``r_ij``;
+  ``v12`` keeps the v10 MLP on an Exphormer phys∪expander∪virtual graph (15 pairs;
+  sparse edge-list default, dense ``-inf`` mask via ``GENCO_TPGT_EXPHORMER_DENSE=1``).
   Q/K/V are type-pair-specific:
   ``q_{i|t_j}^{(ℓ,h)}=W_Q^{(ℓ,h,t_i←t_j)} h_i^{(ℓ-1)}``,
   ``k_{j|t_i}^{(ℓ,h)}=W_K^{(ℓ,h,t_i←t_j)} h_j^{(ℓ-1)}``.
@@ -75,14 +77,15 @@ Performance notes (Colab / large train split)
   not per scenario and not per training batch.
 * **``pair_encoder``**: For GRIT arches, runs once per forward on the static
   ``118×118`` RPEs (stacked when several share bus types). For ``v10`` / ``v11`` /
-  ``v11e`` the encoder is ``Identity`` (raw ``r_ij`` path; GRPE also uses
-  ``hop_id``/``edge_id``). In ``eval`` mode a single-topology batch may cache
-  pair features on ``Network.pair_embed``.
+  ``v11e`` / ``v12`` the encoder is ``Identity`` (raw ``r_ij`` path; GRPE also uses
+  ``hop_id``/``edge_id``; Exphormer uses ``exph_allow``/edge lists). In ``eval`` mode a
+  single-topology batch may cache pair features on ``Network.pair_embed``.
 * **Type-pair attention**: ``CorrectionStage._messages`` evaluates each of the
-  nine type-pair weight sets only on its own receiver-type × sender-type block
-  (both heads batched), then takes one softmax over all senders per receiver. With per-case
-  bus types a block spans the buses of that type in any case and per-case masks keep each
-  case's own pairs (the dense masked formulation restricted to those buses).
+  nine (or fifteen for Exphormer) type-pair weight sets only on its own
+  receiver-type × sender-type block (both heads batched), then takes one softmax over
+  allowed senders per receiver. With per-case bus types a block spans the buses of that
+  type in any case and per-case masks keep each case's own pairs (the dense masked
+  formulation restricted to those buses).
   Optional ``GENCO_TPGT_COMPILE=1`` or ``--compile`` wraps the model in
   ``torch.compile`` (may differ slightly in numerics).
 * **Batch / micro-batch**: Optimizer steps use ``BATCH_SIZE`` cases (default 32).
@@ -163,6 +166,7 @@ from plot_task1_1 import PUBLISHED, categories_for, plot_tpgt_comparison
 write_task31_table = getattr(plot_task1_1_module, "write_task31_table", None)
 display_task31_table = getattr(plot_task1_1_module, "display_task31_table", None)
 from storage import ROOT, in_colab, mount_drive
+import exphormer_tpgt as exph
 
 # Implementation choices, not values from the draft.
 D = 48
@@ -194,7 +198,7 @@ LAMBDA_PHYS = 0.5
 PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
-CACHE_VERSION = "tpgt-cache-10"
+CACHE_VERSION = "tpgt-cache-12"
 RPE_FEATURE_NAMES = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_DIM = len(RPE_FEATURE_NAMES)
 # Per optimizer step, each RPE channel is zeroed (whole 118x118 plane, no rescaling) with this
@@ -219,9 +223,10 @@ USE_NODE_SHUNT = False
 #   s_ij = MLP_{t_i←t_j}^{ℓ,h}([q_{i|t_j} ‖ k_{j|t_i} ‖ r_ij]) on raw RPE (Approach C; v10).
 # ``grpe``: Park et al. GRPE — shared hop/edge embeddings in score and values (v11).
 # ``grpe_elec``: GRPE + stage-specific Zeff bilinear U_Q/U_K/U_V (v11e).
+# ``exphormer``: v10 joint MLP on Exphormer phys∪expander∪virtual sparse graph (v12).
 ATTENTION_KIND = "grit"
 # Attention kinds that use Identity pair encoder (raw RPE still stored on Network for Zeff / elec).
-RAW_RPE_ATTENTION_KINDS = frozenset({"joint_mlp", "grpe", "grpe_elec"})
+RAW_RPE_ATTENTION_KINDS = frozenset({"joint_mlp", "grpe", "grpe_elec", "exphormer"})
 GRPE_ATTENTION_KINDS = frozenset({"grpe", "grpe_elec"})
 # Shortest-path hop bins: 0..GRPE_MAX_HOP plus one overflow bin (hop > max or unreachable).
 GRPE_MAX_HOP = 8
@@ -229,6 +234,10 @@ GRPE_EDGE_SELF = 0
 GRPE_EDGE_BRANCH = 1
 GRPE_EDGE_NONADJ = 2
 GRPE_NUM_EDGE_TYPES = 3
+# Exphormer (v12): expander degree and dense-vs-sparse kernel (sparse default after dense parity).
+EXPHORMER_D_EXP = 4
+EXPHORMER_DENSE = False
+EXPHORMER_NUM_PAIRS = 15
 
 
 def grpe_num_hop_bins(max_hop: int | None = None) -> int:
@@ -326,6 +335,19 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h2-pqvt-busBS-grpe-elec-v11e",
         "USE_NODE_SHUNT": True,
         "ATTENTION_KIND": "grpe_elec",
+    },
+    # v10 joint MLP + Exphormer phys∪expander∪virtual attention graph (sparse after dense parity).
+    "v12": {
+        "D": 96,
+        "D_E": 48,
+        "D_A": 48,
+        "HEADS": 2,
+        "DEPTH": 8,
+        "RUN_TAG": "v12",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h2-pqvt-busBS-exphormer-sparse-v12",
+        "USE_NODE_SHUNT": True,
+        "ATTENTION_KIND": "exphormer",
+        "ATTENTION_MLP_HIDDENS": (128, 64),
     },
 }
 # Fixed training subset scored with val's PBL metric each validation pass (overfitting check).
@@ -832,22 +854,22 @@ def _gather_grpe_block(emb: torch.Tensor, receivers: torch.Tensor, senders: torc
 
 
 class CorrectionStage(nn.Module):
-    """One unshared correction stage. Nine type pairs, each with its own head weights.
+    """One unshared correction stage. Type-pair Q/K/V (9 or 15) with kind-specific scores.
 
     Attention kind is selected by ``ATTENTION_KIND`` at construction:
     * ``grit`` (default): pair-conditioned GRIT scores and edge-augmented values.
-    * ``joint_mlp`` (v10): nine type-pair × head score MLPs on raw RPE;
-      ``q_{i|t_j}=W_Q^{t_i←t_j} h_i``, ``k_{j|t_i}=W_K^{t_i←t_j} h_j``,
-      ``s_ij = MLP_{t_i←t_j}([q_{i|t_j} ‖ k_{j|t_i} ‖ r_ij])``; values ``W_V^{t_i←t_j} h_j``.
+    * ``joint_mlp`` (v10): nine type-pair × head score MLPs on raw RPE.
     * ``grpe`` (v11): Park GRPE with shared hop/edge embeddings in score and values.
     * ``grpe_elec`` (v11e): GRPE plus stage-specific Zeff bilinear ``U_Q/U_K/U_V``.
+    * ``exphormer`` (v12): 15 type-pairs on phys∪expander∪virtual graph (v10 MLP scores).
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.attention_kind = ATTENTION_KIND
-        # Nine directed type-pairs × HEADS: each (pair, head) has its own Q/K/V (and score params).
-        shape = (9, HEADS)
+        n_pairs = EXPHORMER_NUM_PAIRS if self.attention_kind == "exphormer" else 9
+        # Directed type-pairs × HEADS: each (pair, head) has its own Q/K/V (and score params).
+        shape = (n_pairs, HEADS)
         self.w_q = nn.Parameter(torch.empty(*shape, D_A, D))
         self.w_k = nn.Parameter(torch.empty(*shape, D_A, D))
         self.w_v = nn.Parameter(torch.empty(*shape, D_A, D))
@@ -860,7 +882,10 @@ class CorrectionStage(nn.Module):
         self.score_w3 = self.score_b3 = None
         self.u_q = self.u_k = self.u_v = None
         self.w_ew = self.w_eb = self.w_a = self.w_ev = None
-        if self.attention_kind == "joint_mlp":
+        self.edge_bias = None
+        self.update_virt = None
+        self.norm_virt = None
+        if self.attention_kind in ("joint_mlp", "exphormer"):
             h1, h2 = (int(ATTENTION_MLP_HIDDENS[0]), int(ATTENTION_MLP_HIDDENS[1]))
             # Raw RPE channels (Zeff Re/Im), not pair_encoder(D_E) embeddings.
             # Score MLP: (2*D_A+RPE_DIM) → h1 → h2 → 1  (v10 default: 98 → 128 → 64 → 1).
@@ -872,6 +897,10 @@ class CorrectionStage(nn.Module):
             self.score_w3 = nn.Parameter(torch.empty(*shape, 1, h2))
             self.score_b3 = nn.Parameter(torch.zeros(*shape, 1))
             mlp_params = [self.score_w1, self.score_w2, self.score_w3]
+            if self.attention_kind == "exphormer":
+                self.edge_bias = nn.Parameter(torch.zeros(exph.NUM_EDGE_TAU, HEADS))
+                self.update_virt = MLP(D + D, D)
+                self.norm_virt = nn.LayerNorm(D)
         elif self.attention_kind == "grpe":
             # Shared P/E live on TPGT.grpe_encodings; stage keeps type-pair Q/K/V only.
             pass
@@ -902,9 +931,38 @@ class CorrectionStage(nn.Module):
         layout: TypeLayout,
         ybus: torch.Tensor,
         grpe: GrpePairFeatures | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        z_virt: torch.Tensor | None = None,
+        exph_allow: torch.Tensor | None = None,
+        exph_tau: torch.Tensor | None = None,
+        virt_rpe: torch.Tensor | None = None,
+        types: torch.Tensor | None = None,
+        exph_recv: torch.Tensor | None = None,
+        exph_send: torch.Tensor | None = None,
+        exph_edge_tau: torch.Tensor | None = None,
+        exph_pair_id: torch.Tensor | None = None,
+        use_dense_exph: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         residual_in = nodal_residual(specified, unknown, layout, ybus)
-        message = self._messages(hidden, pair, layout.blocks, grpe=grpe)
+        z_next: torch.Tensor | None = None
+        if self.attention_kind == "exphormer":
+            if z_virt is None or exph_allow is None or exph_tau is None or virt_rpe is None or types is None:
+                raise ValueError("exphormer stage requires z_virt, allow/tau, virt_rpe, and types")
+            message, z_next = self._messages_exphormer(
+                hidden,
+                z_virt,
+                pair,
+                types,
+                exph_allow,
+                exph_tau,
+                virt_rpe,
+                exph_recv=exph_recv,
+                exph_send=exph_send,
+                exph_edge_tau=exph_edge_tau,
+                exph_pair_id=exph_pair_id,
+                use_dense=use_dense_exph,
+            )
+        else:
+            message = self._messages(hidden, pair, layout.blocks, grpe=grpe)
         updated = torch.zeros_like(hidden)
         for type_id, update in enumerate(self.update):
             if not layout.present[type_id]:
@@ -934,7 +992,62 @@ class CorrectionStage(nn.Module):
                     delta[:, buses, 1] = delta[:, buses, 1] * ETA_ANGLE
         unknown_next = constrain_unknown(unknown + ETA * delta, layout)
         residual_out = nodal_residual(specified, unknown_next, layout, ybus)
+        if z_next is not None:
+            return hidden_next, unknown_next, residual_out, z_next
         return hidden_next, unknown_next, residual_out
+
+    def _messages_exphormer(
+        self,
+        hidden: torch.Tensor,
+        z_virt: torch.Tensor,
+        pair: torch.Tensor,
+        types: torch.Tensor,
+        allow: torch.Tensor,
+        tau: torch.Tensor,
+        virt_rpe: torch.Tensor,
+        *,
+        exph_recv: torch.Tensor | None,
+        exph_send: torch.Tensor | None,
+        exph_edge_tau: torch.Tensor | None,
+        exph_pair_id: torch.Tensor | None,
+        use_dense: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.score_w1 is not None and self.edge_bias is not None
+        assert self.update_virt is not None and self.norm_virt is not None
+        n_virt = int(z_virt.shape[1])
+        types_aug = exph.augmented_types(types, n_virt)
+        pair_aug = exph.build_exphormer_pair_features(pair, allow, tau, types_aug, virt_rpe)
+        kwargs = dict(
+            w_q=self.w_q,
+            w_k=self.w_k,
+            w_v=self.w_v,
+            w_o=self.w_o,
+            score_w1=self.score_w1,
+            score_b1=self.score_b1,
+            score_w2=self.score_w2,
+            score_b2=self.score_b2,
+            score_w3=self.score_w3,
+            score_b3=self.score_b3,
+            edge_bias=self.edge_bias,
+        )
+        if use_dense or exph_recv is None:
+            msg_r, msg_v = exph.dense_exphormer_messages(
+                hidden, z_virt, pair_aug, types_aug, allow, tau, **kwargs
+            )
+        else:
+            msg_r, msg_v = exph.sparse_exphormer_messages(
+                hidden,
+                z_virt,
+                pair_aug,
+                types_aug,
+                exph_recv,
+                exph_send,
+                exph_edge_tau,
+                exph_pair_id,
+                **kwargs,
+            )
+        z_next = self.norm_virt(z_virt + self.update_virt(torch.cat((z_virt, msg_v), dim=-1)))
+        return msg_r, z_next
 
     def _messages(
         self,
@@ -1248,16 +1361,24 @@ class TPGT(nn.Module):
         self.encoders = nn.ModuleList(MLP(node_in, D) for _ in range(3))
         self.use_node_shunt = USE_NODE_SHUNT
         self.attention_kind = ATTENTION_KIND
-        # v10/v11/v11e consume raw RPE path; GRIT still uses a learned pair encoder.
+        # v10/v11/v11e/v12 consume raw RPE path; GRIT still uses a learned pair encoder.
         self.use_raw_rpe = ATTENTION_KIND in RAW_RPE_ATTENTION_KINDS
         self.pair_encoder: nn.Module = nn.Identity() if self.use_raw_rpe else MLP(RPE_DIM, D_E)
         self.grpe_encodings: GrpeEncodings | None = (
             GrpeEncodings() if ATTENTION_KIND in GRPE_ATTENTION_KINDS else None
         )
+        self.theta_u: nn.Parameter | None = None
+        self.virt_rpe: nn.Parameter | None = None
+        self.use_dense_exph = EXPHORMER_DENSE
+        if ATTENTION_KIND == "exphormer":
+            self.theta_u = nn.Parameter(torch.empty(D))
+            self.virt_rpe = nn.Parameter(torch.empty(6, RPE_DIM))
+            nn.init.xavier_uniform_(self.theta_u.view(1, -1))
+            nn.init.xavier_uniform_(self.virt_rpe)
         self.stages = nn.ModuleList(CorrectionStage() for _ in range(DEPTH))
 
     def encode_pairs(self, rpe: torch.Tensor) -> torch.Tensor:
-        """Features for correction-stage attention (raw RPE for v10/v11/v11e, else ``pair_encoder``)."""
+        """Features for correction-stage attention (raw RPE for v10/v11/v12, else ``pair_encoder``)."""
         return rpe if self.use_raw_rpe else self.pair_encoder(rpe)
 
     def encode_grpe(
@@ -1283,12 +1404,20 @@ class TPGT(nn.Module):
         hop_id: torch.Tensor | None = None,
         edge_id: torch.Tensor | None = None,
         grpe: GrpePairFeatures | None = None,
+        exph_allow: torch.Tensor | None = None,
+        exph_tau: torch.Tensor | None = None,
+        exph_n_virt: int | None = None,
+        exph_recv: torch.Tensor | None = None,
+        exph_send: torch.Tensor | None = None,
+        exph_edge_tau: torch.Tensor | None = None,
+        exph_pair_id: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """``types`` (N,) with ``pair_type_masks`` (9, N, N), or per case (B, N) with (B, 9, N, N).
 
         ``layout`` (precomputed by ``move_to`` / ``PassBatch``) replaces ``types`` and the masks.
         ``shunt_b`` is bus-shunt ``BS`` (N,) or (B, N); required for v9 node features.
         ``hop_id`` / ``edge_id`` (or precomputed ``grpe``) required for ``grpe`` / ``grpe_elec``.
+        Exphormer needs ``exph_allow`` / ``exph_tau`` / ``exph_n_virt``.
         """
         if pair is None:
             pair = self.encode_pairs(rpe)
@@ -1319,11 +1448,40 @@ class TPGT(nn.Module):
             if not layout.present[type_id]:
                 continue
             hidden = write_type(hidden, layout, type_id, encoder(gather_type(node_feats, layout, type_id)))
+        z_virt: torch.Tensor | None = None
+        if self.attention_kind == "exphormer":
+            if exph_allow is None or exph_tau is None or exph_n_virt is None or exph_n_virt <= 0:
+                raise ValueError("exphormer attention requires exph_allow, exph_tau, and exph_n_virt")
+            assert self.theta_u is not None and self.virt_rpe is not None
+            z_virt = self.theta_u.to(dtype=act_dtype).view(1, 1, -1).expand(
+                specified.shape[0], int(exph_n_virt), -1
+            ).clone()
         residuals = []
+        shared_types = types if types.dim() == 1 else layout.types[0]
         for stage in self.stages:
-            hidden, unknown, residual = stage(
-                hidden, unknown, specified, pair, layout, ybus, grpe=grpe
-            )
+            if self.attention_kind == "exphormer":
+                hidden, unknown, residual, z_virt = stage(
+                    hidden,
+                    unknown,
+                    specified,
+                    pair,
+                    layout,
+                    ybus,
+                    z_virt=z_virt,
+                    exph_allow=exph_allow,
+                    exph_tau=exph_tau,
+                    virt_rpe=self.virt_rpe,
+                    types=shared_types,
+                    exph_recv=exph_recv,
+                    exph_send=exph_send,
+                    exph_edge_tau=exph_edge_tau,
+                    exph_pair_id=exph_pair_id,
+                    use_dense_exph=self.use_dense_exph,
+                )
+            else:
+                hidden, unknown, residual = stage(
+                    hidden, unknown, specified, pair, layout, ybus, grpe=grpe
+                )
             residuals.append(residual)
         return unknown, residuals
 
@@ -1646,6 +1804,7 @@ def eval_batch_with_pair(
             shunt_b=shunt_b,
             hop_id=hop_id,
             edge_id=edge_id,
+            **exphormer_forward_kwargs(network),
         )
         breakdown = task_loss(prediction, target, residuals, network.types)
         final_pbl = pbl_stats(residuals[-1])
@@ -2133,6 +2292,7 @@ def collect_forward_diagnostics(
             shunt_b=network_shunt_b(network),
             hop_id=hop_id,
             edge_id=edge_id,
+            **exphormer_forward_kwargs(network),
         )
         breakdown = task_loss(prediction, target, residuals, types)
         stage_pbl = [pbl_stats(r) for r in residuals]
@@ -2372,6 +2532,7 @@ def audit_residual_correctness(
             shunt_b=network_shunt_b(network),
             hop_id=hop_id,
             edge_id=edge_id,
+            **exphormer_forward_kwargs(network),
         )
         recomputed = nodal_residual(specified, prediction, types, ybus)
         scale = float(residuals[-1].abs().max().clamp(min=1.0))
@@ -2702,6 +2863,14 @@ class Network:
     # GRPE topology bins (Park et al.): hop distance id and discrete edge-relation id.
     hop_id: torch.Tensor | None = field(default=None, repr=False)
     edge_id: torch.Tensor | None = field(default=None, repr=False)
+    # Exphormer (v12): dense allow/tau on augmented N+C nodes; optional COO edges for sparse kernel.
+    exph_allow: torch.Tensor | None = field(default=None, repr=False)
+    exph_tau: torch.Tensor | None = field(default=None, repr=False)
+    exph_n_virt: int = field(default=0, repr=False)
+    exph_recv: torch.Tensor | None = field(default=None, repr=False)
+    exph_send: torch.Tensor | None = field(default=None, repr=False)
+    exph_edge_tau: torch.Tensor | None = field(default=None, repr=False)
+    exph_pair_id: torch.Tensor | None = field(default=None, repr=False)
     type_key: bytes | None = field(default=None, repr=False, compare=False)
     layout: TypeLayout | None = field(default=None, repr=False, compare=False)
 
@@ -2927,6 +3096,73 @@ def ensure_network_grpe_ids(network: Network) -> tuple[torch.Tensor, torch.Tenso
         edge = edge.to(device=device, non_blocking=device.type == "cuda")
         network.edge_id = edge
     return hop, edge
+
+
+def attach_exphormer_graph(network: Network, *, d_exp: int | None = None, seed: int | None = None) -> Network:
+    """Set Exphormer allow/tau (+ COO edges) from branches and component labels."""
+    bus_count = int(network.types.shape[-1])
+    branches = list(network.branches) if network.branches is not None else []
+    component = network.component.detach().cpu().numpy().astype(np.int64)
+    degree = EXPHORMER_D_EXP if d_exp is None else int(d_exp)
+    allow, tau, n_virt = exph.build_exphormer_graph(
+        bus_count, branches, component, d_exp=degree, seed=seed
+    )
+    types_aug = np.concatenate(
+        [
+            network.types.detach().cpu().numpy().astype(np.int64),
+            np.full(n_virt, exph.TYPE_VIRTUAL, dtype=np.int64),
+        ]
+    )
+    recv, send, edge_tau, pair_ids = exph.sparse_edges_from_dense(allow, tau, types_aug)
+    network.exph_allow = torch.from_numpy(allow)
+    network.exph_tau = torch.from_numpy(tau)
+    network.exph_n_virt = int(n_virt)
+    network.exph_recv = torch.from_numpy(recv)
+    network.exph_send = torch.from_numpy(send)
+    network.exph_edge_tau = torch.from_numpy(edge_tau)
+    network.exph_pair_id = torch.from_numpy(pair_ids)
+    return network
+
+
+def ensure_network_exphormer(network: Network) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Return ``(allow, tau, n_virt)`` on ``network.types`` device, building if missing."""
+    allow = getattr(network, "exph_allow", None)
+    tau = getattr(network, "exph_tau", None)
+    n_virt = int(getattr(network, "exph_n_virt", 0) or 0)
+    if allow is None or tau is None or n_virt <= 0:
+        attach_exphormer_graph(network)
+        allow = network.exph_allow
+        tau = network.exph_tau
+        n_virt = int(network.exph_n_virt)
+    assert allow is not None and tau is not None
+    device = network.types.device
+    if allow.device != device:
+        allow = allow.to(device=device, non_blocking=device.type == "cuda")
+        network.exph_allow = allow
+    if tau.device != device:
+        tau = tau.to(device=device, non_blocking=device.type == "cuda")
+        network.exph_tau = tau
+    for attr in ("exph_recv", "exph_send", "exph_edge_tau", "exph_pair_id"):
+        tensor = getattr(network, attr, None)
+        if tensor is not None and tensor.device != device:
+            setattr(network, attr, tensor.to(device=device, non_blocking=device.type == "cuda"))
+    return allow, tau, n_virt
+
+
+def exphormer_forward_kwargs(network: Network) -> dict:
+    """Keyword args for ``TPGT.forward`` when ``ATTENTION_KIND==exphormer``; else empty."""
+    if ATTENTION_KIND != "exphormer":
+        return {}
+    allow, tau, n_virt = ensure_network_exphormer(network)
+    return {
+        "exph_allow": allow,
+        "exph_tau": tau,
+        "exph_n_virt": n_virt,
+        "exph_recv": getattr(network, "exph_recv", None),
+        "exph_send": getattr(network, "exph_send", None),
+        "exph_edge_tau": getattr(network, "exph_edge_tau", None),
+        "exph_pair_id": getattr(network, "exph_pair_id", None),
+    }
 
 
 def meshed_rpe(
@@ -3206,6 +3442,8 @@ def unify_network_rpe(
         network.rpe_im_scale = global_im
         network.pair_embed = None
         attach_grpe_graph_ids(network)
+        if ATTENTION_KIND == "exphormer":
+            attach_exphormer_graph(network)
     return global_re, global_im
 
 
@@ -3411,7 +3649,7 @@ def _parse_mlp_hiddens(raw: object, default: tuple[int, ...] = (128, 64)) -> tup
 def apply_architecture_config() -> str:
     """Apply ``ARCH_PRESETS`` / per-dim env overrides. Same residual, packing, and loss logic."""
     global D, D_E, D_A, HEADS, DEPTH, RUN_TAG, RUN_DIR_NAME, CHECKPOINT_VERSION
-    global USE_NODE_SHUNT, ATTENTION_KIND, ATTENTION_MLP_HIDDENS, GRPE_MAX_HOP
+    global USE_NODE_SHUNT, ATTENTION_KIND, ATTENTION_MLP_HIDDENS, GRPE_MAX_HOP, EXPHORMER_DENSE, EXPHORMER_D_EXP
     name = parse_arch_name()
     if name:
         if name not in ARCH_PRESETS:
@@ -3475,13 +3713,28 @@ def apply_architecture_config() -> str:
     ATTENTION_MLP_HIDDENS = _parse_mlp_hiddens(globals()["ATTENTION_MLP_HIDDENS"])
     ATTENTION_KIND = str(globals()["ATTENTION_KIND"]).strip().lower()
     GRPE_MAX_HOP = int(globals()["GRPE_MAX_HOP"])
-    if ATTENTION_KIND not in ("grit", "joint_mlp", "grpe", "grpe_elec"):
+    # Sparse is the v12 default after dense/sparse parity; env forces dense or sparse.
+    dense_env = os.environ.get("GENCO_TPGT_EXPHORMER_DENSE", "").strip().lower()
+    if dense_env in ("0", "false", "no"):
+        EXPHORMER_DENSE = False
+    elif dense_env in ("1", "true", "yes"):
+        EXPHORMER_DENSE = True
+    else:
+        EXPHORMER_DENSE = False
+    d_exp_env = os.environ.get("GENCO_TPGT_EXPHORMER_D_EXP", "").strip()
+    if d_exp_env:
+        EXPHORMER_D_EXP = int(d_exp_env)
+    else:
+        EXPHORMER_D_EXP = 4
+    if ATTENTION_KIND not in ("grit", "joint_mlp", "grpe", "grpe_elec", "exphormer"):
         raise ValueError(
             f"unknown ATTENTION_KIND {ATTENTION_KIND!r}; "
-            "use grit, joint_mlp, grpe, or grpe_elec"
+            "use grit, joint_mlp, grpe, grpe_elec, or exphormer"
         )
     if GRPE_MAX_HOP < 0:
         raise ValueError(f"GRPE_MAX_HOP must be >= 0, got {GRPE_MAX_HOP}")
+    if EXPHORMER_D_EXP < 2 or EXPHORMER_D_EXP % 2 != 0:
+        raise ValueError(f"EXPHORMER_D_EXP must be even and >= 2, got {EXPHORMER_D_EXP}")
     RUN_DIR_NAME = f"tpgt_task11_{RUN_TAG}"
     if DEPTH < 1 or HEADS < 1 or D < 1 or D_E < 1 or D_A < 1:
         raise ValueError(
@@ -3508,6 +3761,12 @@ def architecture_summary() -> str:
         attn_txt = (
             f"grpe_elec(Park P/E + stage U r)/sqrt({D_A}), raw_rpe={RPE_DIM}, "
             f"hop_bins={hop_bins}"
+        )
+    elif ATTENTION_KIND == "exphormer":
+        kernel = "dense" if EXPHORMER_DENSE else "sparse"
+        attn_txt = (
+            f"exphormer({kernel}, d_exp={EXPHORMER_D_EXP}, pairs=15, "
+            f"mlp {score_in}->{h1}->{h2}->1)"
         )
     else:
         attn_txt = "grit"
@@ -3993,20 +4252,21 @@ def _representative_networks(
     for local, types, branches, ybus in rep_specs:
         features, component = meshed_rpe(bus_count, branches, ybus, re_scale=global_re, im_scale=global_im)
         hop_id, edge_id = build_grpe_graph_ids(bus_count, branches)
-        networks.append(
-            Network(
-                ybus=torch.from_numpy(ybus),
-                rpe=torch.from_numpy(features),
-                component=torch.from_numpy(component.astype(np.int64)),
-                types=torch.from_numpy(types),
-                branches=tuple(branches),
-                shunt_b=torch.from_numpy(np.asarray(shunt_b[local], dtype=np.float32)),
-                rpe_re_scale=global_re,
-                rpe_im_scale=global_im,
-                hop_id=torch.from_numpy(hop_id),
-                edge_id=torch.from_numpy(edge_id),
-            )
+        network = Network(
+            ybus=torch.from_numpy(ybus),
+            rpe=torch.from_numpy(features),
+            component=torch.from_numpy(component.astype(np.int64)),
+            types=torch.from_numpy(types),
+            branches=tuple(branches),
+            shunt_b=torch.from_numpy(np.asarray(shunt_b[local], dtype=np.float32)),
+            rpe_re_scale=global_re,
+            rpe_im_scale=global_im,
+            hop_id=torch.from_numpy(hop_id),
+            edge_id=torch.from_numpy(edge_id),
         )
+        if ATTENTION_KIND == "exphormer":
+            attach_exphormer_graph(network)
+        networks.append(network)
     return networks
 
 
@@ -4746,6 +5006,32 @@ def move_to(network: Network, device: torch.device) -> Network:
         masks = masks.to(device)
     shunt = getattr(network, "shunt_b", None)
     hop_id, edge_id = ensure_network_grpe_ids(network)
+
+    def _maybe(tensor: torch.Tensor | None) -> torch.Tensor | None:
+        return None if tensor is None else host_to_device(tensor, device)
+
+    if ATTENTION_KIND == "exphormer":
+        allow, tau, n_virt = ensure_network_exphormer(network)
+        exph_kw = dict(
+            exph_allow=host_to_device(allow, device),
+            exph_tau=host_to_device(tau, device),
+            exph_n_virt=n_virt,
+            exph_recv=_maybe(getattr(network, "exph_recv", None)),
+            exph_send=_maybe(getattr(network, "exph_send", None)),
+            exph_edge_tau=_maybe(getattr(network, "exph_edge_tau", None)),
+            exph_pair_id=_maybe(getattr(network, "exph_pair_id", None)),
+        )
+    else:
+        exph_kw = dict(
+            exph_allow=_maybe(getattr(network, "exph_allow", None)),
+            exph_tau=_maybe(getattr(network, "exph_tau", None)),
+            exph_n_virt=int(getattr(network, "exph_n_virt", 0) or 0),
+            exph_recv=_maybe(getattr(network, "exph_recv", None)),
+            exph_send=_maybe(getattr(network, "exph_send", None)),
+            exph_edge_tau=_maybe(getattr(network, "exph_edge_tau", None)),
+            exph_pair_id=_maybe(getattr(network, "exph_pair_id", None)),
+        )
+
     return Network(
         ybus=host_to_device(network.ybus, device),
         rpe=host_to_device(network.rpe, device).to(dtype=torch.float32),
@@ -4761,6 +5047,7 @@ def move_to(network: Network, device: torch.device) -> Network:
         rpe_im_scale=getattr(network, "rpe_im_scale", None),
         hop_id=host_to_device(hop_id, device),
         edge_id=host_to_device(edge_id, device),
+        **exph_kw,
         type_key=network_type_key(network),
         layout=shared_layout(types, masks, types_np=network.types.detach().cpu().numpy()),
     )
@@ -4901,6 +5188,7 @@ def forward_cases(
         shunt_b=shunt_b,
         hop_id=hop_id,
         edge_id=edge_id,
+        **exphormer_forward_kwargs(network),
     )
     return prediction, target, residuals
 
@@ -5048,6 +5336,30 @@ class PassBatch:
         chunk = self.cases[start:stop]
         if self.kind == "single":
             return run_batch_residuals(model, split, self.networks[0], chunk, device, pair=pair)
+        # Exphormer allow/tau are topology-specific and not yet batched; run one network at a time.
+        if ATTENTION_KIND == "exphormer":
+            owners = self.owner[start:stop]
+            parts: list[tuple[TaskLossBreakdown, float]] = []
+            residuals: list[torch.Tensor] = []
+            for network_id in sorted(set(int(x) for x in owners.tolist())):
+                mask = owners == network_id
+                local_cases = chunk[mask]
+                local_pair = pair[mask] if pair.dim() == 4 else pair
+                breakdown, stage_res = run_batch_residuals(
+                    model,
+                    split,
+                    self.networks[network_id],
+                    local_cases,
+                    device,
+                    pair=local_pair,
+                )
+                parts.append((breakdown, float(len(local_cases))))
+                if not residuals:
+                    residuals = list(stage_res)
+                else:
+                    for i, r in enumerate(stage_res):
+                        residuals[i] = torch.cat((residuals[i], r), dim=0)
+            return _weighted_loss_breakdown(parts), residuals
         select = self.select[start:stop]
         layout = None if self.member_layout is None else self.member_layout.take(select)
         assert self.shunt_b is not None and self.hop_id is not None and self.edge_id is not None

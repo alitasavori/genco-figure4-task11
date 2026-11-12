@@ -27,19 +27,29 @@ def shared_grpe_params() -> int:
     return 3 * per_hop + 3 * per_edge
 
 
+def shared_exphormer_params() -> int:
+    """Shared virtual init θ_u and virt RPE table on TPGT."""
+    return t.D + 6 * t.RPE_DIM
+
+
 def stage_attn_params() -> int:
     """Attention weights for one correction stage under the active ``ATTENTION_KIND``."""
     total = 0
+    n_pairs = t.EXPHORMER_NUM_PAIRS if t.ATTENTION_KIND == "exphormer" else 9
     # Shared: W_Q, W_K, W_V per type-pair head; W_O per head.
     for rows, cols in ((t.D_A, t.D), (t.D_A, t.D), (t.D_A, t.D)):
-        total += 9 * t.HEADS * rows * cols
+        total += n_pairs * t.HEADS * rows * cols
     total += t.HEADS * t.D * t.D_A
-    if t.ATTENTION_KIND == "joint_mlp":
+    if t.ATTENTION_KIND in ("joint_mlp", "exphormer"):
         score_in = 2 * t.D_A + t.RPE_DIM
         h1, h2 = (int(t.ATTENTION_MLP_HIDDENS[0]), int(t.ATTENTION_MLP_HIDDENS[1]))
         # 98→h1→h2→1: W1/b1, W2/b2, W3/b3 — per type-pair head.
         per = h1 * score_in + h1 + h2 * h1 + h2 + 1 * h2 + 1
-        total += 9 * t.HEADS * per
+        total += n_pairs * t.HEADS * per
+        if t.ATTENTION_KIND == "exphormer":
+            total += 3 * t.HEADS  # edge_bias (phys/exp/virt)
+            total += mlp_params(t.D + t.D, t.D)  # update_virt
+            total += 2 * t.D  # LayerNorm virt
     elif t.ATTENTION_KIND == "grpe":
         # Shared P/E live on TPGT; stage has type-pair Q/K/V + W_O only.
         pass
@@ -68,6 +78,7 @@ def main() -> None:
     enc_one = mlp_params(node_in, t.D)
     pe_one = 0 if t.ATTENTION_KIND in t.RAW_RPE_ATTENTION_KINDS else mlp_params(t.RPE_DIM, t.D_E)
     grpe_shared = shared_grpe_params() if t.ATTENTION_KIND in t.GRPE_ATTENTION_KINDS else 0
+    exph_shared = shared_exphormer_params() if t.ATTENTION_KIND == "exphormer" else 0
 
     model = t.TPGT()
     total = sum(p.numel() for p in model.parameters())
@@ -88,6 +99,8 @@ def main() -> None:
     ]
     if grpe_shared:
         rows.append(("Shared GRPE hop/edge encodings (P/E QKV)", grpe_shared, 1))
+    if exph_shared:
+        rows.append(("Shared Exphormer theta_u + virt RPE", exph_shared, 1))
     rows.extend(
         [
             ("Correction stage: type-pair attention", attn, t.DEPTH),
@@ -120,6 +133,16 @@ def main() -> None:
             f"W_Q/W_K/W_V: ({t.D_A},{t.D}), score MLP "
             f"({score_in} -> {h1} -> {h2} -> 1) with r_ij dim={t.RPE_DIM}, "
             f"W_O: ({t.D},{t.D_A}). No pair encoder."
+        )
+    elif t.ATTENTION_KIND == "exphormer":
+        score_in = 2 * t.D_A + t.RPE_DIM
+        h1, h2 = t.ATTENTION_MLP_HIDDENS
+        kernel = "dense" if t.EXPHORMER_DENSE else "sparse"
+        print(
+            f"Attention (Exphormer {kernel}): 15 type-pairs x HEADS x DEPTH, "
+            f"W_Q/W_K/W_V: ({t.D_A},{t.D}), score MLP "
+            f"({score_in} -> {h1} -> {h2} -> 1), edge_bias(3,H), virt update MLP, "
+            f"shared theta_u + virt_rpe(6,{t.RPE_DIM}), d_exp={t.EXPHORMER_D_EXP}."
         )
     elif t.ATTENTION_KIND == "grpe":
         print(
