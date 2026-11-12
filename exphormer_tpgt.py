@@ -155,48 +155,62 @@ def build_exphormer_pair_features(
 
     Real–real slots copy Zeff ``rpe``; virtual edges use learned ``virt_rpe``
     rows ``0..2 = t←U`` and ``3..5 = U←t``.
+
+    Always materializes float32 so CUDA autocast cannot leave Half buffers that
+    reject Float32 ``virt_rpe`` writes.
     """
-    virt_rpe = virt_rpe.to(dtype=rpe.dtype)
-    if rpe.dim() == 3:
-        n_real = int(rpe.shape[0])
-        n_aug = int(allow.shape[0])
-        out = rpe.new_zeros((n_aug, n_aug, rpe.shape[-1]))
-        out[:n_real, :n_real] = rpe
-        virt_edges = allow & (tau == EDGE_TAU_VIRT)
-        if bool(virt_edges.any()):
-            ii, jj = torch.nonzero(virt_edges, as_tuple=True)
-            ti = types_aug[ii]
-            tj = types_aug[jj]
-            real_from_virt = (ti < NUM_REAL_TYPES) & (tj == TYPE_VIRTUAL)
-            virt_from_real = (ti == TYPE_VIRTUAL) & (tj < NUM_REAL_TYPES)
-            if bool(real_from_virt.any()):
-                out[ii[real_from_virt], jj[real_from_virt]] = virt_rpe[ti[real_from_virt]]
-            if bool(virt_from_real.any()):
-                out[ii[virt_from_real], jj[virt_from_real]] = virt_rpe[3 + tj[virt_from_real]]
-        return out
-    # Batched rpe (B, N, N, R)
-    batch, n_real, _, rpe_dim = rpe.shape
-    n_aug = int(allow.shape[-1])
-    out = rpe.new_zeros((batch, n_aug, n_aug, rpe_dim))
-    out[:, :n_real, :n_real] = rpe
-    if allow.dim() == 2:
-        allow_b = allow
-        tau_b = tau
-        types = types_aug
-        virt_edges = allow_b & (tau_b == EDGE_TAU_VIRT)
-        if bool(virt_edges.any()):
-            ii, jj = torch.nonzero(virt_edges, as_tuple=True)
-            ti = types[ii]
-            tj = types[jj]
-            real_from_virt = (ti < NUM_REAL_TYPES) & (tj == TYPE_VIRTUAL)
-            virt_from_real = (ti == TYPE_VIRTUAL) & (tj < NUM_REAL_TYPES)
-            if bool(real_from_virt.any()):
-                feat = virt_rpe[ti[real_from_virt]]
-                out[:, ii[real_from_virt], jj[real_from_virt]] = feat.unsqueeze(0).expand(batch, -1, -1)
-            if bool(virt_from_real.any()):
-                feat = virt_rpe[3 + tj[virt_from_real]]
-                out[:, ii[virt_from_real], jj[virt_from_real]] = feat.unsqueeze(0).expand(batch, -1, -1)
-        return out
+    amp_off = torch.autocast(device_type="cuda", enabled=False) if rpe.is_cuda else nullcontext()
+    with amp_off:
+        rpe_f = rpe.to(dtype=torch.float32)
+        virt_f = virt_rpe.to(dtype=torch.float32)
+        if rpe_f.dim() == 3:
+            n_real = int(rpe_f.shape[0])
+            n_aug = int(allow.shape[0])
+            out = torch.zeros(
+                (n_aug, n_aug, rpe_f.shape[-1]), device=rpe_f.device, dtype=torch.float32
+            )
+            out[:n_real, :n_real] = rpe_f
+            virt_edges = allow & (tau == EDGE_TAU_VIRT)
+            if bool(virt_edges.any()):
+                ii, jj = torch.nonzero(virt_edges, as_tuple=True)
+                ti = types_aug[ii]
+                tj = types_aug[jj]
+                real_from_virt = (ti < NUM_REAL_TYPES) & (tj == TYPE_VIRTUAL)
+                virt_from_real = (ti == TYPE_VIRTUAL) & (tj < NUM_REAL_TYPES)
+                if bool(real_from_virt.any()):
+                    out[ii[real_from_virt], jj[real_from_virt]] = virt_f[ti[real_from_virt]]
+                if bool(virt_from_real.any()):
+                    out[ii[virt_from_real], jj[virt_from_real]] = virt_f[3 + tj[virt_from_real]]
+            return out
+        # Batched rpe (B, N, N, R)
+        batch, n_real, _, rpe_dim = rpe_f.shape
+        n_aug = int(allow.shape[-1])
+        out = torch.zeros(
+            (batch, n_aug, n_aug, rpe_dim), device=rpe_f.device, dtype=torch.float32
+        )
+        out[:, :n_real, :n_real] = rpe_f
+        if allow.dim() == 2:
+            allow_b = allow
+            tau_b = tau
+            types = types_aug
+            virt_edges = allow_b & (tau_b == EDGE_TAU_VIRT)
+            if bool(virt_edges.any()):
+                ii, jj = torch.nonzero(virt_edges, as_tuple=True)
+                ti = types[ii]
+                tj = types[jj]
+                real_from_virt = (ti < NUM_REAL_TYPES) & (tj == TYPE_VIRTUAL)
+                virt_from_real = (ti == TYPE_VIRTUAL) & (tj < NUM_REAL_TYPES)
+                if bool(real_from_virt.any()):
+                    feat = virt_f[ti[real_from_virt]]
+                    out[:, ii[real_from_virt], jj[real_from_virt]] = feat.unsqueeze(0).expand(
+                        batch, -1, -1
+                    )
+                if bool(virt_from_real.any()):
+                    feat = virt_f[3 + tj[virt_from_real]]
+                    out[:, ii[virt_from_real], jj[virt_from_real]] = feat.unsqueeze(0).expand(
+                        batch, -1, -1
+                    )
+            return out
     raise ValueError(f"unsupported allow/rpe shapes allow={tuple(allow.shape)} rpe={tuple(rpe.shape)}")
 
 

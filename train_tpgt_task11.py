@@ -1433,7 +1433,12 @@ class TPGT(nn.Module):
             if hop_id is None or edge_id is None:
                 raise ValueError("GRPE attention requires hop_id and edge_id (or grpe=...)")
             grpe = self.encode_grpe(hop_id, edge_id)
-        act_dtype = autocast_activation_dtype(specified)
+        # Exphormer attention is float32-only; keep activations in float32 even if AMP is on.
+        act_dtype = (
+            torch.float32
+            if self.attention_kind == "exphormer"
+            else autocast_activation_dtype(specified)
+        )
         hidden = torch.zeros(
             specified.shape[0],
             specified.shape[1],
@@ -5537,7 +5542,8 @@ def train_step(
     timer = NO_TIMER if timer is None else timer
     n = sum(len(index) for _network, index in groups)
     micro = min(MICRO_BATCH_SIZE, n)
-    use_amp = device.type == "cuda"
+    # Exphormer kernels force float32; AMP Half activations collide with Float32 RPE/virt writes.
+    use_amp = device.type == "cuda" and ATTENTION_KIND != "exphormer"
     optimizer.zero_grad(set_to_none=True)
     logged_parts: list[tuple[TaskLossBreakdown, float]] = []
     keep = rpe_channel_keep(RPE_DIM, RPE_CHANNEL_DROPOUT, model.training, groups[0][0].rpe.device)
@@ -6213,7 +6219,10 @@ def train_seed(
         model = torch.compile(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = make_lr_schedule(optimizer)
-    grad_scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    grad_scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=device.type == "cuda" and ATTENTION_KIND != "exphormer",
+    )
     plateau_note = (
         f"plateau x{LR_PLATEAU_FACTOR:g} after {lr_plateau_patience()} val checks without gain"
         if scheduler.plateau_enabled
@@ -6914,9 +6923,14 @@ def main() -> None:
         raise ValueError(f"eval-batch must be >= 1, got {EVAL_BATCH_SIZE}")
     if VAL_EVERY < 1:
         raise ValueError(f"val-every must be >= 1, got {VAL_EVERY}")
+    amp_note = (
+        "AMP off (exphormer float32)"
+        if ATTENTION_KIND == "exphormer"
+        else "AMP on CUDA"
+    )
     batch_note = (
         f"Training batch {BATCH_SIZE}, micro {MICRO_BATCH_SIZE}, eval batch {EVAL_BATCH_SIZE}, "
-        f"val every {VAL_EVERY} epoch(s), AMP on CUDA."
+        f"val every {VAL_EVERY} epoch(s), {amp_note}."
     )
     if DATA_FRACTION < 1.0:
         print(
