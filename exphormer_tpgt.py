@@ -332,7 +332,7 @@ def dense_exphormer_messages(
             gathered = torch.einsum("bhnm,bhma->bhna", block_w, value)
             mixed = mixed.index_add(2, receivers, gathered.to(mixed.dtype))
 
-    message = torch.einsum("bhna,hda->bnd", mixed, w_o)
+    message = torch.einsum("bhna,hda->bnd", mixed, w_o.to(dtype=mixed.dtype))
     return message[:, :n_real], message[:, n_real:]
 
 
@@ -389,7 +389,9 @@ def sparse_exphormer_messages(
     if e == 0:
         return hidden_real.new_zeros(hidden_real.shape), z_virt.new_zeros(z_virt.shape)
 
-    # Per-edge scores (B, H, E).
+    # Per-edge scores (B, H, E). Use activation dtype explicitly so CUDA autocast
+    # and CPU float16 smoke tests do not mix Half buffers with Float32 parameters.
+    dtype = y.dtype
     scores = y.new_zeros((batch, heads, e))
     values = y.new_zeros((batch, heads, e, d_a))
     for p in range(NUM_EXPH_PAIRS):
@@ -399,29 +401,32 @@ def sparse_exphormer_messages(
         local = torch.nonzero(edge_mask, as_tuple=False).view(-1)
         r = recv_idx[local]
         s = send_idx[local]
+        wq = w_q[p].to(dtype=dtype)
+        wk = w_k[p].to(dtype=dtype)
+        wv = w_v[p].to(dtype=dtype)
+        sw1 = score_w1[p].to(dtype=dtype)
+        sb1 = score_b1[p].to(dtype=dtype)
+        sw2 = score_w2[p].to(dtype=dtype)
+        sb2 = score_b2[p].to(dtype=dtype)
+        sw3 = score_w3[p].to(dtype=dtype)
+        sb3 = score_b3[p].to(dtype=dtype)
         # Unique receivers/senders for this pair, then map edges into the dense block path.
         # For parity and simplicity: evaluate each edge with einsum over gathered endpoints.
-        q = torch.einsum("bed,had->bhea", y[:, r], w_q[p])  # B,H,E_p,D_A
-        k = torch.einsum("bed,had->bhea", y[:, s], w_k[p])
-        v = torch.einsum("bed,had->bhea", y[:, s], w_v[p])
+        q = torch.einsum("bed,had->bhea", y[:, r], wq)  # B,H,E_p,D_A
+        k = torch.einsum("bed,had->bhea", y[:, s], wk)
+        v = torch.einsum("bed,had->bhea", y[:, s], wv)
         if pair_aug.dim() == 3:
             edge_feat = pair_aug[r, s].unsqueeze(0).unsqueeze(1).expand(batch, heads, -1, -1)
         else:
             edge_feat = pair_aug[:, r, s].unsqueeze(1).expand(-1, heads, -1, -1)
-        # Match activation dtype under CUDA autocast (pair/RPE may stay float32).
-        edge_feat = edge_feat.to(dtype=q.dtype)
+        edge_feat = edge_feat.to(dtype=dtype)
         joint = torch.cat((q, k, edge_feat), dim=-1)
-        h1 = torch.relu(
-            torch.einsum("bhes,has->bhea", joint, score_w1[p]) + score_b1[p].view(1, heads, 1, -1)
-        )
-        h2 = torch.relu(
-            torch.einsum("bhea,hca->bhec", h1, score_w2[p]) + score_b2[p].view(1, heads, 1, -1)
-        )
-        score = torch.einsum("bhec,hc->bhe", h2, score_w3[p, :, 0]) + score_b3[p].view(1, heads, 1)
+        h1 = torch.relu(torch.einsum("bhes,has->bhea", joint, sw1) + sb1.view(1, heads, 1, -1))
+        h2 = torch.relu(torch.einsum("bhea,hca->bhec", h1, sw2) + sb2.view(1, heads, 1, -1))
+        score = torch.einsum("bhec,hc->bhe", h2, sw3[:, 0]) + sb3.view(1, heads, 1)
         tau_e = edge_tau[local]
-        bias = edge_bias[tau_e].transpose(0, 1).unsqueeze(0).to(dtype=score.dtype)  # (1,H,E_p)
+        bias = edge_bias[tau_e].transpose(0, 1).unsqueeze(0).to(dtype=dtype)  # (1,H,E_p)
         score = score + bias
-        # Autocast: buffers follow y (often Half); MLP/bias math may promote to Float.
         scores[:, :, local] = score.to(dtype=scores.dtype)
         values[:, :, local] = v.to(dtype=values.dtype)
 
@@ -443,5 +448,5 @@ def sparse_exphormer_messages(
         contrib = weights[:, :, edge_i].unsqueeze(-1) * values[:, :, edge_i]
         mixed[:, :, r] = mixed[:, :, r] + contrib.to(dtype=mixed.dtype)
 
-    message = torch.einsum("bhna,hda->bnd", mixed, w_o)
+    message = torch.einsum("bhna,hda->bnd", mixed, w_o.to(dtype=mixed.dtype))
     return message[:, :n_real], message[:, n_real:]
