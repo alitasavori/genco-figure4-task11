@@ -6,7 +6,9 @@ Tasks (``--task`` or ``GENCO_TPGT_TASK``; see ``TASKS``)
 ----------------------------------------------------
 1.1 (default), 1.2, 1.3 (alias 2.1), 2.3, 3.1, 4.1, 4.2, 4.3. Data: ``Foundation Model/vendor/pfdelta_task<id>``
 (override ``GENCO_PFDELTA_TASK<id without dot>``, e.g. ``GENCO_PFDELTA_TASK42``), downloaded from
-``gridfm/pfdelta_task<id>`` when missing. Training and validation use the union of the task's
+``gridfm/pfdelta_task<id>`` when missing. ``--case case57`` / ``GENCO_TPGT_CASE=case57`` runs Task 1.1
+train+test on IEEE 57 (``tpgt_task11_case57_<RUN_TAG>``, vendor ``pfdelta_task1.1_case57`` from MIT PFΔ JSON).
+Training and validation use the union of the task's
 train/valid folders (each cached and cut to ``DATA_FRACTION`` on its own, then merged); every task
 is tested on N, N-1, N-2 and C2I. Task 1.1 keeps ``tpgt_task11_<RUN_TAG>``; other tasks write to
 ``tpgt_task<id>_<RUN_TAG>`` (results inside it). Each optimizer step takes the next 32 cases of
@@ -208,7 +210,9 @@ RPE_CHANNEL_DROPOUT = 0.1
 CHECKPOINT_VERSION = "meshed-rpe-2-d4-v7"
 # Checkpoints, split caches and result tables live in tpgt_task11_<RUN_TAG> so runs of an
 # older architecture (e.g. the 2-stage, 10-channel run in tpgt_task11/) are never overwritten.
+# Non-118 cases use ``tpgt_task11_<case>_<RUN_TAG>`` (e.g. ``tpgt_task11_case57_v9``).
 RUN_TAG = "v7"
+CASE_NAME = "case118"
 RUN_DIR_NAME = f"tpgt_task11_{RUN_TAG}"
 # Residual/state packing stays 2 known slots per type. v9 node encoders see all four PF
 # quantities (P, Q, V, θ) with unknowns zeroed, plus bus-shunt B from parquet ``BS`` (device only).
@@ -482,11 +486,35 @@ TASK31_TEST_CASES = ("case57", "case118", "case500")
 
 
 def eval_case_names(spec: TaskSpec | None = None) -> tuple[str, ...]:
-    """Parquet case folder used at test time. Only Task 3.1 leaves IEEE 118."""
+    """Parquet case folder used at test time. Task 3.1 is multi-grid; others use ``CASE_NAME``."""
     spec = spec or TASKS["1.1"]
     if spec.task_id == "3.1":
         return TASK31_TEST_CASES
-    return ("case118",)
+    return (CASE_NAME,)
+
+
+def parse_case_name() -> str:
+    """``--case case57`` / ``GENCO_TPGT_CASE``; default IEEE 118."""
+    for index, arg in enumerate(sys.argv):
+        if arg == "--case" and index + 1 < len(sys.argv):
+            return sys.argv[index + 1].strip()
+        if arg.startswith("--case="):
+            return arg.split("=", 1)[1].strip()
+    return os.environ.get("GENCO_TPGT_CASE", "").strip() or "case118"
+
+
+def apply_case_config() -> str:
+    """Set ``CASE_NAME`` and fold non-118 cases into ``RUN_DIR_NAME`` (e.g. ``tpgt_task11_case57_v9``)."""
+    global CASE_NAME, RUN_DIR_NAME
+    name = parse_case_name()
+    if not name.startswith("case"):
+        raise ValueError(f"case name must look like case57/case118, got {name!r}")
+    CASE_NAME = name
+    if CASE_NAME == "case118":
+        RUN_DIR_NAME = f"tpgt_task11_{RUN_TAG}"
+    else:
+        RUN_DIR_NAME = f"tpgt_task11_{CASE_NAME}_{RUN_TAG}"
+    return CASE_NAME
 
 
 def task_spec(name: str) -> TaskSpec:
@@ -3751,12 +3779,14 @@ def apply_architecture_config() -> str:
             f"invalid architecture dims D={D} D_E={D_E} D_A={D_A} HEADS={HEADS} "
             f"DEPTH={DEPTH} ATTENTION_MLP_HIDDENS={ATTENTION_MLP_HIDDENS}"
         )
+    apply_case_config()
     return name
 
 
 def architecture_summary() -> str:
     node_in = NODE_FEATURE_DIM if USE_NODE_SHUNT else NODE_SPECIFIED_DIM
     node_txt = "P,Q,V,θ,busBS" if USE_NODE_SHUNT else "spec"
+    case_txt = f" case={CASE_NAME}" if CASE_NAME != "case118" else ""
     h1, h2 = ATTENTION_MLP_HIDDENS
     score_in = 2 * D_A + RPE_DIM
     hop_bins = grpe_num_hop_bins()
@@ -3782,7 +3812,7 @@ def architecture_summary() -> str:
         attn_txt = "grit"
     return (
         f"arch {RUN_TAG}: DEPTH={DEPTH} D={D} D_E={D_E} D_A={D_A} HEADS={HEADS} "
-        f"node_in={node_in} ({node_txt}) attn={attn_txt} "
+        f"node_in={node_in} ({node_txt}) attn={attn_txt}{case_txt} "
         f"checkpoint_version={CHECKPOINT_VERSION}"
     )
 
@@ -4294,29 +4324,49 @@ def log_counts(data_root: Path, results: Path, spec: TaskSpec | None = None) -> 
     for item in folders:
         if len(item) == 3:
             split, topology, condition = item
-            grid = "case118"
+            grid = CASE_NAME
         else:
             split, topology, condition, grid = item
         raw = raw_dir(data_root, split, topology, condition, grid)
         count = scenario_count(raw)
-        key = f"{split}/{topology}/{condition}" if grid == "case118" and spec.task_id != "3.1" else f"{split}/{grid}/{topology}/{condition}"
+        key = (
+            f"{split}/{topology}/{condition}"
+            if grid == CASE_NAME and spec.task_id != "3.1"
+            else f"{split}/{grid}/{topology}/{condition}"
+        )
         if not spec.is_task11:
             report[key] = {"loaded": count}
             print(f"count {key}: {count}", flush=True)
             continue
-        expected = EXPECTED_COUNTS[(split, topology, condition)]
+        expected = EXPECTED_COUNTS.get((split, topology, condition))
         report[key] = {"loaded": count, "expected": expected}
-        print(f"count {key}: {count} (expected {expected})", flush=True)
-        if count != expected:
-            print(f"  count differs from the PFΔ Task 1.1 split. Using the {count} loaded scenarios.", flush=True)
+        if expected is None:
+            print(f"count {key}: {count}", flush=True)
+        else:
+            print(f"count {key}: {count} (expected {expected})", flush=True)
+            if count != expected:
+                print(
+                    f"  count differs from the PFΔ Task 1.1 split. Using the {count} loaded scenarios.",
+                    flush=True,
+                )
     path = results / f"task{spec.file_tag}_tpgt_counts.json"
     path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
 
 
-def raw_dir(data_root: Path, split: str, topology: str, condition: str, grid: str = "case118") -> Path:
-    """PFΔ parquet folder. The dataset root case is always ``case118``; Task 3.1 tests other ``grid`` names."""
-    return data_root / "case118" / split / grid / topology / condition / "raw"
+def raw_dir(
+    data_root: Path,
+    split: str,
+    topology: str,
+    condition: str,
+    grid: str | None = None,
+) -> Path:
+    """PFΔ parquet folder: ``<root>/<CASE_NAME>/<split>/<grid>/<topology>/<condition>/raw``.
+
+    Default IEEE-118 packs (including Task 3.1 cross-grid tests) use outer ``case118``.
+    Native IEEE-57 Task 1.1 packs use outer ``case57``.
+    """
+    return data_root / CASE_NAME / split / (grid or CASE_NAME) / topology / condition / "raw"
 
 
 def task_folders(data_root: Path, split: str) -> list[tuple[str, str]]:
@@ -4848,7 +4898,9 @@ COLAB_DRIVE = Path("/content/drive/MyDrive")
 def dataset_relative(spec: TaskSpec | None = None) -> Path:
     spec = spec or TASKS["1.1"]
     if spec.is_task11:
-        return DATASET_RELATIVE
+        if CASE_NAME == "case118":
+            return DATASET_RELATIVE
+        return Path("Foundation Model") / "vendor" / f"pfdelta_task1.1_{CASE_NAME}"
     return Path("Foundation Model") / "vendor" / f"pfdelta_task{spec.data_id}"
 
 
@@ -4882,12 +4934,12 @@ def dataset_candidates(drive: Path | None, spec: TaskSpec | None = None) -> list
 
 
 def drive_dataset(drive: Path | None, spec: TaskSpec | None = None) -> Path | None:
-    """Return the saved dataset root of ``spec`` (default Task 1.1) when case118 is already on Drive.
+    """Return the saved dataset root of ``spec`` when ``CASE_NAME`` is already on Drive.
 
     This only checks directory names. It does not copy the dataset.
     """
     for candidate in dataset_candidates(drive, spec):
-        if (candidate / "case118").is_dir():
+        if (candidate / CASE_NAME).is_dir():
             return candidate
     return None
 
@@ -4900,7 +4952,7 @@ def dataset_missing_files(data_root: Path, spec: TaskSpec) -> list[Path]:
         for _label, topology, condition in TEST_PARTS
     ]
     for split in ("train", "valid"):
-        folders.extend((split, *folder, "case118") for folder in spec.folders)
+        folders.extend((split, *folder, CASE_NAME) for folder in spec.folders)
     return [
         raw_dir(data_root, split, topology, condition, grid) / name
         for split, topology, condition, grid in folders
@@ -4955,10 +5007,12 @@ def ensure_dataset(work: Path, drive: Path | None = None, spec: TaskSpec | None 
     spec = spec or TASKS["1.1"]
     if not spec.is_task11:
         return ensure_task_dataset(work, drive, spec)
+    if CASE_NAME != "case118":
+        return ensure_case_task11_dataset(work, drive, CASE_NAME)
     saved = drive_dataset(drive)
     if saved is not None:
         print(f"Dataset already present: {saved}", flush=True)
-        print("case118 is already on Drive; skipping download.", flush=True)
+        print(f"{CASE_NAME} is already on Drive; skipping download.", flush=True)
         return saved
     data = work / "pfdelta_task1.1"
     marker = data / "case118" / "train" / "case118" / "n" / "feasible" / "raw" / "bus_data.parquet"
@@ -4972,6 +5026,24 @@ def ensure_dataset(work: Path, drive: Path | None = None, spec: TaskSpec | None 
     if not marker.exists():
         raise FileNotFoundError(f"Download finished without {marker}")
     return data
+
+
+def ensure_case_task11_dataset(work: Path, drive: Path | None, case: str) -> Path:
+    """Task 1.1 on a non-118 case: build gridfm-style parquet from MIT PFΔ JSON."""
+    from pfdelta_case_parquet import build_task11_case_dataset
+
+    relative = dataset_relative(TASKS["1.1"])
+    if drive is not None and (in_colab() or (drive / "Foundation Model").is_dir()):
+        out_root = drive / relative
+    else:
+        requested = dataset_request(TASKS["1.1"])
+        out_root = requested if requested.is_absolute() else work / relative.name
+    marker = out_root / case / "train" / case / "n" / "feasible" / "raw" / "bus_data.parquet"
+    if marker.is_file():
+        print(f"Dataset already present: {out_root}", flush=True)
+        return out_root
+    extract_root = work / f"pfdelta_raw_{case}"
+    return build_task11_case_dataset(case, out_root, extract_root)
 
 
 def ensure_task_dataset(work: Path, drive: Path | None, spec: TaskSpec) -> Path:
@@ -4990,7 +5062,7 @@ def ensure_task_dataset(work: Path, drive: Path | None, spec: TaskSpec) -> Path:
             data = drive / requested
         else:
             data = work / f"pfdelta_task{spec.data_id}"
-    if data.joinpath("case118").is_dir() and not dataset_missing_files(data, spec):
+    if data.joinpath(CASE_NAME).is_dir() and not dataset_missing_files(data, spec):
         print(f"Dataset already present: {data}", flush=True)
         return data
     from huggingface_hub import snapshot_download
@@ -6827,7 +6899,14 @@ def plot_comparison(
     seeds = min(int(by_category[category]["n_seeds"]) for category in categories)
     output = comparison_figure_path(results, spec)
     tpgt_label = f"TPGT (this run, {seeds} seed(s))"
-    written = plot_tpgt_comparison(spec.task_id, spec.label, tpgt, output, tpgt_label=tpgt_label)
+    plot_label = spec.label if CASE_NAME == "case118" else f"{spec.label} ({CASE_NAME})"
+    # Published Task 1.1 baselines are IEEE-118 only; case57 plots TPGT alone.
+    plot_task = (
+        spec.task_id
+        if CASE_NAME == "case118" or spec.task_id == "3.1"
+        else f"{spec.task_id}_{CASE_NAME}"
+    )
+    written = plot_tpgt_comparison(plot_task, plot_label, tpgt, output, tpgt_label=tpgt_label)
     if spec.task_id == "3.1":
         if write_task31_table is None or display_task31_table is None:
             print(
@@ -7075,7 +7154,11 @@ def main() -> None:
     else:
         print(batch_note, flush=True)
     spec = parse_task()
-    print(f"PFΔ Task {spec.label}: {spec.description} (dataset {spec.dataset_repo})", flush=True)
+    case_note = f", case {CASE_NAME}" if CASE_NAME != "case118" else ""
+    print(
+        f"PFΔ Task {spec.label}: {spec.description} (dataset {spec.dataset_repo}{case_note})",
+        flush=True,
+    )
     drive = google_drive_root()
     outputs = drive_output_dirs(drive, spec)
     work, legacy_results = legacy_locations(drive)
@@ -7453,14 +7536,15 @@ def verify_task11_splits(data_root: Path) -> None:
         ("test_n-2_nose", ("test", "n-2", "nose")),
     ]
     for name, parts in checks:
-        raw = data_root.joinpath(*parts)
+        raw = raw_dir(data_root, *parts)
         read_split(raw, name, prefix_end=scenario_limit(raw))
-    print(f"verify_task11_splits OK ({len(checks)} folders)", flush=True)
+    print(f"verify_task11_splits OK ({len(checks)} folders, case={CASE_NAME})", flush=True)
 
 
 def cli_verify_splits() -> None:
     global DATA_FRACTION
     ensure_runtime_packages()
+    apply_architecture_config()
     DATA_FRACTION = parse_data_fraction()
     drive = google_drive_root()
     work, _legacy = legacy_locations(drive)
@@ -7524,6 +7608,7 @@ if __name__ == "__main__":
         cli_verify_splits()
     elif len(sys.argv) > 1 and sys.argv[1] == "--sanity-rpe":
         ensure_runtime_packages()
+        apply_architecture_config()
         drive = google_drive_root()
         work, _legacy = legacy_locations(drive)
         data = ensure_dataset(work, drive)
