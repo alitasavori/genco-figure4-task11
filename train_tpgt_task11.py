@@ -5573,11 +5573,34 @@ def train_step(
             scaler.unscale_(optimizer)
         if GRAD_CLIP_NORM > 0.0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
-        if scaler is not None:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
+        for name, param in model.named_parameters():
+            grad = param.grad
+            if grad is not None and tuple(grad.shape) != tuple(param.shape):
+                raise RuntimeError(
+                    f"grad shape {tuple(grad.shape)} != param {tuple(param.shape)} for {name}"
+                )
+        try:
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+        except RuntimeError as error:
+            # Stale/misaligned Adam buffers after resume: drop momentum and retry once.
+            message = str(error)
+            if "must match the size of tensor" not in message:
+                raise
+            mismatch = live_optimizer_state_shape_mismatch(optimizer)
+            reset_optimizer_state(optimizer)
+            # Grads are already unscaled; do not call scaler.step again.
             optimizer.step()
+            if scaler is not None:
+                scaler.update()
+            print(
+                f"Adam state reset after shape error ({mismatch or message.split(chr(10), 1)[0]}); "
+                "continued with fresh momentum.",
+                flush=True,
+            )
     return _weighted_loss_breakdown(logged_parts)
 
 
@@ -5953,12 +5976,91 @@ def read_completed_epochs(done_path: Path) -> int:
         return 0
 
 
+def _state_entry_for_id(state_map: dict, param_id: object) -> dict | None:
+    """Resolve Adam state for a serialized param id (int or str keys)."""
+    entry = state_map.get(param_id)
+    if isinstance(entry, dict):
+        return entry
+    if isinstance(param_id, int):
+        entry = state_map.get(str(param_id))
+        if isinstance(entry, dict):
+            return entry
+    for key, value in state_map.items():
+        if key == param_id or str(key) == str(param_id):
+            return value if isinstance(value, dict) else None
+    return None
+
+
+def optimizer_state_shape_mismatch(
+    optimizer: torch.optim.Optimizer,
+    state_payload: object,
+) -> str | None:
+    """Return a short reason if Adam buffers do not match current parameter shapes.
+
+    ``Optimizer.load_state_dict`` keys momentum by param-group order and does not always
+    reject transposed/shifted buffers; Adam foreach then crashes on ``_foreach_lerp_``.
+    """
+    if not isinstance(state_payload, dict):
+        return "optimizer payload missing"
+    groups = state_payload.get("param_groups")
+    state_map = state_payload.get("state")
+    if not isinstance(groups, list) or not isinstance(state_map, dict):
+        return "optimizer payload malformed"
+    payload_ids: list[object] = []
+    for group in groups:
+        if not isinstance(group, dict) or "params" not in group:
+            return "optimizer param_groups malformed"
+        payload_ids.extend(group["params"])
+    current_params = [param for group in optimizer.param_groups for param in group["params"]]
+    if len(payload_ids) != len(current_params):
+        return f"optimizer param count {len(payload_ids)} != model {len(current_params)}"
+    for param, param_id in zip(current_params, payload_ids):
+        entry = _state_entry_for_id(state_map, param_id)
+        if entry is None:
+            continue
+        for buffer_name in ("exp_avg", "exp_avg_sq"):
+            buffer = entry.get(buffer_name)
+            if buffer is None or not torch.is_tensor(buffer):
+                continue
+            if tuple(buffer.shape) != tuple(param.shape):
+                return (
+                    f"{buffer_name} shape {tuple(buffer.shape)} != param {tuple(param.shape)}"
+                )
+    return None
+
+
+def live_optimizer_state_shape_mismatch(optimizer: torch.optim.Optimizer) -> str | None:
+    """Validate already-loaded Adam buffers against their parameters."""
+    for param in (p for group in optimizer.param_groups for p in group["params"]):
+        entry = optimizer.state.get(param)
+        if not isinstance(entry, dict):
+            continue
+        for buffer_name in ("exp_avg", "exp_avg_sq"):
+            buffer = entry.get(buffer_name)
+            if buffer is None or not torch.is_tensor(buffer):
+                continue
+            if tuple(buffer.shape) != tuple(param.shape):
+                return (
+                    f"{buffer_name} shape {tuple(buffer.shape)} != param {tuple(param.shape)}"
+                )
+    return None
+
+
+def reset_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
+    """Drop Adam momentum; keep current param_group hyperparameters (e.g. resumed lr)."""
+    optimizer.state.clear()
+
+
 def restore_checkpoint_payload(
     model: TPGT,
     optimizer: torch.optim.Optimizer,
     payload: dict | None,
 ) -> tuple[dict | None, str | None]:
-    """Load weights when compatible; return (restored, obsolete_reason)."""
+    """Load weights when compatible; return (restored, obsolete_reason).
+
+    Model weights load by name. Optimizer momentum is validated against current parameter
+    shapes; on mismatch, weights are kept and Adam state is left fresh (caller logs it).
+    """
     if payload is None:
         return None, None
     version_reason = checkpoint_version_reason(payload)
@@ -5969,10 +6071,27 @@ def restore_checkpoint_payload(
         return None, rpe_reason
     try:
         model.load_state_dict(payload["model"], strict=True)
-        optimizer.load_state_dict(payload["optimizer"])
     except RuntimeError as error:
         detail = str(error).split("\n", maxsplit=1)[0]
         return None, f"state_dict incompatible with current model ({detail})"
+    opt_payload = payload.get("optimizer")
+    optimizer_reset_reason = optimizer_state_shape_mismatch(optimizer, opt_payload)
+    if optimizer_reset_reason is None:
+        try:
+            optimizer.load_state_dict(opt_payload)
+            optimizer_reset_reason = live_optimizer_state_shape_mismatch(optimizer)
+        except RuntimeError as error:
+            detail = str(error).split("\n", maxsplit=1)[0]
+            optimizer_reset_reason = f"optimizer load failed ({detail})"
+    if optimizer_reset_reason is not None:
+        # Keep resumed LR from the checkpoint even when momentum buffers are dropped.
+        if isinstance(opt_payload, dict):
+            groups = opt_payload.get("param_groups")
+            if isinstance(groups, list) and groups and isinstance(groups[0], dict) and "lr" in groups[0]:
+                resumed_lr = float(groups[0]["lr"])
+                for group in optimizer.param_groups:
+                    group["lr"] = resumed_lr
+        reset_optimizer_state(optimizer)
     best_state = payload.get("best_state")
     if isinstance(best_state, dict):
         best_state = {
@@ -5986,6 +6105,7 @@ def restore_checkpoint_payload(
             "best_state": best_state,
             "data_fraction": payload.get("data_fraction"),
             "scheduler": payload.get("scheduler"),
+            "optimizer_reset_reason": optimizer_reset_reason,
         },
         None,
     )
@@ -6294,7 +6414,17 @@ def train_seed(
                     f"synced to epoch {start_epoch} (lr {current_lr(optimizer):.1e}).",
                     flush=True,
                 )
-        print(f"Seed {seed}: resumed optimizer lr {current_lr(optimizer):.1e}", flush=True)
+        opt_reset = restored.get("optimizer_reset_reason")
+        if opt_reset:
+            print(
+                f"Seed {seed}: optimizer state incompatible ({opt_reset}); "
+                f"keeping model weights, resetting Adam momentum "
+                f"(lr {current_lr(optimizer):.1e}).",
+                flush=True,
+            )
+            log(f"optimizer reset on resume: {opt_reset}")
+        else:
+            print(f"Seed {seed}: resumed optimizer lr {current_lr(optimizer):.1e}", flush=True)
     else:
         obsolete_reason = restore_obsolete or load_obsolete
         if obsolete_reason is not None:
