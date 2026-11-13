@@ -403,15 +403,20 @@ def build_task11_case_dataset(case: str, out_root: Path, work: Path) -> Path:
         return out_root
 
     print(f"Building Task 1.1 parquet for {case} -> {out_root}", flush=True)
-    # Feasible N for train/valid/test; N-1/N-2 feasible + nose for test only (Task 1.1 protocol).
+    # Task 1.1 trains on N only (54k pool → 90/10 train/valid). N-1/N-2 have smaller
+    # archives (e.g. 29k / 20k) and are test-only (last 2000 + nose), matching MIT.
     for topology in ("n", "n-1", "n-2"):
         if topology == "n":
-            splits = task11_feasible_file_lists(case_dir, shuffle_dir, topology)
+            splits = task11_feasible_file_lists(
+                case_dir, shuffle_dir, topology, train_size=TASK11_TRAIN_N, test_size=TASK11_TEST_N
+            )
             for split_name, files in splits.items():
                 raw_out = out_root / case / split_name / case / topology / "feasible" / "raw"
                 convert_file_list(files, raw_out)
         else:
-            files = task11_feasible_file_lists(case_dir, shuffle_dir, topology)["test"]
+            files = task11_feasible_file_lists(
+                case_dir, shuffle_dir, topology, train_size=0, test_size=TASK11_TEST_N
+            )["test"]
             raw_out = out_root / case / "test" / case / topology / "feasible" / "raw"
             convert_file_list(files, raw_out)
         nose = task11_nose_test_files(case_dir, topology)

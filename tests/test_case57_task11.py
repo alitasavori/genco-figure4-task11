@@ -113,6 +113,25 @@ def test_case118_run_dir_unchanged(monkeypatch):
         tpgt.apply_case_config()
 
 
+def test_task11_n1_test_only_allows_small_archive(tmp_path):
+    """N-1/N-2 Task 1.1 only need test_size samples, not the 54k N train pool."""
+    case_dir = tmp_path / "case57"
+    raw = case_dir / "n-1" / "raw"
+    raw.mkdir(parents=True)
+    for i in range(1, 101):
+        (raw / f"sample_{i}.json").write_text("{}", encoding="utf-8")
+    shuffle_dir = tmp_path / "shuffle_files" / "n-1"
+    shuffle_dir.mkdir(parents=True)
+    shuffle = {str(i): (i * 7) % 100 for i in range(100)}
+    (shuffle_dir / "raw_shuffle.json").write_text(
+        __import__("json").dumps(shuffle), encoding="utf-8"
+    )
+    files = conv.task11_feasible_file_lists(
+        case_dir, tmp_path / "shuffle_files", "n-1", train_size=0, test_size=20
+    )["test"]
+    assert len(files) == 20
+
+
 def test_list_raw_sample_paths_accepts_both_namings(tmp_path):
     raw = tmp_path / "raw"
     raw.mkdir()
