@@ -5035,7 +5035,13 @@ def ensure_case_task11_dataset(work: Path, drive: Path | None, case: str) -> Pat
     under Colab (``/content/pfdelta_raw_<case>``) — extracting the ~1.6GB case tar onto
     Drive often aborts mid-way and leaves a partial ``case/`` folder.
     """
-    from pfdelta_case_parquet import build_task11_case_dataset, task11_pack_complete
+    # ``build_task11_case_dataset`` already no-ops when the full pack exists and resumes
+    # missing N-1/N-2 folders. Reload so a long-lived Colab kernel cannot keep a stale module.
+    import importlib
+
+    import pfdelta_case_parquet as case_parquet
+
+    case_parquet = importlib.reload(case_parquet)
 
     relative = dataset_relative(TASKS["1.1"])
     if drive is not None and (in_colab() or (drive / "Foundation Model").is_dir()):
@@ -5043,15 +5049,12 @@ def ensure_case_task11_dataset(work: Path, drive: Path | None, case: str) -> Pat
     else:
         requested = dataset_request(TASKS["1.1"])
         out_root = requested if requested.is_absolute() else work / relative.name
-    if task11_pack_complete(out_root, case):
-        print(f"Dataset already present: {out_root}", flush=True)
-        return out_root
     if in_colab():
         extract_root = Path(f"/content/pfdelta_raw_{case}")
     else:
         extract_root = work / f"pfdelta_raw_{case}"
     print(f"PFΔ JSON extract root: {extract_root}", flush=True)
-    return build_task11_case_dataset(case, out_root, extract_root)
+    return case_parquet.build_task11_case_dataset(case, out_root, extract_root)
 
 
 def ensure_task_dataset(work: Path, drive: Path | None, spec: TaskSpec) -> Path:
