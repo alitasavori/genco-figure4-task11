@@ -5354,7 +5354,8 @@ class PassBatch:
             for network_id in sorted(set(int(x) for x in owners.tolist())):
                 mask = owners == network_id
                 local_cases = chunk[mask]
-                local_pair = pair[mask] if pair.dim() == 4 else pair
+                # ``pair`` is stacked per topology (U,N,N,E), not per case — index by network_id.
+                local_pair = pair[network_id] if pair.dim() == 4 else pair
                 breakdown, stage_res = run_batch_residuals(
                     model,
                     split,
