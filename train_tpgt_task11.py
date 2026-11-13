@@ -5029,7 +5029,12 @@ def ensure_dataset(work: Path, drive: Path | None = None, spec: TaskSpec | None 
 
 
 def ensure_case_task11_dataset(work: Path, drive: Path | None, case: str) -> Path:
-    """Task 1.1 on a non-118 case: build gridfm-style parquet from MIT PFΔ JSON."""
+    """Task 1.1 on a non-118 case: build gridfm-style parquet from MIT PFΔ JSON.
+
+    Parquet pack is written to Drive (reusable). Raw JSON extract stays on local SSD
+    under Colab (``/content/pfdelta_raw_<case>``) — extracting the ~1.6GB case tar onto
+    Drive often aborts mid-way and leaves a partial ``case/`` folder.
+    """
     from pfdelta_case_parquet import build_task11_case_dataset
 
     relative = dataset_relative(TASKS["1.1"])
@@ -5042,7 +5047,11 @@ def ensure_case_task11_dataset(work: Path, drive: Path | None, case: str) -> Pat
     if marker.is_file():
         print(f"Dataset already present: {out_root}", flush=True)
         return out_root
-    extract_root = work / f"pfdelta_raw_{case}"
+    if in_colab():
+        extract_root = Path(f"/content/pfdelta_raw_{case}")
+    else:
+        extract_root = work / f"pfdelta_raw_{case}"
+    print(f"PFΔ JSON extract root: {extract_root}", flush=True)
     return build_task11_case_dataset(case, out_root, extract_root)
 
 

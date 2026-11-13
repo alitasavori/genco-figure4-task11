@@ -113,6 +113,16 @@ def test_case118_run_dir_unchanged(monkeypatch):
         tpgt.apply_case_config()
 
 
+def test_list_raw_sample_paths_accepts_both_namings(tmp_path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "sample_2.json").write_text("{}", encoding="utf-8")
+    (raw / "sample_1.json").write_text("{}", encoding="utf-8")
+    paths = conv.list_raw_sample_paths(raw)
+    assert [p.name for p in paths] == ["sample_1.json", "sample_2.json"]
+    assert not conv.feasible_raw_complete(tmp_path, "n", min_samples=3)
+
+
 def test_scenario_rows_units_and_ybus(tmp_path):
     rows = conv.scenario_rows(_tiny_pm_case(), scenario=0)
     assert rows["bus"]["bus"] == [0, 1, 2]

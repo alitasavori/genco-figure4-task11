@@ -245,20 +245,71 @@ def write_parquet_folder(rows: dict[str, dict[str, list]], raw_dir: Path) -> Non
         pq.write_table(table, raw_dir / name)
 
 
+def _sample_index(path: Path) -> int:
+    """Parse ``sample_12.json`` or ``sample12.json`` → 12."""
+    stem = path.stem
+    if stem.startswith("sample_"):
+        return int(stem.split("_", 1)[1])
+    if stem.startswith("sample"):
+        return int(stem[len("sample") :])
+    raise ValueError(f"unrecognized sample name {path.name}")
+
+
+def list_raw_sample_paths(raw_path: Path) -> list[Path]:
+    """Sorted feasible JSON samples under ``…/raw`` (supports ``sample_N`` and ``sampleN``)."""
+    if not raw_path.is_dir():
+        return []
+    underscored = list(raw_path.glob("sample_*.json"))
+    if underscored:
+        return sorted(underscored, key=_sample_index)
+    plain = [p for p in raw_path.glob("sample*.json") if p.stem != "sample"]
+    return sorted(plain, key=_sample_index)
+
+
+def feasible_raw_complete(case_dir: Path, topology: str = "n", *, min_samples: int = 56000) -> bool:
+    """True when ``case/topology/raw`` looks fully extracted (N feasible has 56k samples)."""
+    paths = list_raw_sample_paths(case_dir / topology / "raw")
+    return len(paths) >= min_samples
+
+
 def download_pfdelta_case(case: str, work: Path) -> tuple[Path, Path]:
-    """Ensure ``caseXX/`` and ``shuffle_files/`` exist under ``work``; return those paths."""
+    """Ensure ``caseXX/`` and ``shuffle_files/`` exist under ``work``; return those paths.
+
+    Re-extracts when the case folder exists but is incomplete (common when a previous
+    extract to Google Drive was interrupted). Prefer a local SSD ``work`` on Colab.
+    """
+    import shutil
+
     from huggingface_hub import hf_hub_download
 
     work.mkdir(parents=True, exist_ok=True)
     case_dir = work / case
     shuffle_dir = work / "shuffle_files"
-    if not case_dir.is_dir():
+
+    need_case = not feasible_raw_complete(case_dir)
+    if need_case and case_dir.is_dir():
+        n_raw = len(list_raw_sample_paths(case_dir / "n" / "raw"))
+        print(
+            f"{case_dir} incomplete ({n_raw} N-raw JSON files; need >= 56000). Re-extracting.",
+            flush=True,
+        )
+        shutil.rmtree(case_dir)
+
+    if need_case:
         archive = Path(
             hf_hub_download(repo_id=HF_REPO, repo_type="dataset", filename=f"{case}.tar.gz", local_dir=str(work))
         )
-        print(f"Extracting {archive.name} ...", flush=True)
+        print(f"Extracting {archive.name} into {work} ...", flush=True)
         with tarfile.open(archive, "r:gz") as tar:
             tar.extractall(work)
+        n_raw = len(list_raw_sample_paths(case_dir / "n" / "raw"))
+        print(f"  {case}/n/raw: {n_raw} JSON samples", flush=True)
+        if not feasible_raw_complete(case_dir):
+            raise FileNotFoundError(
+                f"{case}/n/raw has {n_raw} samples after extract (expected >= 56000). "
+                f"Check {case_dir}"
+            )
+
     if not shuffle_dir.is_dir():
         archive = Path(
             hf_hub_download(
@@ -293,8 +344,22 @@ def task11_feasible_file_lists(
     """MIT Task 1.1 feasible splits for one topology."""
     shuffle_map = _shuffle_map(shuffle_dir, topology, case_dir.name)
     raw_path = case_dir / topology / "raw"
-    raw_fnames = [raw_path / f"sample_{i + 1}.json" for i in shuffle_map.keys()]
-    shuffled = [raw_fnames[shuffle_map[i]] for i in shuffle_map.keys()]
+    raw_fnames = list_raw_sample_paths(raw_path)
+    if not raw_fnames:
+        raise FileNotFoundError(f"no sample*.json under {raw_path}")
+    max_idx = max(shuffle_map.values())
+    if max_idx >= len(raw_fnames):
+        raise FileNotFoundError(
+            f"{raw_path}: shuffle index {max_idx} but only {len(raw_fnames)} JSON files "
+            f"(first={raw_fnames[0].name}, last={raw_fnames[-1].name}). "
+            "Re-run after a full extract of the case archive."
+        )
+    # Same as MIT PFDeltaDataset: permute the contiguous sample list by shuffle values.
+    keys = sorted(shuffle_map.keys())
+    shuffled = [raw_fnames[shuffle_map[i]] for i in keys]
+    missing = [path for path in shuffled[:3] + shuffled[-3:] if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"shuffle resolved missing files, e.g. {missing[0]}")
     if train_size + test_size > len(shuffled):
         raise RuntimeError(
             f"{case_dir.name}/{topology}: need {train_size}+{test_size} samples, have {len(shuffled)}"
