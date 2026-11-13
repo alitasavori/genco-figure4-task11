@@ -236,6 +236,8 @@ ATTENTION_KIND = "grit"
 # Attention kinds that use Identity pair encoder (raw RPE still stored on Network for Zeff / elec).
 RAW_RPE_ATTENTION_KINDS = frozenset({"joint_mlp", "grpe", "grpe_elec", "exphormer", "efla"})
 GRPE_ATTENTION_KINDS = frozenset({"grpe", "grpe_elec"})
+# Kernels that write float32 activations into buffers incompatible with AMP Half.
+AMP_DISABLED_ATTENTION_KINDS = frozenset({"exphormer", "efla"})
 # Shortest-path hop bins: 0..GRPE_MAX_HOP plus one overflow bin (hop > max or unreachable).
 GRPE_MAX_HOP = 8
 GRPE_EDGE_SELF = 0
@@ -5884,8 +5886,8 @@ def train_step(
     timer = NO_TIMER if timer is None else timer
     n = sum(len(index) for _network, index in groups)
     micro = min(MICRO_BATCH_SIZE, n)
-    # Exphormer kernels force float32; AMP Half activations collide with Float32 RPE/virt writes.
-    use_amp = device.type == "cuda" and ATTENTION_KIND != "exphormer"
+    # Exphormer/EFLA force float32; AMP Half activations collide with Float32 buffer writes.
+    use_amp = device.type == "cuda" and ATTENTION_KIND not in AMP_DISABLED_ATTENTION_KINDS
     optimizer.zero_grad(set_to_none=True)
     logged_parts: list[tuple[TaskLossBreakdown, float]] = []
     keep = rpe_channel_keep(RPE_DIM, RPE_CHANNEL_DROPOUT, model.training, groups[0][0].rpe.device)
@@ -6683,7 +6685,7 @@ def train_seed(
     scheduler = make_lr_schedule(optimizer)
     grad_scaler = torch.amp.GradScaler(
         "cuda",
-        enabled=device.type == "cuda" and ATTENTION_KIND != "exphormer",
+        enabled=device.type == "cuda" and ATTENTION_KIND not in AMP_DISABLED_ATTENTION_KINDS,
     )
     plateau_note = (
         f"plateau x{LR_PLATEAU_FACTOR:g} after {lr_plateau_patience()} val checks without gain"
@@ -7403,8 +7405,8 @@ def main() -> None:
     if VAL_EVERY < 1:
         raise ValueError(f"val-every must be >= 1, got {VAL_EVERY}")
     amp_note = (
-        "AMP off (exphormer float32)"
-        if ATTENTION_KIND == "exphormer"
+        f"AMP off ({ATTENTION_KIND} float32)"
+        if ATTENTION_KIND in AMP_DISABLED_ATTENTION_KINDS
         else "AMP on CUDA"
     )
     batch_note = (

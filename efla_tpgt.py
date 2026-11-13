@@ -596,7 +596,8 @@ def _dense_efla_messages_core(
         head_msg = numer / safe.unsqueeze(-1)
         # isolated receivers (denom ~ 0 from masking): zero
         head_msg = torch.where(denom.unsqueeze(-1) > eps, head_msg, torch.zeros_like(head_msg))
-        message[:, receivers] = torch.einsum("bhna,hda->bnd", head_msg, w_o)
+        projected = torch.einsum("bhna,hda->bnd", head_msg, w_o).to(dtype=message.dtype)
+        message[:, receivers] = projected
     return message
 
 
@@ -749,7 +750,9 @@ def factorized_efla_messages(
                     denom.unsqueeze(-1) > eps, head_msg, torch.zeros_like(head_msg)
                 )
                 global_recv = buses_c[recv_local]
-                message[:, global_recv] = torch.einsum("bhna,hda->bnd", head_msg, w_o)
+                # Cast explicitly: ambient AMP can re-promote einsum to Half even after .float().
+                projected = torch.einsum("bhna,hda->bnd", head_msg, w_o).to(dtype=message.dtype)
+                message[:, global_recv] = projected
 
     return message.to(dtype=out_dtype)
 
