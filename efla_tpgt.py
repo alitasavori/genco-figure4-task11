@@ -8,6 +8,7 @@ attention matrices on the training/inference path.
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import numpy as np
@@ -417,6 +418,13 @@ class PairValueFactor(nn.Module):
         return torch.tanh(projected)
 
 
+def _amp_off(device: torch.device):
+    """Disable CUDA autocast so EFLA stays float32 (avoids Half/Float index_put mismatches)."""
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", enabled=False)
+    return nullcontext()
+
+
 def dense_efla_messages(
     hidden: torch.Tensor,
     elec_a: torch.Tensor,
@@ -442,15 +450,88 @@ def dense_efla_messages(
     eps: float = ATTENTION_EPS,
 ) -> torch.Tensor:
     """Explicit dense implementation of Eqs. (12)+(16) for parity tests."""
+    out_dtype = hidden.dtype
     batch, buses, hidden_dim = hidden.shape
     if elec_a.dim() == 2:
         elec_a = elec_a.unsqueeze(0).expand(batch, -1, -1)
     heads = int(w_q.shape[1])
     d_a = int(w_q.shape[2])
     device = hidden.device
-    dtype = hidden.dtype
-    # w_o: (H, hidden_dim, d_a) → message in hidden space
-    message = torch.zeros(batch, buses, hidden_dim, device=device, dtype=dtype)
+    with _amp_off(device):
+        hidden = hidden.to(dtype=torch.float32)
+        elec_a = elec_a.to(dtype=torch.float32)
+        w_q, w_k, w_v, w_o = (t.to(dtype=torch.float32) for t in (w_q, w_k, w_v, w_o))
+        a_q, b_q, a_k, b_k = (t.to(dtype=torch.float32) for t in (a_q, b_q, a_k, b_k))
+        bq_elec, cq_elec, bk_elec, ck_elec = (
+            t.to(dtype=torch.float32) for t in (bq_elec, cq_elec, bk_elec, ck_elec)
+        )
+        m_mu, m_nu, c_v, gamma = (t.to(dtype=torch.float32) for t in (m_mu, m_nu, c_v, gamma))
+        dtype = torch.float32
+        # w_o: (H, hidden_dim, d_a) → message in hidden space
+        message = torch.zeros(batch, buses, hidden_dim, device=device, dtype=dtype)
+        message = _dense_efla_messages_core(
+            hidden,
+            elec_a,
+            types,
+            component,
+            message,
+            w_q=w_q,
+            w_k=w_k,
+            w_v=w_v,
+            w_o=w_o,
+            a_q=a_q,
+            b_q=b_q,
+            a_k=a_k,
+            b_k=b_k,
+            bq_elec=bq_elec,
+            cq_elec=cq_elec,
+            bk_elec=bk_elec,
+            ck_elec=ck_elec,
+            m_mu=m_mu,
+            m_nu=m_nu,
+            c_v=c_v,
+            gamma=gamma,
+            eps=eps,
+            batch=batch,
+            heads=heads,
+            d_a=d_a,
+            device=device,
+            dtype=dtype,
+        )
+    return message.to(dtype=out_dtype)
+
+
+def _dense_efla_messages_core(
+    hidden: torch.Tensor,
+    elec_a: torch.Tensor,
+    types: torch.Tensor,
+    component: torch.Tensor,
+    message: torch.Tensor,
+    *,
+    w_q: torch.Tensor,
+    w_k: torch.Tensor,
+    w_v: torch.Tensor,
+    w_o: torch.Tensor,
+    a_q: torch.Tensor,
+    b_q: torch.Tensor,
+    a_k: torch.Tensor,
+    b_k: torch.Tensor,
+    bq_elec: torch.Tensor,
+    cq_elec: torch.Tensor,
+    bk_elec: torch.Tensor,
+    ck_elec: torch.Tensor,
+    m_mu: torch.Tensor,
+    m_nu: torch.Tensor,
+    c_v: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float,
+    batch: int,
+    heads: int,
+    d_a: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    buses = int(hidden.shape[1])
     same = component.view(1, buses) == component.view(buses, 1)
     for recv_t in range(NUM_REAL_TYPES):
         receivers = torch.nonzero(types == recv_t, as_tuple=False).view(-1)
@@ -544,125 +625,133 @@ def factorized_efla_messages(
     eps: float = ATTENTION_EPS,
 ) -> torch.Tensor:
     """Linear-complexity aggregation of Eqs. (17)–(22)."""
+    out_dtype = hidden.dtype
     batch, buses, hidden_dim = hidden.shape
     if elec_a.dim() == 2:
         elec_a = elec_a.unsqueeze(0).expand(batch, -1, -1)
     heads = int(w_q.shape[1])
     d_a = int(w_q.shape[2])
     device = hidden.device
-    dtype = hidden.dtype
-    message = torch.zeros(batch, buses, hidden_dim, device=device, dtype=dtype)
 
     if buses == 0:
-        return message
+        return torch.zeros(batch, 0, hidden_dim, device=device, dtype=out_dtype)
 
-    components = component.detach().cpu().numpy().astype(np.int64)
-    n_comp = int(components.max()) + 1 if buses else 0
-
-    for comp in range(n_comp):
-        buses_c = torch.as_tensor(
-            np.flatnonzero(components == comp), device=device, dtype=torch.long
+    with _amp_off(device):
+        hidden = hidden.to(dtype=torch.float32)
+        elec_a = elec_a.to(dtype=torch.float32)
+        w_q, w_k, w_v, w_o = (t.to(dtype=torch.float32) for t in (w_q, w_k, w_v, w_o))
+        a_q, b_q, a_k, b_k = (t.to(dtype=torch.float32) for t in (a_q, b_q, a_k, b_k))
+        bq_elec, cq_elec, bk_elec, ck_elec = (
+            t.to(dtype=torch.float32) for t in (bq_elec, cq_elec, bk_elec, ck_elec)
         )
-        if buses_c.numel() <= 1:
-            # Singleton: zero message (already zeros).
-            continue
-        types_c = types[buses_c]
-        hidden_c = hidden[:, buses_c]
-        elec_c = elec_a[:, buses_c]
+        m_mu, m_nu, c_v, gamma = (t.to(dtype=torch.float32) for t in (m_mu, m_nu, c_v, gamma))
+        dtype = torch.float32
+        message = torch.zeros(batch, buses, hidden_dim, device=device, dtype=dtype)
 
-        # Precompute per type-pair sender maps on this component's nodes.
-        # Index maps: local positions of each type.
-        type_locals = [
-            torch.nonzero(types_c == t, as_tuple=False).view(-1) for t in range(NUM_REAL_TYPES)
-        ]
+        components = component.detach().cpu().numpy().astype(np.int64)
+        n_comp = int(components.max()) + 1 if buses else 0
 
-        for recv_t in range(NUM_REAL_TYPES):
-            recv_local = type_locals[recv_t]
-            if recv_local.numel() == 0:
+        for comp in range(n_comp):
+            buses_c = torch.as_tensor(
+                np.flatnonzero(components == comp), device=device, dtype=torch.long
+            )
+            if buses_c.numel() <= 1:
                 continue
-            numer = torch.zeros(batch, heads, recv_local.numel(), d_a, device=device, dtype=dtype)
-            denom = torch.zeros(batch, heads, recv_local.numel(), device=device, dtype=dtype)
+            types_c = types[buses_c]
+            hidden_c = hidden[:, buses_c]
+            elec_c = elec_a[:, buses_c]
 
-            h_recv = hidden_c[:, recv_local]
-            e_recv = elec_c[:, recv_local]
+            type_locals = [
+                torch.nonzero(types_c == t, as_tuple=False).view(-1) for t in range(NUM_REAL_TYPES)
+            ]
 
-            for send_t in range(NUM_REAL_TYPES):
-                pair_id = recv_t * NUM_REAL_TYPES + send_t
-                send_local = type_locals[send_t]
-                if send_local.numel() == 0:
+            for recv_t in range(NUM_REAL_TYPES):
+                recv_local = type_locals[recv_t]
+                if recv_local.numel() == 0:
                     continue
-                h_send = hidden_c[:, send_local]
-                e_send = elec_c[:, send_local]
+                numer = torch.zeros(batch, heads, recv_local.numel(), d_a, device=device, dtype=dtype)
+                denom = torch.zeros(batch, heads, recv_local.numel(), device=device, dtype=dtype)
 
-                q = torch.einsum("bnd,had->bhna", h_recv, w_q[pair_id])
-                k = torch.einsum("bnd,had->bhna", h_send, w_k[pair_id])
-                v = torch.einsum("bnd,had->bhna", h_send, w_v[pair_id])
+                h_recv = hidden_c[:, recv_local]
+                e_recv = elec_c[:, recv_local]
 
-                f = positive_feature_map(
-                    torch.einsum("bhnd,hod->bhno", q, a_q[pair_id]) + b_q[pair_id].view(1, heads, 1, -1)
+                for send_t in range(NUM_REAL_TYPES):
+                    pair_id = recv_t * NUM_REAL_TYPES + send_t
+                    send_local = type_locals[send_t]
+                    if send_local.numel() == 0:
+                        continue
+                    h_send = hidden_c[:, send_local]
+                    e_send = elec_c[:, send_local]
+
+                    q = torch.einsum("bnd,had->bhna", h_recv, w_q[pair_id])
+                    k = torch.einsum("bnd,had->bhna", h_send, w_k[pair_id])
+                    v = torch.einsum("bnd,had->bhna", h_send, w_v[pair_id])
+
+                    f = positive_feature_map(
+                        torch.einsum("bhnd,hod->bhno", q, a_q[pair_id])
+                        + b_q[pair_id].view(1, heads, 1, -1)
+                    )
+                    g = positive_feature_map(
+                        torch.einsum("bhnd,hod->bhno", k, a_k[pair_id])
+                        + b_k[pair_id].view(1, heads, 1, -1)
+                    )
+                    u = positive_feature_map(
+                        torch.einsum("bnd,hod->bhno", e_recv, bq_elec[pair_id])
+                        + cq_elec[pair_id].view(1, heads, 1, -1)
+                    )
+                    z = positive_feature_map(
+                        torch.einsum("bnd,hod->bhno", e_send, bk_elec[pair_id])
+                        + ck_elec[pair_id].view(1, heads, 1, -1)
+                    )
+                    F = kronecker_features(f, u)
+                    G = kronecker_features(g, z)
+
+                    joint_r = torch.cat((h_recv, e_recv), dim=-1)
+                    joint_s = torch.cat((h_send, e_send), dim=-1)
+                    mu = torch.tanh(torch.einsum("bnd,hrd->bhnr", joint_r, m_mu[pair_id]))
+                    nu = torch.tanh(torch.einsum("bnd,hrd->bhnr", joint_s, m_nu[pair_id]))
+
+                    S = torch.einsum("bhjf,bhjd->bhfd", G, v)
+                    z_sum = G.sum(dim=2)
+                    T = torch.einsum("bhjf,bhjr->bhfr", G, nu)
+
+                    base = torch.einsum("bhif,bhfd->bhid", F, S)
+                    ft = torch.einsum("bhif,bhfr->bhir", F, T)
+                    corr = torch.einsum("bhir,hrd->bhid", ft * mu, c_v[pair_id]) * gamma[pair_id].view(
+                        1, heads, 1, 1
+                    )
+                    numer = numer + base + corr
+                    denom = denom + torch.einsum("bhif,bhf->bhi", F, z_sum)
+
+                    if recv_t == send_t:
+                        send_pos = {int(s): i for i, s in enumerate(send_local.tolist())}
+                        for li, rloc in enumerate(recv_local.tolist()):
+                            sj = send_pos.get(int(rloc))
+                            if sj is None:
+                                continue
+                            Fi = F[:, :, li, :]
+                            Gj = G[:, :, sj, :]
+                            w_ii = torch.einsum("bhf,bhf->bh", Fi, Gj)
+                            v_i = v[:, :, sj, :]
+                            mu_i = mu[:, :, li, :]
+                            nu_i = nu[:, :, sj, :]
+                            delta_i = torch.einsum(
+                                "bhr,hrd->bhd", mu_i * nu_i, c_v[pair_id]
+                            ) * gamma[pair_id].view(1, heads, 1)
+                            numer[:, :, li, :] = numer[:, :, li, :] - w_ii.unsqueeze(-1) * (
+                                v_i + delta_i
+                            )
+                            denom[:, :, li] = denom[:, :, li] - w_ii
+
+                safe = denom.clamp_min(eps)
+                head_msg = numer / safe.unsqueeze(-1)
+                head_msg = torch.where(
+                    denom.unsqueeze(-1) > eps, head_msg, torch.zeros_like(head_msg)
                 )
-                g = positive_feature_map(
-                    torch.einsum("bhnd,hod->bhno", k, a_k[pair_id]) + b_k[pair_id].view(1, heads, 1, -1)
-                )
-                u = positive_feature_map(
-                    torch.einsum("bnd,hod->bhno", e_recv, bq_elec[pair_id])
-                    + cq_elec[pair_id].view(1, heads, 1, -1)
-                )
-                z = positive_feature_map(
-                    torch.einsum("bnd,hod->bhno", e_send, bk_elec[pair_id])
-                    + ck_elec[pair_id].view(1, heads, 1, -1)
-                )
-                F = kronecker_features(f, u)  # (B,H,Nr,feat)
-                G = kronecker_features(g, z)  # (B,H,Ns,feat)
+                global_recv = buses_c[recv_local]
+                message[:, global_recv] = torch.einsum("bhna,hda->bnd", head_msg, w_o)
 
-                joint_r = torch.cat((h_recv, e_recv), dim=-1)
-                joint_s = torch.cat((h_send, e_send), dim=-1)
-                mu = torch.tanh(torch.einsum("bnd,hrd->bhnr", joint_r, m_mu[pair_id]))
-                nu = torch.tanh(torch.einsum("bnd,hrd->bhnr", joint_s, m_nu[pair_id]))
-
-                # S: (B,H,feat,d_a) = sum_j G_j v_j^T
-                S = torch.einsum("bhjf,bhjd->bhfd", G, v)
-                z_sum = G.sum(dim=2)  # (B,H,feat)
-                T = torch.einsum("bhjf,bhjr->bhfr", G, nu)  # (B,H,feat,R)
-
-                # (F^T S): (B,H,Nr,d_a)
-                base = torch.einsum("bhif,bhfd->bhid", F, S)
-                # (F^T T): (B,H,Nr,R) then ⊙ mu → (B,H,Nr,R)
-                ft = torch.einsum("bhif,bhfr->bhir", F, T)
-                corr = torch.einsum("bhir,hrd->bhid", ft * mu, c_v[pair_id]) * gamma[pair_id].view(
-                    1, heads, 1, 1
-                )
-                numer = numer + base + corr
-                denom = denom + torch.einsum("bhif,bhf->bhi", F, z_sum)
-
-                # Self-exclusion for same-type relation.
-                if recv_t == send_t:
-                    # For each receiver that is also a sender of this type, subtract own term.
-                    # Map local recv index -> position in send_local
-                    send_pos = {int(s): i for i, s in enumerate(send_local.tolist())}
-                    for li, rloc in enumerate(recv_local.tolist()):
-                        sj = send_pos.get(int(rloc))
-                        if sj is None:
-                            continue
-                        Fi = F[:, :, li, :]  # (B,H,feat)
-                        Gj = G[:, :, sj, :]
-                        w_ii = torch.einsum("bhf,bhf->bh", Fi, Gj)
-                        v_i = v[:, :, sj, :]
-                        mu_i = mu[:, :, li, :]
-                        nu_i = nu[:, :, sj, :]
-                        delta_i = torch.einsum("bhr,hrd->bhd", mu_i * nu_i, c_v[pair_id]) * gamma[
-                            pair_id
-                        ].view(1, heads, 1)
-                        numer[:, :, li, :] = numer[:, :, li, :] - w_ii.unsqueeze(-1) * (v_i + delta_i)
-                        denom[:, :, li] = denom[:, :, li] - w_ii
-
-            safe = denom.clamp_min(eps)
-            head_msg = numer / safe.unsqueeze(-1)
-            head_msg = torch.where(denom.unsqueeze(-1) > eps, head_msg, torch.zeros_like(head_msg))
-            global_recv = buses_c[recv_local]
-            message[:, global_recv] = torch.einsum("bhna,hda->bnd", head_msg, w_o)
-
-    return message
+    return message.to(dtype=out_dtype)
 
 
 class ElectricalFactorizedAttention(nn.Module):
