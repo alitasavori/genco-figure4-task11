@@ -45,7 +45,9 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
   ``r_ij`` (no pair encoder); ``v11`` uses Park et al. GRPE (shared hop/edge
   ``P/E`` in score and values); ``v11e`` adds stage ``U_Q/U_K/U_V`` on Zeff ``r_ij``;
   ``v12`` keeps the v10 MLP on an Exphormer phys∪expander∪virtual graph (15 pairs;
-  dense ``-inf`` mask default; sparse via ``GENCO_TPGT_EXPHORMER_DENSE=0``).
+  dense ``-inf`` mask default; sparse via ``GENCO_TPGT_EXPHORMER_DENSE=0``);
+  ``v13`` uses electrically factorized linear attention (landmark complex-Laplacian
+  ``a_i``, no dense Zeff / attention matrix on the training path).
   Q/K/V are type-pair-specific:
   ``q_{i|t_j}^{(ℓ,h)}=W_Q^{(ℓ,h,t_i←t_j)} h_i^{(ℓ-1)}``,
   ``k_{j|t_i}^{(ℓ,h)}=W_K^{(ℓ,h,t_i←t_j)} h_j^{(ℓ-1)}``.
@@ -169,6 +171,7 @@ write_task31_table = getattr(plot_task1_1_module, "write_task31_table", None)
 display_task31_table = getattr(plot_task1_1_module, "display_task31_table", None)
 from storage import ROOT, in_colab, mount_drive
 import exphormer_tpgt as exph
+import efla_tpgt as efla
 
 # Implementation choices, not values from the draft.
 D = 48
@@ -200,7 +203,7 @@ LAMBDA_PHYS = 0.5
 PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
-CACHE_VERSION = "tpgt-cache-12"
+CACHE_VERSION = "tpgt-cache-13"
 RPE_FEATURE_NAMES = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_DIM = len(RPE_FEATURE_NAMES)
 # Per optimizer step, each RPE channel is zeroed (whole 118x118 plane, no rescaling) with this
@@ -228,9 +231,10 @@ USE_NODE_SHUNT = False
 # ``grpe``: Park et al. GRPE — shared hop/edge embeddings in score and values (v11).
 # ``grpe_elec``: GRPE + stage-specific Zeff bilinear U_Q/U_K/U_V (v11e).
 # ``exphormer``: v10 joint MLP on Exphormer phys∪expander∪virtual sparse graph (v12).
+# ``efla``: electrically factorized linear attention (v13; landmark Laplacian a_i, no dense Zeff).
 ATTENTION_KIND = "grit"
 # Attention kinds that use Identity pair encoder (raw RPE still stored on Network for Zeff / elec).
-RAW_RPE_ATTENTION_KINDS = frozenset({"joint_mlp", "grpe", "grpe_elec", "exphormer"})
+RAW_RPE_ATTENTION_KINDS = frozenset({"joint_mlp", "grpe", "grpe_elec", "exphormer", "efla"})
 GRPE_ATTENTION_KINDS = frozenset({"grpe", "grpe_elec"})
 # Shortest-path hop bins: 0..GRPE_MAX_HOP plus one overflow bin (hop > max or unreachable).
 GRPE_MAX_HOP = 8
@@ -243,6 +247,12 @@ GRPE_NUM_EDGE_TYPES = 3
 EXPHORMER_D_EXP = 4
 EXPHORMER_DENSE = True
 EXPHORMER_NUM_PAIRS = 15
+# EFLA (v13): landmark complex-Laplacian factors + factorized type-pair attention.
+EFLA_LANDMARKS = efla.DEFAULT_LANDMARKS
+EFLA_NODE_KERNEL = efla.DEFAULT_NODE_KERNEL
+EFLA_ELEC_KERNEL = efla.DEFAULT_ELEC_KERNEL
+EFLA_VALUE_RANK = efla.DEFAULT_VALUE_RANK
+EFLA_ELEC_DIM = efla.elec_feature_dim(EFLA_LANDMARKS)
 
 
 def grpe_num_hop_bins(max_hop: int | None = None) -> int:
@@ -353,6 +363,18 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "USE_NODE_SHUNT": True,
         "ATTENTION_KIND": "exphormer",
         "ATTENTION_MLP_HIDDENS": (128, 64),
+    },
+    # v9 capacity + electrically factorized linear attention (landmark Laplacian a_i).
+    "v13": {
+        "D": 96,
+        "D_E": 48,  # unused by attention; pair_encoder is Identity (stub RPE).
+        "D_A": 48,
+        "HEADS": 4,
+        "DEPTH": 8,
+        "RUN_TAG": "v13",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h4-pqvt-busBS-efla-v13",
+        "USE_NODE_SHUNT": True,
+        "ATTENTION_KIND": "efla",
     },
 }
 # Fixed training subset scored with val's PBL metric each validation pass (overfitting check).
@@ -891,6 +913,7 @@ class CorrectionStage(nn.Module):
     * ``grpe`` (v11): Park GRPE with shared hop/edge embeddings in score and values.
     * ``grpe_elec`` (v11e): GRPE plus stage-specific Zeff bilinear ``U_Q/U_K/U_V``.
     * ``exphormer`` (v12): 15 type-pairs on phys∪expander∪virtual graph (v10 MLP scores).
+    * ``efla`` (v13): electrically factorized linear attention on landmark Laplacian ``a_i``.
     """
 
     def __init__(self) -> None:
@@ -906,6 +929,7 @@ class CorrectionStage(nn.Module):
         grit_params: list[nn.Parameter] = []
         mlp_params: list[nn.Parameter] = []
         grpe_params: list[nn.Parameter] = []
+        efla_params: list[nn.Parameter] = []
         # Defaults: absent unless the active attention kind needs them.
         self.score_w1 = self.score_b1 = self.score_w2 = self.score_b2 = None
         self.score_w3 = self.score_b3 = None
@@ -914,6 +938,9 @@ class CorrectionStage(nn.Module):
         self.edge_bias = None
         self.update_virt = None
         self.norm_virt = None
+        self.a_q = self.b_q = self.a_k = self.b_k = None
+        self.bq_elec = self.cq_elec = self.bk_elec = self.ck_elec = None
+        self.m_mu = self.m_nu = self.c_v = self.gamma = None
         if self.attention_kind in ("joint_mlp", "exphormer"):
             h1, h2 = (int(ATTENTION_MLP_HIDDENS[0]), int(ATTENTION_MLP_HIDDENS[1]))
             # Raw RPE channels (Zeff Re/Im), not pair_encoder(D_E) embeddings.
@@ -939,13 +966,45 @@ class CorrectionStage(nn.Module):
             self.u_k = nn.Parameter(torch.empty(*shape, D_A, RPE_DIM))
             self.u_v = nn.Parameter(torch.empty(*shape, D_A, RPE_DIM))
             grpe_params = [self.u_q, self.u_k, self.u_v]
+        elif self.attention_kind == "efla":
+            self.a_q = nn.Parameter(torch.empty(*shape, EFLA_NODE_KERNEL, D_A))
+            self.b_q = nn.Parameter(torch.zeros(*shape, EFLA_NODE_KERNEL))
+            self.a_k = nn.Parameter(torch.empty(*shape, EFLA_NODE_KERNEL, D_A))
+            self.b_k = nn.Parameter(torch.zeros(*shape, EFLA_NODE_KERNEL))
+            self.bq_elec = nn.Parameter(torch.empty(*shape, EFLA_ELEC_KERNEL, EFLA_ELEC_DIM))
+            self.cq_elec = nn.Parameter(torch.zeros(*shape, EFLA_ELEC_KERNEL))
+            self.bk_elec = nn.Parameter(torch.empty(*shape, EFLA_ELEC_KERNEL, EFLA_ELEC_DIM))
+            self.ck_elec = nn.Parameter(torch.zeros(*shape, EFLA_ELEC_KERNEL))
+            pair_in = D + EFLA_ELEC_DIM
+            self.m_mu = nn.Parameter(torch.empty(*shape, EFLA_VALUE_RANK, pair_in))
+            self.m_nu = nn.Parameter(torch.empty(*shape, EFLA_VALUE_RANK, pair_in))
+            self.c_v = nn.Parameter(torch.empty(*shape, EFLA_VALUE_RANK, D_A))
+            self.gamma = nn.Parameter(torch.full(shape, efla.GAMMA_INIT))
+            efla_params = [
+                self.a_q,
+                self.a_k,
+                self.bq_elec,
+                self.bk_elec,
+                self.m_mu,
+                self.m_nu,
+                self.c_v,
+            ]
         else:
             self.w_ew = nn.Parameter(torch.empty(*shape, D_A, D_E))
             self.w_eb = nn.Parameter(torch.empty(*shape, D_A, D_E))
             self.w_a = nn.Parameter(torch.empty(*shape, 1, D_A))
             self.w_ev = nn.Parameter(torch.empty(*shape, D_A, D_A))
             grit_params = [self.w_ew, self.w_eb, self.w_a, self.w_ev]
-        for parameter in (self.w_q, self.w_k, self.w_v, self.w_o, *grit_params, *mlp_params, *grpe_params):
+        for parameter in (
+            self.w_q,
+            self.w_k,
+            self.w_v,
+            self.w_o,
+            *grit_params,
+            *mlp_params,
+            *grpe_params,
+            *efla_params,
+        ):
             _init_matrices(parameter)
         self.update = nn.ModuleList(MLP(D + D + 2, D) for _ in range(3))
         self.decode = nn.ModuleList(MLP(D, 2) for _ in range(3))
@@ -970,6 +1029,9 @@ class CorrectionStage(nn.Module):
         exph_edge_tau: torch.Tensor | None = None,
         exph_pair_id: torch.Tensor | None = None,
         use_dense_exph: bool = True,
+        elec_a: torch.Tensor | None = None,
+        component: torch.Tensor | None = None,
+        types_efla: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         residual_in = nodal_residual(specified, unknown, layout, ybus)
         z_next: torch.Tensor | None = None
@@ -990,6 +1052,13 @@ class CorrectionStage(nn.Module):
                 exph_pair_id=exph_pair_id,
                 use_dense=use_dense_exph,
             )
+        elif self.attention_kind == "efla":
+            if elec_a is None or component is None:
+                raise ValueError("efla stage requires elec_a and component")
+            types_use = types_efla if types_efla is not None else (types if types is not None else layout.types)
+            if types_use.dim() != 1:
+                types_use = types_use[0]
+            message = self._messages_efla(hidden, elec_a, types_use, component)
         else:
             message = self._messages(hidden, pair, layout.blocks, grpe=grpe)
         updated = torch.zeros_like(hidden)
@@ -1081,6 +1150,38 @@ class CorrectionStage(nn.Module):
         z_next = self.norm_virt(z_virt + self.update_virt(torch.cat((z_virt, msg_v), dim=-1)))
         return msg_r, z_next
 
+    def _messages_efla(
+        self,
+        hidden: torch.Tensor,
+        elec_a: torch.Tensor,
+        types: torch.Tensor,
+        component: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.a_q is not None and self.bq_elec is not None and self.m_mu is not None
+        if elec_a.dim() == 2:
+            elec_a = elec_a.unsqueeze(0).expand(hidden.shape[0], -1, -1)
+        return efla.factorized_efla_messages(
+            hidden,
+            elec_a,
+            types,
+            component,
+            w_q=self.w_q,
+            w_k=self.w_k,
+            w_v=self.w_v,
+            w_o=self.w_o,
+            a_q=self.a_q,
+            b_q=self.b_q,
+            a_k=self.a_k,
+            b_k=self.b_k,
+            bq_elec=self.bq_elec,
+            cq_elec=self.cq_elec,
+            bk_elec=self.bk_elec,
+            ck_elec=self.ck_elec,
+            m_mu=self.m_mu,
+            m_nu=self.m_nu,
+            c_v=self.c_v,
+            gamma=self.gamma,
+        )
 
     def _messages(
         self,
@@ -1444,6 +1545,8 @@ class TPGT(nn.Module):
         exph_send: torch.Tensor | None = None,
         exph_edge_tau: torch.Tensor | None = None,
         exph_pair_id: torch.Tensor | None = None,
+        elec_a: torch.Tensor | None = None,
+        component: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """``types`` (N,) with ``pair_type_masks`` (9, N, N), or per case (B, N) with (B, 9, N, N).
 
@@ -1451,6 +1554,7 @@ class TPGT(nn.Module):
         ``shunt_b`` is bus-shunt ``BS`` (N,) or (B, N); required for v9 node features.
         ``hop_id`` / ``edge_id`` (or precomputed ``grpe``) required for ``grpe`` / ``grpe_elec``.
         Exphormer needs ``exph_allow`` / ``exph_tau`` / ``exph_n_virt``.
+        EFLA needs ``elec_a`` and ``component``.
         """
         if pair is None:
             pair = self.encode_pairs(rpe)
@@ -1465,7 +1569,7 @@ class TPGT(nn.Module):
         # Exphormer attention is float32-only; keep activations in float32 even if AMP is on.
         act_dtype = (
             torch.float32
-            if self.attention_kind == "exphormer"
+            if self.attention_kind in ("exphormer", "efla")
             else autocast_activation_dtype(specified)
         )
         hidden = torch.zeros(
@@ -1496,6 +1600,10 @@ class TPGT(nn.Module):
             ).clone()
         residuals = []
         shared_types = types if types.dim() == 1 else layout.types[0]
+        if self.attention_kind == "efla":
+            if elec_a is None or component is None:
+                raise ValueError("efla attention requires elec_a and component")
+            elec_a = elec_a.to(dtype=act_dtype)
         for stage in self.stages:
             if self.attention_kind == "exphormer":
                 hidden, unknown, residual, z_virt = stage(
@@ -1515,6 +1623,19 @@ class TPGT(nn.Module):
                     exph_edge_tau=exph_edge_tau,
                     exph_pair_id=exph_pair_id,
                     use_dense_exph=self.use_dense_exph,
+                )
+            elif self.attention_kind == "efla":
+                hidden, unknown, residual = stage(
+                    hidden,
+                    unknown,
+                    specified,
+                    pair,
+                    layout,
+                    ybus,
+                    types=shared_types,
+                    elec_a=elec_a,
+                    component=component,
+                    types_efla=shared_types,
                 )
             else:
                 hidden, unknown, residual = stage(
@@ -1843,6 +1964,7 @@ def eval_batch_with_pair(
             hop_id=hop_id,
             edge_id=edge_id,
             **exphormer_forward_kwargs(network),
+            **efla_forward_kwargs(network),
         )
         breakdown = task_loss(prediction, target, residuals, network.types)
         final_pbl = pbl_stats(residuals[-1])
@@ -2331,6 +2453,7 @@ def collect_forward_diagnostics(
             hop_id=hop_id,
             edge_id=edge_id,
             **exphormer_forward_kwargs(network),
+            **efla_forward_kwargs(network),
         )
         breakdown = task_loss(prediction, target, residuals, types)
         stage_pbl = [pbl_stats(r) for r in residuals]
@@ -2571,6 +2694,7 @@ def audit_residual_correctness(
             hop_id=hop_id,
             edge_id=edge_id,
             **exphormer_forward_kwargs(network),
+            **efla_forward_kwargs(network),
         )
         recomputed = nodal_residual(specified, prediction, types, ybus)
         scale = float(residuals[-1].abs().max().clamp(min=1.0))
@@ -2909,6 +3033,9 @@ class Network:
     exph_send: torch.Tensor | None = field(default=None, repr=False)
     exph_edge_tau: torch.Tensor | None = field(default=None, repr=False)
     exph_pair_id: torch.Tensor | None = field(default=None, repr=False)
+    # EFLA (v13): landmark complex-Laplacian node embedding a_i (N, EFLA_ELEC_DIM).
+    elec_a: torch.Tensor | None = field(default=None, repr=False)
+    elec_c_scale: float | None = field(default=None, repr=False)
     type_key: bytes | None = field(default=None, repr=False, compare=False)
     layout: TypeLayout | None = field(default=None, repr=False, compare=False)
 
@@ -3203,6 +3330,57 @@ def exphormer_forward_kwargs(network: Network) -> dict:
     }
 
 
+def attach_efla_electrical(
+    network: Network,
+    *,
+    s_r: float | None = None,
+    s_x: float | None = None,
+    s_c: float | None = None,
+    num_landmarks: int | None = None,
+) -> Network:
+    """Attach landmark electrical embeddings; stub zero RPE (attention does not use it)."""
+    if network.branches is None:
+        raise ValueError("EFLA requires network.branches")
+    bus_count = int(network.types.numel())
+    factors = efla.compute_electrical_factors(
+        bus_count,
+        list(network.branches),
+        num_landmarks=EFLA_LANDMARKS if num_landmarks is None else int(num_landmarks),
+        s_r=s_r if s_r is not None else getattr(network, "rpe_re_scale", None),
+        s_x=s_x if s_x is not None else getattr(network, "rpe_im_scale", None),
+        s_c=s_c if s_c is not None else getattr(network, "elec_c_scale", None),
+    )
+    network.elec_a = torch.from_numpy(factors.elec_a)
+    network.component = torch.from_numpy(factors.component.astype(np.int64))
+    network.rpe = torch.zeros(bus_count, bus_count, RPE_DIM, dtype=torch.float32)
+    network.rpe_re_scale = float(factors.s_r)
+    network.rpe_im_scale = float(factors.s_x)
+    network.elec_c_scale = float(factors.s_c)
+    network.pair_embed = None
+    network.pair_type_masks = None
+    network.layout = None
+    network.type_key = None
+    return network
+
+
+def ensure_network_efla(network: Network) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(elec_a, component)``, building embeddings if missing."""
+    elec_a = getattr(network, "elec_a", None)
+    if elec_a is None:
+        attach_efla_electrical(network)
+        elec_a = network.elec_a
+    assert elec_a is not None
+    return elec_a, network.component
+
+
+def efla_forward_kwargs(network: Network) -> dict:
+    """Keyword args for ``TPGT.forward`` when ``ATTENTION_KIND==efla``; else empty."""
+    if ATTENTION_KIND != "efla":
+        return {}
+    elec_a, component = ensure_network_efla(network)
+    return {"elec_a": elec_a, "component": component}
+
+
 def meshed_rpe(
     bus_count: int,
     branches: list[tuple[int, int, float, float]],
@@ -3455,7 +3633,35 @@ def unify_network_rpe(
     networks: list[Network],
     rpe_scales: tuple[float, float] | None = None,
 ) -> tuple[float, float]:
-    """Recompute ``rpe`` on each network with shared ``s_R``, ``s_X`` (train scales or fit from ``networks``)."""
+    """Recompute ``rpe`` on each network with shared ``s_R``, ``s_X`` (train scales or fit from ``networks``).
+
+    For ``efla``, builds landmark electrical embeddings and a stub zero ``rpe``.
+    """
+    if ATTENTION_KIND == "efla":
+        if rpe_scales is not None:
+            global_re, global_im = rpe_scales
+            global_c = 1.0
+            for network in networks:
+                scale = getattr(network, "elec_c_scale", None)
+                if scale is not None:
+                    global_c = max(global_c, float(scale))
+        else:
+            if not any(network.branches for network in networks):
+                print("  unify_network_rpe: no branches; using s_R=s_X=s_C=1.0", flush=True)
+                return 1.0, 1.0
+            bus_count = int(networks[0].types.numel())
+            branch_lists = [list(n.branches) for n in networks if n.branches]
+            global_re, global_im, global_c = efla.fit_electrical_scales_from_branch_lists(
+                branch_lists, bus_count, num_landmarks=EFLA_LANDMARKS
+            )
+        for network in networks:
+            if network.branches is None:
+                continue
+            attach_efla_electrical(
+                network, s_r=global_re, s_x=global_im, s_c=global_c, num_landmarks=EFLA_LANDMARKS
+            )
+        return global_re, global_im
+
     if rpe_scales is not None:
         global_re, global_im = rpe_scales
     else:
@@ -3503,11 +3709,44 @@ class CorrectnessCheck:
 
 def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> list[CorrectnessCheck]:
     """Structural checks plus optional full recompute from stored Ybus and in-service branches."""
+    if ATTENTION_KIND == "efla":
+        elec_a = getattr(network, "elec_a", None)
+        checks: list[CorrectnessCheck] = []
+        if elec_a is None:
+            checks.append(CorrectnessCheck("efla_elec_a", False, "missing elec_a on Network"))
+            return checks
+        arr = elec_a.detach().cpu().numpy()
+        bus_count = int(network.types.numel())
+        ok_shape = arr.shape == (bus_count, EFLA_ELEC_DIM)
+        checks.append(
+            CorrectnessCheck(
+                "efla_elec_a_shape",
+                ok_shape,
+                str(tuple(arr.shape)) if ok_shape else f"expected ({bus_count}, {EFLA_ELEC_DIM})",
+            )
+        )
+        finite = bool(np.isfinite(arr).all())
+        checks.append(
+            CorrectnessCheck(
+                "efla_elec_a_finite",
+                finite,
+                "all channels finite" if finite else "non-finite values in elec_a",
+            )
+        )
+        checks.append(
+            CorrectnessCheck(
+                "efla_stub_rpe",
+                True,
+                "dense Zeff RPE is a zero stub under efla (attention uses elec_a)",
+            )
+        )
+        return checks
+
     rpe = network.rpe.detach().cpu().numpy().astype(np.float32, copy=False)
     ybus = network.ybus.detach().cpu().numpy()
     component = network.component.detach().cpu().numpy().astype(np.int64)
     bus_count = rpe.shape[0]
-    checks: list[CorrectnessCheck] = []
+    checks = []
 
     if rpe.shape != (bus_count, bus_count, RPE_DIM):
         checks.append(
@@ -3764,10 +4003,10 @@ def apply_architecture_config() -> str:
         EXPHORMER_D_EXP = int(d_exp_env)
     else:
         EXPHORMER_D_EXP = 4
-    if ATTENTION_KIND not in ("grit", "joint_mlp", "grpe", "grpe_elec", "exphormer"):
+    if ATTENTION_KIND not in ("grit", "joint_mlp", "grpe", "grpe_elec", "exphormer", "efla"):
         raise ValueError(
             f"unknown ATTENTION_KIND {ATTENTION_KIND!r}; "
-            "use grit, joint_mlp, grpe, grpe_elec, or exphormer"
+            "use grit, joint_mlp, grpe, grpe_elec, exphormer, or efla"
         )
     if GRPE_MAX_HOP < 0:
         raise ValueError(f"GRPE_MAX_HOP must be >= 0, got {GRPE_MAX_HOP}")
@@ -3807,6 +4046,11 @@ def architecture_summary() -> str:
         attn_txt = (
             f"exphormer({kernel}, d_exp={EXPHORMER_D_EXP}, pairs=15, "
             f"mlp {score_in}->{h1}->{h2}->1)"
+        )
+    elif ATTENTION_KIND == "efla":
+        attn_txt = (
+            f"efla(landmarks={EFLA_LANDMARKS}, node_k={EFLA_NODE_KERNEL}, "
+            f"elec_k={EFLA_ELEC_KERNEL}, rank={EFLA_VALUE_RANK}, elec_dim={EFLA_ELEC_DIM})"
         )
     else:
         attn_txt = "grit"
@@ -5124,6 +5368,17 @@ def move_to(network: Network, device: torch.device) -> Network:
             exph_edge_tau=_maybe(getattr(network, "exph_edge_tau", None)),
             exph_pair_id=_maybe(getattr(network, "exph_pair_id", None)),
         )
+    if ATTENTION_KIND == "efla":
+        elec_a, _comp = ensure_network_efla(network)
+        elec_kw = dict(
+            elec_a=host_to_device(elec_a, device).to(dtype=torch.float32),
+            elec_c_scale=getattr(network, "elec_c_scale", None),
+        )
+    else:
+        elec_kw = dict(
+            elec_a=_maybe(getattr(network, "elec_a", None)),
+            elec_c_scale=getattr(network, "elec_c_scale", None),
+        )
 
     return Network(
         ybus=host_to_device(network.ybus, device),
@@ -5141,6 +5396,7 @@ def move_to(network: Network, device: torch.device) -> Network:
         hop_id=host_to_device(hop_id, device),
         edge_id=host_to_device(edge_id, device),
         **exph_kw,
+        **elec_kw,
         type_key=network_type_key(network),
         layout=shared_layout(types, masks, types_np=network.types.detach().cpu().numpy()),
     )
@@ -5282,6 +5538,7 @@ def forward_cases(
         hop_id=hop_id,
         edge_id=edge_id,
         **exphormer_forward_kwargs(network),
+        **efla_forward_kwargs(network),
     )
     return prediction, target, residuals
 
@@ -5429,8 +5686,8 @@ class PassBatch:
         chunk = self.cases[start:stop]
         if self.kind == "single":
             return run_batch_residuals(model, split, self.networks[0], chunk, device, pair=pair)
-        # Exphormer allow/tau are topology-specific and not yet batched; run one network at a time.
-        if ATTENTION_KIND == "exphormer":
+        # Exphormer allow/tau and EFLA elec_a are topology-specific; run one network at a time.
+        if ATTENTION_KIND in ("exphormer", "efla"):
             owners = self.owner[start:stop]
             parts: list[tuple[TaskLossBreakdown, float]] = []
             residuals: list[torch.Tensor] = []
