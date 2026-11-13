@@ -47,7 +47,9 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
   ``v12`` keeps the v10 MLP on an Exphormer phys∪expander∪virtual graph (15 pairs;
   dense ``-inf`` mask default; sparse via ``GENCO_TPGT_EXPHORMER_DENSE=0``);
   ``v13`` uses electrically factorized linear attention (landmark complex-Laplacian
-  ``a_i``, no dense Zeff / attention matrix on the training path).
+  ``a_i``, no dense Zeff / attention matrix on the training path);
+  ``v14`` uses electrically weighted WIRE (susceptance Laplacian spectral RoPE)
+  with full softmax + connectivity mask.
   Q/K/V are type-pair-specific:
   ``q_{i|t_j}^{(ℓ,h)}=W_Q^{(ℓ,h,t_i←t_j)} h_i^{(ℓ-1)}``,
   ``k_{j|t_i}^{(ℓ,h)}=W_K^{(ℓ,h,t_i←t_j)} h_j^{(ℓ-1)}``.
@@ -172,6 +174,7 @@ display_task31_table = getattr(plot_task1_1_module, "display_task31_table", None
 from storage import ROOT, in_colab, mount_drive
 import exphormer_tpgt as exph
 import efla_tpgt as efla
+import wire_tpgt as wire
 
 # Implementation choices, not values from the draft.
 D = 48
@@ -203,7 +206,7 @@ LAMBDA_PHYS = 0.5
 PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
-CACHE_VERSION = "tpgt-cache-13"
+CACHE_VERSION = "tpgt-cache-14"
 RPE_FEATURE_NAMES = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_DIM = len(RPE_FEATURE_NAMES)
 # Per optimizer step, each RPE channel is zeroed (whole 118x118 plane, no rescaling) with this
@@ -232,12 +235,13 @@ USE_NODE_SHUNT = False
 # ``grpe_elec``: GRPE + stage-specific Zeff bilinear U_Q/U_K/U_V (v11e).
 # ``exphormer``: v10 joint MLP on Exphormer phys∪expander∪virtual sparse graph (v12).
 # ``efla``: electrically factorized linear attention (v13; landmark Laplacian a_i, no dense Zeff).
+# ``wire``: electrically weighted WIRE spectral RoPE + full softmax (v14; no dense Zeff).
 ATTENTION_KIND = "grit"
 # Attention kinds that use Identity pair encoder (raw RPE still stored on Network for Zeff / elec).
-RAW_RPE_ATTENTION_KINDS = frozenset({"joint_mlp", "grpe", "grpe_elec", "exphormer", "efla"})
+RAW_RPE_ATTENTION_KINDS = frozenset({"joint_mlp", "grpe", "grpe_elec", "exphormer", "efla", "wire"})
 GRPE_ATTENTION_KINDS = frozenset({"grpe", "grpe_elec"})
 # Kernels that write float32 activations into buffers incompatible with AMP Half.
-AMP_DISABLED_ATTENTION_KINDS = frozenset({"exphormer", "efla"})
+AMP_DISABLED_ATTENTION_KINDS = frozenset({"exphormer", "efla", "wire"})
 # Shortest-path hop bins: 0..GRPE_MAX_HOP plus one overflow bin (hop > max or unreachable).
 GRPE_MAX_HOP = 8
 GRPE_EDGE_SELF = 0
@@ -255,6 +259,8 @@ EFLA_NODE_KERNEL = efla.DEFAULT_NODE_KERNEL
 EFLA_ELEC_KERNEL = efla.DEFAULT_ELEC_KERNEL
 EFLA_VALUE_RANK = efla.DEFAULT_VALUE_RANK
 EFLA_ELEC_DIM = efla.elec_feature_dim(EFLA_LANDMARKS)
+# WIRE (v14): susceptance-weighted spectral coordinates.
+WIRE_SPECTRAL_DIM = wire.DEFAULT_SPECTRAL_DIM
 
 
 def grpe_num_hop_bins(max_hop: int | None = None) -> int:
@@ -377,6 +383,18 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h4-pqvt-busBS-efla-v13",
         "USE_NODE_SHUNT": True,
         "ATTENTION_KIND": "efla",
+    },
+    # v9 capacity + electrically weighted WIRE (susceptance Laplacian RoPE) + full softmax.
+    "v14": {
+        "D": 96,
+        "D_E": 48,  # unused by attention; pair_encoder is Identity (stub RPE).
+        "D_A": 48,
+        "HEADS": 4,
+        "DEPTH": 8,
+        "RUN_TAG": "v14",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h4-pqvt-busBS-wire-v14",
+        "USE_NODE_SHUNT": True,
+        "ATTENTION_KIND": "wire",
     },
 }
 # Fixed training subset scored with val's PBL metric each validation pass (overfitting check).
@@ -916,6 +934,7 @@ class CorrectionStage(nn.Module):
     * ``grpe_elec`` (v11e): GRPE plus stage-specific Zeff bilinear ``U_Q/U_K/U_V``.
     * ``exphormer`` (v12): 15 type-pairs on phys∪expander∪virtual graph (v10 MLP scores).
     * ``efla`` (v13): electrically factorized linear attention on landmark Laplacian ``a_i``.
+    * ``wire`` (v14): electrically weighted WIRE RoPE + full softmax + connectivity mask.
     """
 
     def __init__(self) -> None:
@@ -932,6 +951,7 @@ class CorrectionStage(nn.Module):
         mlp_params: list[nn.Parameter] = []
         grpe_params: list[nn.Parameter] = []
         efla_params: list[nn.Parameter] = []
+        wire_params: list[nn.Parameter] = []
         # Defaults: absent unless the active attention kind needs them.
         self.score_w1 = self.score_b1 = self.score_w2 = self.score_b2 = None
         self.score_w3 = self.score_b3 = None
@@ -943,6 +963,7 @@ class CorrectionStage(nn.Module):
         self.a_q = self.b_q = self.a_k = self.b_k = None
         self.bq_elec = self.cq_elec = self.bk_elec = self.ck_elec = None
         self.m_mu = self.m_nu = self.c_v = self.gamma = None
+        self.wire_omega = None
         if self.attention_kind in ("joint_mlp", "exphormer"):
             h1, h2 = (int(ATTENTION_MLP_HIDDENS[0]), int(ATTENTION_MLP_HIDDENS[1]))
             # Raw RPE channels (Zeff Re/Im), not pair_encoder(D_E) embeddings.
@@ -991,6 +1012,11 @@ class CorrectionStage(nn.Module):
                 self.m_nu,
                 self.c_v,
             ]
+        elif self.attention_kind == "wire":
+            # Ω shared across nine type pairs within each head: (H, D_A/2, K_s).
+            n_blocks = D_A // 2
+            self.wire_omega = nn.Parameter(torch.empty(HEADS, n_blocks, WIRE_SPECTRAL_DIM))
+            wire_params = [self.wire_omega]
         else:
             self.w_ew = nn.Parameter(torch.empty(*shape, D_A, D_E))
             self.w_eb = nn.Parameter(torch.empty(*shape, D_A, D_E))
@@ -1006,6 +1032,7 @@ class CorrectionStage(nn.Module):
             *mlp_params,
             *grpe_params,
             *efla_params,
+            *wire_params,
         ):
             _init_matrices(parameter)
         self.update = nn.ModuleList(MLP(D + D + 2, D) for _ in range(3))
@@ -1034,6 +1061,7 @@ class CorrectionStage(nn.Module):
         elec_a: torch.Tensor | None = None,
         component: torch.Tensor | None = None,
         types_efla: torch.Tensor | None = None,
+        wire_rho: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         residual_in = nodal_residual(specified, unknown, layout, ybus)
         z_next: torch.Tensor | None = None
@@ -1061,6 +1089,13 @@ class CorrectionStage(nn.Module):
             if types_use.dim() != 1:
                 types_use = types_use[0]
             message = self._messages_efla(hidden, elec_a, types_use, component)
+        elif self.attention_kind == "wire":
+            if wire_rho is None or component is None:
+                raise ValueError("wire stage requires wire_rho and component")
+            types_use = types if types is not None else layout.types
+            if types_use.dim() != 1:
+                types_use = types_use[0]
+            message = self._messages_wire(hidden, wire_rho, types_use, component)
         else:
             message = self._messages(hidden, pair, layout.blocks, grpe=grpe)
         updated = torch.zeros_like(hidden)
@@ -1183,6 +1218,26 @@ class CorrectionStage(nn.Module):
             m_nu=self.m_nu,
             c_v=self.c_v,
             gamma=self.gamma,
+        )
+
+    def _messages_wire(
+        self,
+        hidden: torch.Tensor,
+        wire_rho: torch.Tensor,
+        types: torch.Tensor,
+        component: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.wire_omega is not None
+        return wire.wire_messages(
+            hidden,
+            wire_rho,
+            types,
+            component,
+            w_q=self.w_q,
+            w_k=self.w_k,
+            w_v=self.w_v,
+            w_o=self.w_o,
+            omega=self.wire_omega,
         )
 
     def _messages(
@@ -1549,6 +1604,7 @@ class TPGT(nn.Module):
         exph_pair_id: torch.Tensor | None = None,
         elec_a: torch.Tensor | None = None,
         component: torch.Tensor | None = None,
+        wire_rho: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """``types`` (N,) with ``pair_type_masks`` (9, N, N), or per case (B, N) with (B, 9, N, N).
 
@@ -1557,6 +1613,7 @@ class TPGT(nn.Module):
         ``hop_id`` / ``edge_id`` (or precomputed ``grpe``) required for ``grpe`` / ``grpe_elec``.
         Exphormer needs ``exph_allow`` / ``exph_tau`` / ``exph_n_virt``.
         EFLA needs ``elec_a`` and ``component``.
+        WIRE needs ``wire_rho`` and ``component``.
         """
         if pair is None:
             pair = self.encode_pairs(rpe)
@@ -1568,10 +1625,10 @@ class TPGT(nn.Module):
             if hop_id is None or edge_id is None:
                 raise ValueError("GRPE attention requires hop_id and edge_id (or grpe=...)")
             grpe = self.encode_grpe(hop_id, edge_id)
-        # Exphormer attention is float32-only; keep activations in float32 even if AMP is on.
+        # Exphormer/EFLA/WIRE attention is float32-only; keep activations in float32 even if AMP is on.
         act_dtype = (
             torch.float32
-            if self.attention_kind in ("exphormer", "efla")
+            if self.attention_kind in ("exphormer", "efla", "wire")
             else autocast_activation_dtype(specified)
         )
         hidden = torch.zeros(
@@ -1606,6 +1663,10 @@ class TPGT(nn.Module):
             if elec_a is None or component is None:
                 raise ValueError("efla attention requires elec_a and component")
             elec_a = elec_a.to(dtype=act_dtype)
+        if self.attention_kind == "wire":
+            if wire_rho is None or component is None:
+                raise ValueError("wire attention requires wire_rho and component")
+            wire_rho = wire_rho.to(dtype=act_dtype)
         for stage in self.stages:
             if self.attention_kind == "exphormer":
                 hidden, unknown, residual, z_virt = stage(
@@ -1638,6 +1699,18 @@ class TPGT(nn.Module):
                     elec_a=elec_a,
                     component=component,
                     types_efla=shared_types,
+                )
+            elif self.attention_kind == "wire":
+                hidden, unknown, residual = stage(
+                    hidden,
+                    unknown,
+                    specified,
+                    pair,
+                    layout,
+                    ybus,
+                    types=shared_types,
+                    component=component,
+                    wire_rho=wire_rho,
                 )
             else:
                 hidden, unknown, residual = stage(
@@ -1967,6 +2040,7 @@ def eval_batch_with_pair(
             edge_id=edge_id,
             **exphormer_forward_kwargs(network),
             **efla_forward_kwargs(network),
+            **wire_forward_kwargs(network),
         )
         breakdown = task_loss(prediction, target, residuals, network.types)
         final_pbl = pbl_stats(residuals[-1])
@@ -2456,6 +2530,7 @@ def collect_forward_diagnostics(
             edge_id=edge_id,
             **exphormer_forward_kwargs(network),
             **efla_forward_kwargs(network),
+            **wire_forward_kwargs(network),
         )
         breakdown = task_loss(prediction, target, residuals, types)
         stage_pbl = [pbl_stats(r) for r in residuals]
@@ -2697,6 +2772,7 @@ def audit_residual_correctness(
             edge_id=edge_id,
             **exphormer_forward_kwargs(network),
             **efla_forward_kwargs(network),
+            **wire_forward_kwargs(network),
         )
         recomputed = nodal_residual(specified, prediction, types, ybus)
         scale = float(residuals[-1].abs().max().clamp(min=1.0))
@@ -3038,6 +3114,8 @@ class Network:
     # EFLA (v13): landmark complex-Laplacian node embedding a_i (N, EFLA_ELEC_DIM).
     elec_a: torch.Tensor | None = field(default=None, repr=False)
     elec_c_scale: float | None = field(default=None, repr=False)
+    # WIRE (v14): susceptance-Laplacian spectral coordinates ρ (N, WIRE_SPECTRAL_DIM).
+    wire_rho: torch.Tensor | None = field(default=None, repr=False)
     type_key: bytes | None = field(default=None, repr=False, compare=False)
     layout: TypeLayout | None = field(default=None, repr=False, compare=False)
 
@@ -3383,6 +3461,50 @@ def efla_forward_kwargs(network: Network) -> dict:
     return {"elec_a": elec_a, "component": component}
 
 
+def attach_wire_spectral(
+    network: Network,
+    *,
+    k_s: int | None = None,
+) -> Network:
+    """Attach susceptance-Laplacian WIRE coordinates; stub zero RPE."""
+    if network.branches is None:
+        raise ValueError("WIRE requires network.branches")
+    bus_count = int(network.types.numel())
+    factors = wire.compute_wire_factors(
+        bus_count,
+        list(network.branches),
+        k_s=WIRE_SPECTRAL_DIM if k_s is None else int(k_s),
+    )
+    network.wire_rho = torch.from_numpy(factors.rho)
+    network.component = torch.from_numpy(factors.component.astype(np.int64))
+    network.rpe = torch.zeros(bus_count, bus_count, RPE_DIM, dtype=torch.float32)
+    network.rpe_re_scale = 1.0
+    network.rpe_im_scale = 1.0
+    network.pair_embed = None
+    network.pair_type_masks = None
+    network.layout = None
+    network.type_key = None
+    return network
+
+
+def ensure_network_wire(network: Network) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(wire_rho, component)``, building embeddings if missing."""
+    rho = getattr(network, "wire_rho", None)
+    if rho is None:
+        attach_wire_spectral(network)
+        rho = network.wire_rho
+    assert rho is not None
+    return rho, network.component
+
+
+def wire_forward_kwargs(network: Network) -> dict:
+    """Keyword args for ``TPGT.forward`` when ``ATTENTION_KIND==wire``; else empty."""
+    if ATTENTION_KIND != "wire":
+        return {}
+    rho, component = ensure_network_wire(network)
+    return {"wire_rho": rho, "component": component}
+
+
 def meshed_rpe(
     bus_count: int,
     branches: list[tuple[int, int, float, float]],
@@ -3638,6 +3760,7 @@ def unify_network_rpe(
     """Recompute ``rpe`` on each network with shared ``s_R``, ``s_X`` (train scales or fit from ``networks``).
 
     For ``efla``, builds landmark electrical embeddings and a stub zero ``rpe``.
+    For ``wire``, builds susceptance-Laplacian spectral coordinates and a stub zero ``rpe``.
     """
     if ATTENTION_KIND == "efla":
         if rpe_scales is not None:
@@ -3663,6 +3786,16 @@ def unify_network_rpe(
                 network, s_r=global_re, s_x=global_im, s_c=global_c, num_landmarks=EFLA_LANDMARKS
             )
         return global_re, global_im
+
+    if ATTENTION_KIND == "wire":
+        if not any(network.branches for network in networks):
+            print("  unify_network_rpe: no branches; using stub scales 1.0", flush=True)
+            return 1.0, 1.0
+        for network in networks:
+            if network.branches is None:
+                continue
+            attach_wire_spectral(network, k_s=WIRE_SPECTRAL_DIM)
+        return 1.0, 1.0
 
     if rpe_scales is not None:
         global_re, global_im = rpe_scales
@@ -3740,6 +3873,39 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
                 "efla_stub_rpe",
                 True,
                 "dense Zeff RPE is a zero stub under efla (attention uses elec_a)",
+            )
+        )
+        return checks
+
+    if ATTENTION_KIND == "wire":
+        rho = getattr(network, "wire_rho", None)
+        checks = []
+        if rho is None:
+            checks.append(CorrectnessCheck("wire_rho", False, "missing wire_rho on Network"))
+            return checks
+        arr = rho.detach().cpu().numpy()
+        bus_count = int(network.types.numel())
+        ok_shape = arr.shape == (bus_count, WIRE_SPECTRAL_DIM)
+        checks.append(
+            CorrectnessCheck(
+                "wire_rho_shape",
+                ok_shape,
+                str(tuple(arr.shape)) if ok_shape else f"expected ({bus_count}, {WIRE_SPECTRAL_DIM})",
+            )
+        )
+        finite = bool(np.isfinite(arr).all())
+        checks.append(
+            CorrectnessCheck(
+                "wire_rho_finite",
+                finite,
+                "all channels finite" if finite else "non-finite values in wire_rho",
+            )
+        )
+        checks.append(
+            CorrectnessCheck(
+                "wire_stub_rpe",
+                True,
+                "dense Zeff RPE is a zero stub under wire (attention uses spectral rho)",
             )
         )
         return checks
@@ -4005,10 +4171,10 @@ def apply_architecture_config() -> str:
         EXPHORMER_D_EXP = int(d_exp_env)
     else:
         EXPHORMER_D_EXP = 4
-    if ATTENTION_KIND not in ("grit", "joint_mlp", "grpe", "grpe_elec", "exphormer", "efla"):
+    if ATTENTION_KIND not in ("grit", "joint_mlp", "grpe", "grpe_elec", "exphormer", "efla", "wire"):
         raise ValueError(
             f"unknown ATTENTION_KIND {ATTENTION_KIND!r}; "
-            "use grit, joint_mlp, grpe, grpe_elec, exphormer, or efla"
+            "use grit, joint_mlp, grpe, grpe_elec, exphormer, efla, or wire"
         )
     if GRPE_MAX_HOP < 0:
         raise ValueError(f"GRPE_MAX_HOP must be >= 0, got {GRPE_MAX_HOP}")
@@ -4053,6 +4219,11 @@ def architecture_summary() -> str:
         attn_txt = (
             f"efla(landmarks={EFLA_LANDMARKS}, node_k={EFLA_NODE_KERNEL}, "
             f"elec_k={EFLA_ELEC_KERNEL}, rank={EFLA_VALUE_RANK}, elec_dim={EFLA_ELEC_DIM})"
+        )
+    elif ATTENTION_KIND == "wire":
+        attn_txt = (
+            f"wire(spectral_k={WIRE_SPECTRAL_DIM}, blocks={D_A // 2}, "
+            f"softmax+connectivity_mask)"
         )
     else:
         attn_txt = "grit"
@@ -5381,6 +5552,11 @@ def move_to(network: Network, device: torch.device) -> Network:
             elec_a=_maybe(getattr(network, "elec_a", None)),
             elec_c_scale=getattr(network, "elec_c_scale", None),
         )
+    if ATTENTION_KIND == "wire":
+        rho, _comp = ensure_network_wire(network)
+        wire_kw = dict(wire_rho=host_to_device(rho, device).to(dtype=torch.float32))
+    else:
+        wire_kw = dict(wire_rho=_maybe(getattr(network, "wire_rho", None)))
 
     return Network(
         ybus=host_to_device(network.ybus, device),
@@ -5399,6 +5575,7 @@ def move_to(network: Network, device: torch.device) -> Network:
         edge_id=host_to_device(edge_id, device),
         **exph_kw,
         **elec_kw,
+        **wire_kw,
         type_key=network_type_key(network),
         layout=shared_layout(types, masks, types_np=network.types.detach().cpu().numpy()),
     )
@@ -5541,6 +5718,7 @@ def forward_cases(
         edge_id=edge_id,
         **exphormer_forward_kwargs(network),
         **efla_forward_kwargs(network),
+        **wire_forward_kwargs(network),
     )
     return prediction, target, residuals
 
@@ -5688,8 +5866,8 @@ class PassBatch:
         chunk = self.cases[start:stop]
         if self.kind == "single":
             return run_batch_residuals(model, split, self.networks[0], chunk, device, pair=pair)
-        # Exphormer allow/tau and EFLA elec_a are topology-specific; run one network at a time.
-        if ATTENTION_KIND in ("exphormer", "efla"):
+        # Exphormer/EFLA/WIRE topology features are not batched; run one network at a time.
+        if ATTENTION_KIND in ("exphormer", "efla", "wire"):
             owners = self.owner[start:stop]
             parts: list[tuple[TaskLossBreakdown, float]] = []
             residuals: list[torch.Tensor] = []
