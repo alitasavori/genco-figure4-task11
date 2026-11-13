@@ -394,15 +394,45 @@ def convert_file_list(files: list[Path], raw_out: Path, *, progress_every: int =
     write_parquet_folder(rows, raw_out)
 
 
+def task11_pack_raw_dirs(out_root: Path, case: str) -> list[Path]:
+    """All ``…/raw`` folders required for Task 1.1 on ``case`` (train N + full test suite)."""
+    dirs = [
+        out_root / case / "train" / case / "n" / "feasible" / "raw",
+        out_root / case / "valid" / case / "n" / "feasible" / "raw",
+        out_root / case / "test" / case / "n" / "feasible" / "raw",
+    ]
+    for topology in ("n", "n-1", "n-2"):
+        if topology != "n":
+            dirs.append(out_root / case / "test" / case / topology / "feasible" / "raw")
+        dirs.append(out_root / case / "test" / case / topology / "nose" / "raw")
+    return dirs
+
+
+def task11_pack_complete(out_root: Path, case: str) -> bool:
+    """True when every Task 1.1 parquet folder has all four tables."""
+    for raw in task11_pack_raw_dirs(out_root, case):
+        if not all((raw / name).is_file() for name in PARQUET_NAMES):
+            return False
+    return True
+
+
 def build_task11_case_dataset(case: str, out_root: Path, work: Path) -> Path:
     """Download PFΔ ``case`` and write Task 1.1 parquet under ``out_root``."""
-    case_dir, shuffle_dir = download_pfdelta_case(case, work)
-    marker = out_root / case / "train" / case / "n" / "feasible" / "raw" / "bus_data.parquet"
-    if marker.is_file():
+    if task11_pack_complete(out_root, case):
         print(f"Parquet Task 1.1 pack already present: {out_root}", flush=True)
         return out_root
 
-    print(f"Building Task 1.1 parquet for {case} -> {out_root}", flush=True)
+    case_dir, shuffle_dir = download_pfdelta_case(case, work)
+    missing = [
+        raw
+        for raw in task11_pack_raw_dirs(out_root, case)
+        if not all((raw / name).is_file() for name in PARQUET_NAMES)
+    ]
+    print(
+        f"Building Task 1.1 parquet for {case} -> {out_root} "
+        f"({len(missing)} folder(s) still missing)",
+        flush=True,
+    )
     # Task 1.1 trains on N only (54k pool → 90/10 train/valid). N-1/N-2 have smaller
     # archives (e.g. 29k / 20k) and are test-only (last 2000 + nose), matching MIT.
     for topology in ("n", "n-1", "n-2"):
@@ -423,7 +453,12 @@ def build_task11_case_dataset(case: str, out_root: Path, work: Path) -> Path:
         raw_out = out_root / case / "test" / case / topology / "nose" / "raw"
         convert_file_list(nose, raw_out)
 
-    if not marker.is_file():
-        raise FileNotFoundError(f"conversion finished without {marker}")
+    if not task11_pack_complete(out_root, case):
+        still = [
+            str(raw.relative_to(out_root))
+            for raw in task11_pack_raw_dirs(out_root, case)
+            if not all((raw / name).is_file() for name in PARQUET_NAMES)
+        ]
+        raise FileNotFoundError(f"conversion unfinished; missing {still[:5]}")
     print(f"Wrote Task 1.1 parquet pack at {out_root}", flush=True)
     return out_root

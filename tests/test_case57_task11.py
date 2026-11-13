@@ -113,6 +113,22 @@ def test_case118_run_dir_unchanged(monkeypatch):
         tpgt.apply_case_config()
 
 
+def test_task11_pack_complete_requires_all_test_folders(tmp_path):
+    case = "case57"
+    # Only train N present → incomplete.
+    train_raw = tmp_path / case / "train" / case / "n" / "feasible" / "raw"
+    train_raw.mkdir(parents=True)
+    for name in conv.PARQUET_NAMES:
+        (train_raw / name).write_text("x", encoding="utf-8")
+    assert not conv.task11_pack_complete(tmp_path, case)
+    # Create every required folder.
+    for raw in conv.task11_pack_raw_dirs(tmp_path, case):
+        raw.mkdir(parents=True, exist_ok=True)
+        for name in conv.PARQUET_NAMES:
+            (raw / name).write_text("x", encoding="utf-8")
+    assert conv.task11_pack_complete(tmp_path, case)
+
+
 def test_task11_n1_test_only_allows_small_archive(tmp_path):
     """N-1/N-2 Task 1.1 only need test_size samples, not the 54k N train pool."""
     case_dir = tmp_path / "case57"
