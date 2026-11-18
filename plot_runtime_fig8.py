@@ -61,8 +61,8 @@ UTILITY_BY_GRID: dict[int, str] = {
     ),
 }
 
-# Task 3.1 PFΔ cross-grid eval (N topology, condition N).
-TPGT_BENCH_GRIDS = ("57", "118", "500")
+# Task 3.1 PFΔ cross-grid eval: intact-N feasible packs under outer case118/.
+TPGT_BENCH_GRIDS = ("case57", "case118", "case500")
 
 
 def load_published(path: Path = PUBLISHED_JSON) -> dict[str, Any]:
@@ -349,6 +349,10 @@ def run_tpgt_benchmarks(
     gpu = require_gpu(gpu_needle)
     print(f"Timing GPU: {gpu} (needle={gpu_needle!r})", flush=True)
     ensure_runtime_packages()
+    # Force Task 3.1 pack root (case118/...), ignoring a leftover GENCO_TPGT_CASE from case57 training.
+    os.environ.setdefault("GENCO_TPGT_ARCH", arch)
+    os.environ["GENCO_TPGT_TASK"] = "3.1"
+    os.environ["GENCO_TPGT_CASE"] = "case118"
     apply_architecture_config()
     spec = TASKS["3.1"]
     device = torch.device("cuda")
@@ -372,15 +376,17 @@ def run_tpgt_benchmarks(
 
     out: dict[int, dict[str, float]] = {}
     for grid in TPGT_BENCH_GRIDS:
+        # Same paths/cache names as Task 3.1 Table 4 scoring (n/feasible under case118/).
+        cache_name = f"test_{grid}_n_feasible"
         split = cached_split(
             active_cache,
             persistent_cache,
-            raw_dir(data_root, "test", "N", "N", grid),
-            f"test_{grid}_N_N",
+            raw_dir(data_root, "test", "n", "feasible", grid),
+            cache_name,
         )
         network = split.networks[0]
         buses = int(network.ybus.shape[0])
-        print(f"Benchmark grid {grid} ({buses} buses, {split.count} scenarios)", flush=True)
+        print(f"Benchmark {grid} ({buses} buses, {split.count} scenarios)", flush=True)
         ms, batch = benchmark_tpgt_grid(
             model=model,
             split=split,
@@ -515,7 +521,10 @@ def run_notebook_section54(
         )
 
     # Arch must be applied before split_cache_dirs so Colab SSD path uses RUN_TAG (v9), not default v7.
+    # Task 3.1 parquet lives under outer case118/ even when an earlier cell set GENCO_TPGT_CASE=case57.
     os.environ.setdefault("GENCO_TPGT_ARCH", arch)
+    os.environ["GENCO_TPGT_TASK"] = "3.1"
+    os.environ["GENCO_TPGT_CASE"] = "case118"
     apply_architecture_config()
 
     if rebench or not cache_path.is_file():
