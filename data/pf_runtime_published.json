@@ -1,0 +1,174 @@
+{
+  "source": "gridfm-graphkit/datakit genco-paper-repro (GENCO tiny CSV minima; base/small scaled from IEEE-118 sweep; AC/DC from paper Table-6 speedups vs GENCO Tiny)",
+  "metric": "amortized_ms_per_instance",
+  "grids": {
+    "14": {
+      "bus_count": 14,
+      "genco": {
+        "tiny": {
+          "batch_size": 16384,
+          "ms_per_instance": 0.009057445366983305,
+          "dc_over_genco_active_res": 374.0
+        },
+        "small": {
+          "batch_size": 16384,
+          "ms_per_instance": 0.01633058329708209,
+          "dc_over_genco_active_res": 85.8
+        },
+        "base": {
+          "batch_size": 16384,
+          "ms_per_instance": 0.04148317986138354,
+          "dc_over_genco_active_res": 374.0
+        }
+      },
+      "powermodels": {
+        "pf": { "workers": 200, "ms_per_instance": 0.007245956293586644 },
+        "dcpf": { "workers": 56, "ms_per_instance": 0.0045287226834916525 }
+      }
+    },
+    "30": {
+      "bus_count": 30,
+      "genco": {
+        "tiny": {
+          "batch_size": 16384,
+          "ms_per_instance": 0.007751294638340672,
+          "dc_over_genco_active_res": 85.8
+        },
+        "small": {
+          "batch_size": 16384,
+          "ms_per_instance": 0.01397608355385458,
+          "dc_over_genco_active_res": 85.8
+        },
+        "base": {
+          "batch_size": 16384,
+          "ms_per_instance": 0.03550092942780388,
+          "dc_over_genco_active_res": 85.8
+        }
+      },
+      "powermodels": {
+        "pf": { "workers": 200, "ms_per_instance": 0.011626941957511008 },
+        "dcpf": { "workers": 88, "ms_per_instance": 0.006201035710672538 }
+      }
+    },
+    "57": {
+      "bus_count": 57,
+      "genco": {
+        "tiny": {
+          "batch_size": 8192,
+          "ms_per_instance": 0.01250232960958965,
+          "dc_over_genco_active_res": 56.1
+        },
+        "small": {
+          "batch_size": 8192,
+          "ms_per_instance": 0.02254668855154194,
+          "dc_over_genco_active_res": 56.1
+        },
+        "base": {
+          "batch_size": 8192,
+          "ms_per_instance": 0.05726072965195451,
+          "dc_over_genco_active_res": 56.1
+        }
+      },
+      "powermodels": {
+        "pf": { "workers": 200, "ms_per_instance": 0.016253028527466545 },
+        "dcpf": { "workers": 120, "ms_per_instance": 0.00750139776575379 }
+      }
+    },
+    "118": {
+      "bus_count": 118,
+      "genco": {
+        "tiny": {
+          "batch_size": 4096,
+          "ms_per_instance": 0.02903486359911,
+          "dc_over_genco_active_res": 16.9
+        },
+        "small": {
+          "batch_size": 16384,
+          "ms_per_instance": 0.0523023554149945,
+          "dc_over_genco_active_res": 16.9
+        },
+        "base": {
+          "batch_size": 4096,
+          "ms_per_instance": 0.13290928502311,
+          "dc_over_genco_active_res": 16.9
+        }
+      },
+      "powermodels": {
+        "pf": { "workers": 200, "ms_per_instance": 0.052262754478398 },
+        "dcpf": { "workers": 184, "ms_per_instance": 0.017420918159466 }
+      }
+    },
+    "500": {
+      "bus_count": 500,
+      "genco": {
+        "tiny": {
+          "batch_size": 2048,
+          "ms_per_instance": 0.10362629786808975,
+          "dc_over_genco_active_res": 2.49
+        },
+        "small": {
+          "batch_size": 2048,
+          "ms_per_instance": 0.18683913849545617,
+          "dc_over_genco_active_res": 2.49
+        },
+        "base": {
+          "batch_size": 2048,
+          "ms_per_instance": 0.47460836730845063,
+          "dc_over_genco_active_res": 2.49
+        }
+      },
+      "powermodels": {
+        "pf": { "workers": 200, "ms_per_instance": 0.21761522552288848 },
+        "dcpf": { "workers": 88, "ms_per_instance": 0.0414505191472359 }
+      }
+    },
+    "2000": {
+      "bus_count": 2000,
+      "genco": {
+        "tiny": {
+          "batch_size": 128,
+          "ms_per_instance": 0.47335586837958544,
+          "dc_over_genco_active_res": 1.19
+        },
+        "small": {
+          "batch_size": 128,
+          "ms_per_instance": 0.8534844212636917,
+          "dc_over_genco_active_res": 1.19
+        },
+        "base": {
+          "batch_size": 128,
+          "ms_per_instance": 2.1679697680183006,
+          "dc_over_genco_active_res": 1.19
+        }
+      },
+      "powermodels": {
+        "pf": { "workers": 24, "ms_per_instance": 13.348634688902107 },
+        "dcpf": { "workers": 24, "ms_per_instance": 0.23667793418979272 }
+      }
+    },
+    "10000": {
+      "bus_count": 10000,
+      "genco": {
+        "tiny": {
+          "batch_size": 64,
+          "ms_per_instance": 2.093336395197548,
+          "dc_over_genco_active_res": 0.63
+        },
+        "small": {
+          "batch_size": 64,
+          "ms_per_instance": 3.7742821847301005,
+          "dc_over_genco_active_res": 0.63
+        },
+        "base": {
+          "batch_size": 64,
+          "ms_per_instance": 9.587480729942718,
+          "dc_over_genco_active_res": 0.63
+        }
+      },
+      "powermodels": {
+        "pf": { "workers": 24, "ms_per_instance": 60.91608922099546 },
+        "dcpf": { "workers": 24, "ms_per_instance": 1.2560018371185288 }
+      }
+    }
+  }
+}
