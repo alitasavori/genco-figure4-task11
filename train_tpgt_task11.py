@@ -125,12 +125,14 @@ Performance notes (Colab / large train split)
   patience. The epoch line shows ``lr``; scheduler state is checkpointed.
 * **Debug (on by default)**: every validation pass also scores a fixed training
   subset (``train_pbl`` and ``gap`` in the epoch line). On checkpoint epochs the
-  run prints the forward report, RPE zero-ablation, RPE and residual correctness
+  run prints the forward report, pair/RPE zero-ablation, RPE and residual correctness
   audits on the validation topology, and contingency diagnostics on test N-1/N-2
   (per-topology PBL spread, audits and ablation on the largest outage topologies,
-  RPE shift from the training topology). Disable with ``GENCO_TPGT_DEBUG=0`` or
-  ``--no-debug``; skip RPE ablation with ``GENCO_TPGT_RPE_ABLATION=0``, bus-shunt
-  (``busBS``) node ablation with ``GENCO_TPGT_SHUNT_ABLATION=0`` (v9 only).
+  feature shift from the training topology). Runs on the training grid every
+  checkpoint epoch (every 3), including case57; Task 3.1 keeps ablation on IEEE 118.
+  v15 abates pair-elec channels; grit/Zeff arches abate RPE channels. Disable with
+  ``GENCO_TPGT_DEBUG=0`` or ``--no-debug``; skip pair/RPE ablation with
+  ``GENCO_TPGT_RPE_ABLATION=0``, bus-shunt (``busBS``) with ``GENCO_TPGT_SHUNT_ABLATION=0``.
   ``--eval-only --task 3.1`` scores Table 4 test splits without training: same
   split-cache prelude as ``main()`` (``reconcile_split_caches``, then ``load_task_split``
   train on ``pfdelta_task3.1``). When ``--checkpoint-root`` / ``GENCO_TPGT_CHECKPOINT_ROOT``
@@ -215,6 +217,8 @@ TYPE_NAMES = ("PQ", "PV", "Slack")
 CACHE_VERSION = "tpgt-cache-14"
 RPE_FEATURE_NAMES = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_DIM = len(RPE_FEATURE_NAMES)
+# v15 pair-rotary electrical pair features (ablate these, not Zeff RPE).
+PAIR_ELEC_FEATURE_NAMES = ("elec_dist", "edge_on", "edge_weight")
 # Per optimizer step, each RPE channel is zeroed (whole 118x118 plane, no rescaling) with this
 # probability. Training only; validation, test and diagnostics always see the full RPE.
 RPE_CHANNEL_DROPOUT = 0.1
@@ -2105,6 +2109,7 @@ def eval_batch_with_pair(
     pair: torch.Tensor,
     *,
     shunt_b: torch.Tensor | None = None,
+    pair_elec: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Loss and final-stage PBL on a fixed batch with precomputed pair embeddings."""
     model.eval()
@@ -2117,6 +2122,9 @@ def eval_batch_with_pair(
     if shunt_b is None:
         shunt_b = network_shunt_b(network)
     hop_id, edge_id = ensure_network_grpe_ids(network)
+    rotary_kwargs = pair_rotary_forward_kwargs(network)
+    if pair_elec is not None:
+        rotary_kwargs = {**rotary_kwargs, "pair_elec": pair_elec}
     with torch.no_grad():
         prediction, residuals = model(
             specified,
@@ -2131,7 +2139,7 @@ def eval_batch_with_pair(
             **exphormer_forward_kwargs(network),
             **efla_forward_kwargs(network),
             **wire_forward_kwargs(network),
-            **pair_rotary_forward_kwargs(network),
+            **rotary_kwargs,
         )
         breakdown = task_loss(prediction, target, residuals, network.types)
         final_pbl = pbl_stats(residuals[-1])
@@ -2200,7 +2208,7 @@ def collect_rpe_channel_ablation(
     index: np.ndarray,
     device: torch.device,
 ) -> tuple[dict[str, float], list[dict[str, float]]]:
-    """Zero one RPE channel at a time; compare batch metrics to the full-RPE baseline."""
+    """Zero one Zeff RPE channel at a time; compare batch metrics to the full-RPE baseline."""
     model.eval()
     clear_pair_embed_cache([network])
     baseline_pair = pair_features(model, network)
@@ -2221,6 +2229,69 @@ def collect_rpe_channel_ablation(
         )
     clear_pair_embed_cache([network])
     return baseline, rows
+
+
+def collect_pair_elec_channel_ablation(
+    model: TPGT,
+    split: Split,
+    network: Network,
+    index: np.ndarray,
+    device: torch.device,
+) -> tuple[dict[str, float], list[dict[str, float]]]:
+    """Zero one pair-rotary electrical feature channel; compare to the full-feature baseline."""
+    model.eval()
+    clear_pair_embed_cache([network])
+    baseline_pair = pair_features(model, network)
+    feat, _component = ensure_network_pair_rotary(network)
+    feat = feat.to(device=device, dtype=torch.float32)
+    baseline = eval_batch_with_pair(
+        model, split, network, index, device, baseline_pair, pair_elec=feat
+    )
+    rows: list[dict[str, float]] = []
+    for channel, name in enumerate(PAIR_ELEC_FEATURE_NAMES):
+        ablated = feat.clone()
+        ablated[..., channel] = 0.0
+        metrics = eval_batch_with_pair(
+            model, split, network, index, device, baseline_pair, pair_elec=ablated
+        )
+        rows.append(
+            {
+                "name": name,
+                "delta_pbl_mean": metrics["pbl_mean"] - baseline["pbl_mean"],
+                "delta_state_mse": metrics["state_mse"] - baseline["state_mse"],
+                "delta_total_loss": metrics["total_loss"] - baseline["total_loss"],
+            }
+        )
+    clear_pair_embed_cache([network])
+    return baseline, rows
+
+
+def collect_pair_feature_ablation(
+    model: TPGT,
+    split: Split,
+    network: Network,
+    index: np.ndarray,
+    device: torch.device,
+) -> tuple[dict[str, float], list[dict[str, float]], tuple[str, ...]]:
+    """Attention-aware zero-ablation: pair-elec for pair_rotary (v15+), else Zeff RPE."""
+    if ATTENTION_KIND == "pair_rotary":
+        baseline, rows = collect_pair_elec_channel_ablation(
+            model, split, network, index, device
+        )
+        return baseline, rows, PAIR_ELEC_FEATURE_NAMES
+    baseline, rows = collect_rpe_channel_ablation(model, split, network, index, device)
+    return baseline, rows, RPE_FEATURE_NAMES
+
+
+def pair_feature_shift_from_reference(network: Network, reference: Network) -> np.ndarray:
+    """Per-channel mean |feature - reference| for the active pair representation."""
+    if ATTENTION_KIND == "pair_rotary":
+        feat, _ = ensure_network_pair_rotary(network)
+        ref, _ = ensure_network_pair_rotary(reference)
+        if feat.shape != ref.shape:
+            return np.zeros(len(PAIR_ELEC_FEATURE_NAMES), dtype=np.float64)
+        return (feat - ref).abs().mean(dim=(0, 1)).detach().cpu().numpy().astype(np.float64)
+    return np.asarray(rpe_shift_from_reference(network.rpe, reference.rpe), dtype=np.float64)
 
 
 def format_rpe_effectiveness_diagnostics(
@@ -2245,11 +2316,12 @@ def format_rpe_effectiveness_diagnostics(
             lines.append(f"  {row['name']:12s} weight_l2 {row['weight_l2']:.4g}")
     if baseline is None or ablation_rows is None:
         lines.append(
-            "RPE channel ablation: not run (use --diagnose, --rpe-ablation, or GENCO_TPGT_RPE_ABLATION=1)."
+            "Pair/RPE channel ablation: not run (use --diagnose, --rpe-ablation, or GENCO_TPGT_RPE_ABLATION=1)."
         )
         return "\n".join(lines)
+    kind = "Pair-elec" if ATTENTION_KIND == "pair_rotary" else "RPE"
     lines.append(
-        f"RPE zero-ablation on same batch (baseline PBL mean {baseline['pbl_mean']:.6g}, "
+        f"{kind} zero-ablation on same batch (baseline PBL mean {baseline['pbl_mean']:.6g}, "
         f"state_mse {baseline['state_mse']:.6g}):"
     )
     lines.append(
@@ -2911,7 +2983,9 @@ def build_forward_diagnostics_text(
     baseline: dict[str, float] | None = None
     ablation_rows: list[dict[str, float]] | None = None
     if rpe_ablation:
-        baseline, ablation_rows = collect_rpe_channel_ablation(model, split, network, index, device)
+        baseline, ablation_rows, _names = collect_pair_feature_ablation(
+            model, split, network, index, device
+        )
     text = text + "\n" + format_rpe_effectiveness_diagnostics(weight_rows, baseline, ablation_rows)
     node_weight_rows = type_encoder_input_weight_norms(model)
     shunt_baseline: dict[str, float] | None = None
@@ -3105,6 +3179,10 @@ def print_contingency_diagnostics(
         picked = [net for net, _count in network_case_counts(split) if classes[net] == name][:networks_per_class]
         chosen.extend((net, name) for net in picked)
 
+    feature_names: tuple[str, ...] = (
+        PAIR_ELEC_FEATURE_NAMES if ATTENTION_KIND == "pair_rotary" else RPE_FEATURE_NAMES
+    )
+    n_feat = len(feature_names)
     deltas: dict[str, np.ndarray] = {}
     shifts: dict[str, np.ndarray] = {}
     weights: dict[str, int] = {}
@@ -3115,10 +3193,15 @@ def print_contingency_diagnostics(
         network = networks[net]
         index = debug_sample_index(split, network_id=net, count=cases_per_network)
         weight = len(index)
-        _baseline, rows = collect_rpe_channel_ablation(model, split, network, index, device)
-        deltas[name] = deltas.get(name, np.zeros(RPE_DIM)) + np.array([row["delta_pbl_mean"] for row in rows]) * weight
-        shifts[name] = shifts.get(name, np.zeros(RPE_DIM)) + np.array(
-            rpe_shift_from_reference(network.rpe, reference.rpe)
+        _baseline, rows, feature_names = collect_pair_feature_ablation(
+            model, split, network, index, device
+        )
+        n_feat = len(feature_names)
+        deltas[name] = deltas.get(name, np.zeros(n_feat)) + np.array(
+            [row["delta_pbl_mean"] for row in rows]
+        ) * weight
+        shifts[name] = shifts.get(name, np.zeros(n_feat)) + pair_feature_shift_from_reference(
+            network, reference
         ) * weight
         weights[name] = weights.get(name, 0) + weight
         for check in audit_rpe_correctness(network):
@@ -3145,11 +3228,19 @@ def print_contingency_diagnostics(
         lines.append(f"Residual correctness on {checked} topologies: OK ({worst_text})")
 
     present = [name for name in CONTINGENCY_CLASSES if weights.get(name)]
+    ablation_payload: dict[str, Any] = {
+        "label": label,
+        "attention_kind": ATTENTION_KIND,
+        "feature_names": list(feature_names),
+        "by_class": {},
+    }
     if present:
         mean_delta = {name: deltas[name] / weights[name] for name in present}
         mean_shift = {name: shifts[name] / weights[name] for name in present}
+        kind = "pair-elec" if ATTENTION_KIND == "pair_rotary" else "RPE"
         lines.append(
-            "RPE zero-ablation by class (ΔPBL when the channel is zeroed; shift = mean |RPE - training RPE|):"
+            f"{kind} zero-ablation by class (ΔPBL when the channel is zeroed; "
+            "shift = mean |feature - training topology|):"
         )
         lines.append(
             "  " + " " * 12 + "".join(
@@ -3162,12 +3253,22 @@ def print_contingency_diagnostics(
                 f"  ΔPBL {mean_delta[name][channel]:+.4g}  shift {mean_shift[name][channel]:.3g}".ljust(32)
                 for name in present
             )
-            lines.append(f"  {RPE_FEATURE_NAMES[channel]:12s}{cells}")
+            lines.append(f"  {feature_names[channel]:12s}{cells}")
         lines.append(
-            "  Generator outages leave the RPE unchanged (shift 0): their error comes from the bus-type change, "
-            "not the pair features. For line outages, large shift plus large ΔPBL marks the channels that "
-            "move under outages and that the model depends on."
+            "  Generator outages leave pair/RPE features unchanged (shift 0): their error comes from the "
+            "bus-type change, not the pair features. For line outages, large shift plus large ΔPBL marks "
+            "the channels that move under outages and that the model depends on."
         )
+        for name in present:
+            ablation_payload["by_class"][name] = {
+                "delta_pbl_mean": {
+                    feature_names[i]: float(mean_delta[name][i]) for i in range(n_feat)
+                },
+                "shift_from_train": {
+                    feature_names[i]: float(mean_shift[name][i]) for i in range(n_feat)
+                },
+                "weight_cases": int(weights[name]),
+            }
     text = "\n".join(lines)
     if seed_dir is None:
         print(text, flush=True)
@@ -3176,6 +3277,24 @@ def print_contingency_diagnostics(
         if epoch is not None and saves_checkpoint_epoch(int(epoch)):
             safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in label.strip()) or "contingency"
             write_seed_report(seed_dir, int(epoch), f"contingency_{safe}.txt", text)
+            write_seed_json(seed_dir, int(epoch), f"contingency_{safe}_ablation.json", ablation_payload)
+            seed_value: int | None = None
+            if seed_dir.name.startswith("seed_"):
+                try:
+                    seed_value = int(seed_dir.name.split("_", 1)[1])
+                except ValueError:
+                    seed_value = None
+            append_seed_metrics(
+                seed_dir,
+                {
+                    "seed": seed_value,
+                    "epoch": int(epoch),
+                    "kind": "pair_ablation",
+                    "label": label,
+                    "attention_kind": ATTENTION_KIND,
+                    "ablation": ablation_payload,
+                },
+            )
     return text
 
 
@@ -7821,8 +7940,16 @@ def test_model(
             )
             counts[key] = split.count
             print(f"test {key}: PBL {scores[key]:.6g} on {split.count} scenarios", flush=True)
-            if after_split is not None and grid == "case118":
-                after_split(label, split, networks, per_network)
+            # Contingency RPE / pair-feature zero-ablation (N-1 / N-2): run on the
+            # native training grid. Task 3.1 scores many grids — keep ablation on IEEE 118 only.
+            if after_split is not None:
+                run_ablation = (
+                    grid == "case118"
+                    if spec.task_id == "3.1"
+                    else True
+                )
+                if run_ablation:
+                    after_split(label, split, networks, per_network)
         persist_split_caches(active_cache, persistent_cache, label=grid)
         if device.type == "cuda":
             del networks
