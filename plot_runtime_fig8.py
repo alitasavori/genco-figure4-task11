@@ -505,6 +505,14 @@ def _load_tpgt_trainer():
     return importlib.import_module(name)
 
 
+def _load_genco_matched_bench():
+    """Import ``bench_genco_matched``, reloading after git pull on Colab."""
+    name = "bench_genco_matched"
+    if name in sys.modules:
+        return importlib.reload(sys.modules[name])
+    return importlib.import_module(name)
+
+
 def run_tpgt_benchmarks(
     *,
     data_root: Path,
@@ -797,7 +805,15 @@ def run_notebook_section54(
 
     genco_measured: dict[str, dict[int, float]] = {}
     if match_genco:
-        from bench_genco_matched import batches_from_tpgt_bench, run_genco_matched_benchmark
+        # Always reload after git pull — Colab keeps a stale bench_genco_matched otherwise.
+        genco_bench = _load_genco_matched_bench()
+        batches_from_tpgt_bench = genco_bench.batches_from_tpgt_bench
+        run_genco_matched_benchmark = genco_bench.run_genco_matched_benchmark
+        print(
+            f"Matched GENCO helper v{getattr(genco_bench, 'BENCH_HELPER_VERSION', '?')} "
+            f"from {genco_bench.__file__}",
+            flush=True,
+        )
 
         if rebench_genco or not genco_cache.is_file():
             batch_by_bus = batches_from_tpgt_bench(raw)

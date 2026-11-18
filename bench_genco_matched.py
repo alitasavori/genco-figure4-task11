@@ -21,6 +21,9 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent
 
+# Bumped when Colab must reload this module after git pull (stale pip -q install path).
+BENCH_HELPER_VERSION = "b8c2929-nodeps-py313"
+
 # Keep in sync with plot_runtime_fig8 TPGT timer.
 WARMUP_BATCHES = 10
 MIN_BENCH_SECONDS = 20.0
