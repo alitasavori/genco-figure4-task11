@@ -39,7 +39,7 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
 * **Correction stages** (``DEPTH``), each with its own weights; the physics
   loss sums stage residuals with GENCO weights ``0.5**(K-i)`` (last stage 1).
   Default ``DEPTH=4``; preset ``v8`` / ``v9`` / ``v10`` use ``DEPTH=8`` with wider
-  ``D/D_E/D_A/HEADS``.
+  ``D/D_E/D_A/HEADS``; ``v16`` is v9 features/attention with ``DEPTH=12``.
 * **Attention**: ``grit`` (default; v7–v9) uses pair-modulated GRIT scores on
   ``pair_encoder(RPE)``;   ``v10`` uses Approach C joint MLP scores on **raw** RPE
   ``r_ij`` (no pair encoder); ``v11`` uses Park et al. GRPE (shared hop/edge
@@ -413,6 +413,18 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "CHECKPOINT_VERSION": "meshed-rpe-2-d8-w96-h4-pqvt-busBS-pairrot-v15",
         "USE_NODE_SHUNT": True,
         "ATTENTION_KIND": "pair_rotary",
+    },
+    # v9 features/attention/width with deeper correction stack (12 stages).
+    "v16": {
+        "D": 96,
+        "D_E": 48,
+        "D_A": 48,
+        "HEADS": 4,
+        "DEPTH": 12,
+        "RUN_TAG": "v16",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d12-w96-h4-pqvt-busBS-v16",
+        "USE_NODE_SHUNT": True,
+        "ATTENTION_KIND": "grit",
     },
 }
 # Fixed training subset scored with val's PBL metric each validation pass (overfitting check).
