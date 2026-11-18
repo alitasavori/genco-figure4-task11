@@ -280,10 +280,12 @@ def benchmark_tpgt_grid(
     """Return best (ms/instance, batch_size) for one grid on the paper in-memory protocol."""
     import torch
 
-    from train_tpgt_task11 import clear_pair_embed_cache, pair_features, run_batch
+    from train_tpgt_task11 import clear_pair_embed_cache, move_to, pair_features, run_batch
 
-    clear_pair_embed_cache([network])
-    pair = pair_features(model, network)
+    # Cached splits are CPU; match eval path and move topology tensors onto the timing device.
+    device_network = move_to(network, device)
+    clear_pair_embed_cache([device_network])
+    pair = pair_features(model, device_network)
     n_cases = int(split.count)
     best_ms = float("inf")
     best_batch = 0
@@ -293,14 +295,14 @@ def benchmark_tpgt_grid(
             continue
         indices = np.arange(min(batch_size, n_cases))
         for _ in range(WARMUP_BATCHES):
-            run_batch(model, split, network, indices, device, pair=pair)
+            run_batch(model, split, device_network, indices, device, pair=pair)
         if device.type == "cuda":
             torch.cuda.synchronize()
 
         total_samples = 0
         wall_start = time.perf_counter()
         while time.perf_counter() - wall_start < MIN_BENCH_SECONDS:
-            run_batch(model, split, network, indices, device, pair=pair)
+            run_batch(model, split, device_network, indices, device, pair=pair)
             total_samples += len(indices)
         if device.type == "cuda":
             torch.cuda.synchronize()
