@@ -30,7 +30,7 @@ def make_optimizer() -> torch.optim.Optimizer:
 
 
 def test_schedule_constants():
-    assert LEARNING_RATE == pytest.approx(5e-4)
+    assert LEARNING_RATE == pytest.approx(2e-4)
     assert LR_COSINE_MIN_RATIO == pytest.approx(0.05)
     assert GRAD_CLIP_NORM > 0.0
     assert cosine_lr_at_epoch(0) == pytest.approx(LEARNING_RATE)

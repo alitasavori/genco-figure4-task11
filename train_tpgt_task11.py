@@ -115,10 +115,12 @@ Performance notes (Colab / large train split)
   0.5 MB each on case118; otherwise an LRU of that size. The decision is logged at seed start.
 * **Optional**: ``GENCO_TPGT_VAL_EVERY=3`` or ``--val-every 3`` skips most
   validation passes (faster; coarser early stopping).
-* **LR / grads**: Adam at ``LEARNING_RATE`` with a **cosine ceiling** over
-  ``EPOCHS`` (lr is never above the cosine curve) and **ReduceLROnPlateau** on
+* **LR / grads**: Adam at ``LEARNING_RATE`` (default ``2e-4``; override
+  ``GENCO_TPGT_LR`` / ``--lr``) with a **cosine ceiling** over ``EPOCHS``
+  (lr is never above the cosine curve) and **ReduceLROnPlateau** on
   ``val_pbl`` when validation runs (halve lr after ``LR_PLATEAU_PATIENCE``
   checks without improvement; disable with ``GENCO_TPGT_LR_PLATEAU=0``).
+  Resume rebases LR to the current schedule (so a mid-run LR cut applies).
   ``GRAD_CLIP_NORM`` on every optimizer step. Early stopping uses separate val
   patience. The epoch line shows ``lr``; scheduler state is checkpointed.
 * **Debug (on by default)**: every validation pass also scores a fixed training
@@ -187,10 +189,11 @@ HEADS = 2
 DEPTH = 4
 ETA = 1.0
 BATCH_SIZE = 32
-# Adam start LR matches GENCO Task 1.1; cosine anneals it so late epochs take tinier steps.
-# Grad clip caps single-batch explosions (epoch-7 style spikes). Early stop still on val PBL.
-LEARNING_RATE = 5e-4
-LR_COSINE_MIN_RATIO = 0.05  # final lr = LEARNING_RATE * this (2.5e-5 at defaults)
+# Adam start LR (override with GENCO_TPGT_LR / --lr). Lowered from GENCO's 5e-4 for
+# deeper TPGT stacks (DEPTH 8–12) where 5e-4 caused mid-run val_pbl cliffs.
+# Grad clip caps single-batch explosions. Early stop still on val PBL.
+LEARNING_RATE = 2e-4
+LR_COSINE_MIN_RATIO = 0.05  # final lr = LEARNING_RATE * this (1e-5 at defaults)
 LR_PLATEAU_PATIENCE = 5  # validation passes without val_pbl improvement before halving lr
 LR_PLATEAU_FACTOR = 0.5
 LR_PLATEAU_THRESHOLD = 1e-6  # min val_pbl improvement to reset plateau patience
@@ -4479,6 +4482,18 @@ def count_parameters(model: nn.Module) -> int:
     return sum(int(param.numel()) for param in model.parameters())
 
 
+def parse_learning_rate(*, default: float | None = None) -> float:
+    for index, arg in enumerate(sys.argv):
+        if arg == "--lr" and index + 1 < len(sys.argv):
+            return float(sys.argv[index + 1])
+        if arg.startswith("--lr="):
+            return float(arg.split("=", 1)[1])
+    env = os.environ.get("GENCO_TPGT_LR", "").strip()
+    if env:
+        return float(env)
+    return LEARNING_RATE if default is None else default
+
+
 def parse_batch_size() -> int:
     for index, arg in enumerate(sys.argv):
         if arg == "--batch" and index + 1 < len(sys.argv):
@@ -7066,16 +7081,17 @@ def restore_lr_schedule(
     *,
     completed_epochs: int = 0,
 ) -> LearningRateSchedule:
+    """Restore plateau counters when present, then rebase LR on current ``LEARNING_RATE``.
+
+    Always re-applies the cosine ceiling so a mid-run ``GENCO_TPGT_LR`` cut takes effect
+    immediately on resume instead of keeping the checkpoint's old peak LR.
+    """
     schedule = make_lr_schedule(optimizer)
-    if state is None:
-        schedule.sync_completed_epochs(completed_epochs)
-        return schedule
-    if state.get("kind") == "plateau_cosine":
+    if state is not None and state.get("kind") == "plateau_cosine":
         try:
             schedule.load_state_dict(state)
         except (KeyError, TypeError, ValueError, RuntimeError):
-            schedule.sync_completed_epochs(completed_epochs)
-        return schedule
+            pass
     schedule.sync_completed_epochs(completed_epochs)
     return schedule
 
@@ -7176,22 +7192,18 @@ def train_seed(
             best_val = float("inf")
             wait = 0
             best_state = None
-        else:
-            scheduler = restore_lr_schedule(optimizer, restored["scheduler"], completed_epochs=start_epoch)
-            if restored["scheduler"] is None:
-                print(
-                    f"Seed {seed}: checkpoint has no LR scheduler state; "
-                    f"synced to epoch {start_epoch} (lr {current_lr(optimizer):.1e}).",
-                    flush=True,
-                )
-            elif restored["scheduler"].get("kind") != "plateau_cosine":
-                print(
-                    f"Seed {seed}: legacy cosine-only scheduler in checkpoint; "
-                    f"synced to epoch {start_epoch} (lr {current_lr(optimizer):.1e}).",
-                    flush=True,
-                )
+        scheduler = restore_lr_schedule(optimizer, restored["scheduler"], completed_epochs=start_epoch)
+        print(
+            f"Seed {seed}: resumed from epoch {start_epoch} "
+            f"({resumed_from.name if resumed_from is not None else 'checkpoint'}); "
+            f"LR rebased to LEARNING_RATE={LEARNING_RATE:.1e} "
+            f"-> lr {current_lr(optimizer):.1e} at cosine@{start_epoch}.",
+            flush=True,
+        )
         opt_reset = restored.get("optimizer_reset_reason")
         if opt_reset:
+            # Re-apply cosine after any Adam reset that may have restored a stale checkpoint LR.
+            scheduler.sync_completed_epochs(start_epoch)
             print(
                 f"Seed {seed}: optimizer state incompatible ({opt_reset}); "
                 f"keeping model weights, resetting Adam momentum "
@@ -7199,8 +7211,6 @@ def train_seed(
                 flush=True,
             )
             log(f"optimizer reset on resume: {opt_reset}")
-        else:
-            print(f"Seed {seed}: resumed optimizer lr {current_lr(optimizer):.1e}", flush=True)
     else:
         obsolete_reason = restore_obsolete or load_obsolete
         if obsolete_reason is not None:
@@ -7822,14 +7832,17 @@ def test_model(
 
 
 def main() -> None:
-    global BATCH_SIZE, DATA_FRACTION, MICRO_BATCH_SIZE, EVAL_BATCH_SIZE, VAL_EVERY
+    global BATCH_SIZE, DATA_FRACTION, MICRO_BATCH_SIZE, EVAL_BATCH_SIZE, VAL_EVERY, LEARNING_RATE
     ensure_runtime_packages()
     apply_architecture_config()
     DATA_FRACTION = parse_data_fraction()
+    LEARNING_RATE = parse_learning_rate()
     BATCH_SIZE = parse_batch_size()
     MICRO_BATCH_SIZE = parse_micro_batch_size(default=BATCH_SIZE)
     EVAL_BATCH_SIZE = parse_eval_batch_size()
     VAL_EVERY = parse_val_every()
+    if LEARNING_RATE <= 0:
+        raise ValueError(f"lr must be > 0, got {LEARNING_RATE}")
     if BATCH_SIZE < 1:
         raise ValueError(f"batch must be >= 1, got {BATCH_SIZE}")
     if MICRO_BATCH_SIZE < 1 or MICRO_BATCH_SIZE > BATCH_SIZE:
