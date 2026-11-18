@@ -133,6 +133,8 @@ Performance notes (Colab / large train split)
   v15 abates pair-elec channels; grit/Zeff arches abate RPE channels. Disable with
   ``GENCO_TPGT_DEBUG=0`` or ``--no-debug``; skip pair/RPE ablation with
   ``GENCO_TPGT_RPE_ABLATION=0``, bus-shunt (``busBS``) with ``GENCO_TPGT_SHUNT_ABLATION=0``.
+  ``--ablate-grit`` (v9/v16) scores N/N-1/N-2 after removing GRIT pieces
+  (``W_Eb``, ``W_Ev``, ``W_Ew``, Re Zeff, each head, stage cutoffs 8..DEPTH-1).
   ``--eval-only --task 3.1`` scores Table 4 test splits without training: same
   split-cache prelude as ``main()`` (``reconcile_split_caches``, then ``load_task_split``
   train on ``pfdelta_task3.1``). When ``--checkpoint-root`` / ``GENCO_TPGT_CHECKPOINT_ROOT``
@@ -1372,6 +1374,11 @@ class CorrectionStage(nn.Module):
         interactions = []
         assert self.w_ew is not None and self.w_eb is not None
         assert self.w_a is not None and self.w_ev is not None
+        # Post-training ablations: skip the matmul (do not multiply by a zero tensor).
+        use_ew = bool(getattr(self, "_grit_use_ew", True))
+        use_eb = bool(getattr(self, "_grit_use_eb", True))
+        use_ev = bool(getattr(self, "_grit_use_ev", True))
+        zero_heads = getattr(self, "_grit_zero_heads", None)
         for block in blocks:
             p = block.pair_id
             receivers = block.receivers.view(-1, 1)
@@ -1381,13 +1388,30 @@ class CorrectionStage(nn.Module):
             mixed = rho_nonlinearity(query.unsqueeze(-2) + key.unsqueeze(-3))
             if pair.dim() == 3:
                 edge = pair[receivers, senders]
-                projected = torch.einsum("nme,hae->hnma", edge, self.w_ew[p]).unsqueeze(0)
-                bias = torch.einsum("nme,hae->hnma", edge, self.w_eb[p]).unsqueeze(0)
+                projected = (
+                    torch.einsum("nme,hae->hnma", edge, self.w_ew[p]).unsqueeze(0)
+                    if use_ew
+                    else None
+                )
+                bias = (
+                    torch.einsum("nme,hae->hnma", edge, self.w_eb[p]).unsqueeze(0)
+                    if use_eb
+                    else None
+                )
             else:
                 edge = pair[:, receivers, senders]
-                projected = torch.einsum("bnme,hae->bhnma", edge, self.w_ew[p])
-                bias = torch.einsum("bnme,hae->bhnma", edge, self.w_eb[p])
-            interaction = torch.relu(mixed * projected + bias)
+                projected = (
+                    torch.einsum("bnme,hae->bhnma", edge, self.w_ew[p]) if use_ew else None
+                )
+                bias = torch.einsum("bnme,hae->bhnma", edge, self.w_eb[p]) if use_eb else None
+            if projected is not None and bias is not None:
+                interaction = torch.relu(mixed * projected + bias)
+            elif projected is not None:
+                interaction = torch.relu(mixed * projected)
+            elif bias is not None:
+                interaction = torch.relu(bias.expand_as(mixed) if bias.shape != mixed.shape else bias)
+            else:
+                interaction = mixed.new_zeros(mixed.shape)
             score = torch.einsum("bhnma,ha->bhnm", interaction, self.w_a[p, :, 0])
             scores = self._scatter_block_scores(scores, score, block, batch, buses)
             interactions.append(interaction)
@@ -1406,9 +1430,13 @@ class CorrectionStage(nn.Module):
             value = torch.einsum("bnd,had->bhna", hidden[:, block.senders], self.w_v[p])
             # sum_j w_ij (W_V h_j + W_Ev x_ij) without materializing the per-pair values.
             gathered = torch.einsum("bhnm,bhma->bhna", block_weights, value)
-            pooled = torch.einsum("bhnm,bhnma->bhna", block_weights, interaction)
-            gathered = gathered + torch.einsum("bhna,hxa->bhnx", pooled, self.w_ev[p])
+            if use_ev:
+                pooled = torch.einsum("bhnm,bhnma->bhna", block_weights, interaction)
+                gathered = gathered + torch.einsum("bhna,hxa->bhnx", pooled, self.w_ev[p])
             mixed_heads = mixed_heads.index_add(2, block.receivers, gathered.to(mixed_heads.dtype))
+        if zero_heads:
+            for head in zero_heads:
+                mixed_heads[:, int(head)].zero_()
         return torch.einsum("bhna,hda->bnd", mixed_heads, self.w_o)
 
     def _messages_joint_mlp(
@@ -3068,6 +3096,327 @@ def wants_shunt_ablation(*, default: bool) -> bool:
     if flag in ("0", "false", "no"):
         return False
     return default and USE_NODE_SHUNT
+
+
+@contextlib.contextmanager
+def grit_component_flags(
+    model: TPGT,
+    *,
+    use_ew: bool = True,
+    use_eb: bool = True,
+    use_ev: bool = True,
+    zero_heads: frozenset[int] | None = None,
+):
+    """Temporarily set GRIT skip/zero flags on every correction stage (restored on exit)."""
+    if ATTENTION_KIND != "grit":
+        raise RuntimeError(f"GRIT component ablation requires ATTENTION_KIND=grit, got {ATTENTION_KIND}")
+    previous: list[tuple[CorrectionStage, bool, bool, bool, frozenset[int] | None]] = []
+    for stage in model.stages:
+        previous.append(
+            (
+                stage,
+                bool(getattr(stage, "_grit_use_ew", True)),
+                bool(getattr(stage, "_grit_use_eb", True)),
+                bool(getattr(stage, "_grit_use_ev", True)),
+                getattr(stage, "_grit_zero_heads", None),
+            )
+        )
+        stage._grit_use_ew = use_ew
+        stage._grit_use_eb = use_eb
+        stage._grit_use_ev = use_ev
+        stage._grit_zero_heads = zero_heads
+    try:
+        yield
+    finally:
+        for stage, ew, eb, ev, heads in previous:
+            stage._grit_use_ew = ew
+            stage._grit_use_eb = eb
+            stage._grit_use_ev = ev
+            stage._grit_zero_heads = heads
+
+
+@contextlib.contextmanager
+def zero_rpe_channel(networks: list[Network] | DeviceNetworks, channel: int):
+    """Temporarily zero one Zeff RPE channel on each topology (clears pair_embed cache)."""
+    hosts = networks.networks if isinstance(networks, DeviceNetworks) else list(networks)
+    saved: list[tuple[Network, torch.Tensor]] = []
+    for host in hosts:
+        saved.append((host, host.rpe.detach().clone()))
+        host.rpe = host.rpe.clone()
+        host.rpe[..., int(channel)] = 0.0
+        host.pair_embed = None
+    # Drop device copies so the next eval rematerializes from the ablated host RPE.
+    if isinstance(networks, DeviceNetworks):
+        networks._moved.clear()
+    try:
+        yield
+    finally:
+        for host, rpe in saved:
+            host.rpe = rpe
+            host.pair_embed = None
+        if isinstance(networks, DeviceNetworks):
+            networks._moved.clear()
+
+
+def evaluate_pbl_stage_cutoff(
+    model: TPGT,
+    split: Split,
+    networks: list[Network] | DeviceNetworks,
+    device: torch.device,
+    *,
+    stage_cutoff: int,
+    batch_size: int = EVAL_BATCH_SIZE,
+) -> float:
+    """Mean PBL using residual after ``stage_cutoff`` stages (1-indexed; full model uses DEPTH)."""
+    if stage_cutoff < 1 or stage_cutoff > len(model.stages):
+        raise ValueError(f"stage_cutoff must be in 1..{len(model.stages)}, got {stage_cutoff}")
+    model.eval()
+    clear_pair_embed_cache(networks)
+    total = 0.0
+    seen = 0
+    with torch.no_grad():
+        for owners, index in iterate_type_batches(split, batch_size=batch_size, mix_patterns=True):
+            ids, inverse = np.unique(owners, return_inverse=True)
+            inverse = inverse.reshape(-1)
+            if len(ids) == 1:
+                network = networks[int(ids[0])]
+                _breakdown, residuals = run_batch_residuals(model, split, network, index, device)
+                per_case = case_pbl(residuals[stage_cutoff - 1]).double().cpu().numpy()
+                total += float(per_case.sum())
+                seen += len(index)
+            else:
+                batch = PassBatch([networks[int(network_id)] for network_id in ids], index, inverse)
+                _breakdown, residuals = batch.run(model, split, batch.encode(model), device)
+                del batch
+                per_case = case_pbl(residuals[stage_cutoff - 1]).double().cpu().numpy()
+                total += float(per_case.sum())
+                seen += len(index)
+    if seen != split.count:
+        raise RuntimeError(f"Evaluated {seen} of {split.count} scenarios in {split.name}.")
+    return total / seen
+
+
+def score_feasible_splits(
+    model: TPGT,
+    data: Path,
+    device: torch.device,
+    active_cache: Path,
+    persistent_cache: Path,
+    *,
+    labels: tuple[str, ...] = ("N", "N-1", "N-2"),
+    stage_cutoff: int | None = None,
+    eval_batch_size: int = EVAL_BATCH_SIZE,
+) -> dict[str, float]:
+    """Score feasible N / N-1 / N-2 PBL (optionally at an early stage cutoff)."""
+    wanted = {label for label in labels}
+    scores: dict[str, float] = {}
+    for label, topology, condition in TEST_PARTS:
+        if label not in wanted or condition != "feasible":
+            continue
+        split = cached_split(
+            active_cache,
+            persistent_cache,
+            raw_dir(data, "test", topology, condition),
+            f"test_{topology}_{condition}",
+        )
+        networks = DeviceNetworks(split.networks, device)
+        if stage_cutoff is None or stage_cutoff >= len(model.stages):
+            scores[label] = evaluate_pbl(
+                model, split, networks, device, batch_size=eval_batch_size, progress_label=label
+            )
+        else:
+            scores[label] = evaluate_pbl_stage_cutoff(
+                model,
+                split,
+                networks,
+                device,
+                stage_cutoff=stage_cutoff,
+                batch_size=eval_batch_size,
+            )
+        print(f"  {label}: PBL {scores[label]:.6g} ({split.count} scenarios)", flush=True)
+        if device.type == "cuda":
+            del networks
+            gc.collect()
+            torch.cuda.empty_cache()
+    return scores
+
+
+def grit_ablation_specs(model: TPGT) -> list[dict[str, Any]]:
+    """Priority-ordered post-training GRIT ablations (v16 / grit arches)."""
+    depth = len(model.stages)
+    specs: list[dict[str, Any]] = [
+        {"name": "baseline", "kind": "flags", "use_ew": True, "use_eb": True, "use_ev": True},
+        {
+            "name": "W_Eb=0 (no additive electrical)",
+            "kind": "flags",
+            "use_ew": True,
+            "use_eb": False,
+            "use_ev": True,
+            "priority": 1,
+        },
+        {
+            "name": "W_Ev=0 (node values only)",
+            "kind": "flags",
+            "use_ew": True,
+            "use_eb": True,
+            "use_ev": False,
+            "priority": 2,
+        },
+        {
+            "name": "Zeff_Re=0 (keep Im)",
+            "kind": "rpe_channel",
+            "channel": 0,
+            "priority": 3,
+        },
+        {
+            "name": "W_Ew=0 (no multiplicative electrical)",
+            "kind": "flags",
+            "use_ew": False,
+            "use_eb": True,
+            "use_ev": True,
+            "priority": 4,
+        },
+    ]
+    for head in range(HEADS):
+        specs.append(
+            {
+                "name": f"head_{head}=0",
+                "kind": "flags",
+                "use_ew": True,
+                "use_eb": True,
+                "use_ev": True,
+                "zero_heads": frozenset({head}),
+                "priority": 5,
+            }
+        )
+    # Early-exit: stages 8..DEPTH on the trained deep stack (v16 DEPTH=12).
+    for stage in range(max(8, 1), depth + 1):
+        if stage >= depth:
+            continue  # full depth covered by baseline
+        specs.append(
+            {
+                "name": f"stage_cutoff_{stage}",
+                "kind": "stage_cutoff",
+                "stage_cutoff": stage,
+                "priority": 6,
+            }
+        )
+    return specs
+
+
+def run_grit_component_ablations(
+    model: TPGT,
+    data: Path,
+    device: torch.device,
+    active_cache: Path,
+    persistent_cache: Path,
+    *,
+    labels: tuple[str, ...] = ("N", "N-1", "N-2"),
+    eval_batch_size: int = EVAL_BATCH_SIZE,
+    seed_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Score N/N-1/N-2 under each GRIT component ablation; optionally persist JSON."""
+    if ATTENTION_KIND != "grit":
+        raise RuntimeError(f"--ablate-grit requires grit attention, got {ATTENTION_KIND}")
+    rows: list[dict[str, Any]] = []
+    for spec in grit_ablation_specs(model):
+        name = str(spec["name"])
+        print(f"=== GRIT ablation: {name} ===", flush=True)
+        kind = spec["kind"]
+        if kind == "flags":
+            with grit_component_flags(
+                model,
+                use_ew=bool(spec.get("use_ew", True)),
+                use_eb=bool(spec.get("use_eb", True)),
+                use_ev=bool(spec.get("use_ev", True)),
+                zero_heads=spec.get("zero_heads"),
+            ):
+                scores = score_feasible_splits(
+                    model,
+                    data,
+                    device,
+                    active_cache,
+                    persistent_cache,
+                    labels=labels,
+                    eval_batch_size=eval_batch_size,
+                )
+        elif kind == "rpe_channel":
+            # Load N once to grab networks, then zero channel for each split separately.
+            scores = {}
+            for label, topology, condition in TEST_PARTS:
+                if label not in labels or condition != "feasible":
+                    continue
+                split = cached_split(
+                    active_cache,
+                    persistent_cache,
+                    raw_dir(data, "test", topology, condition),
+                    f"test_{topology}_{condition}",
+                )
+                networks = DeviceNetworks(split.networks, device)
+                with zero_rpe_channel(networks, int(spec["channel"])):
+                    scores[label] = evaluate_pbl(
+                        model,
+                        split,
+                        networks,
+                        device,
+                        batch_size=eval_batch_size,
+                        progress_label=label,
+                    )
+                print(f"  {label}: PBL {scores[label]:.6g} ({split.count} scenarios)", flush=True)
+                if device.type == "cuda":
+                    del networks
+                    gc.collect()
+                    torch.cuda.empty_cache()
+        elif kind == "stage_cutoff":
+            scores = score_feasible_splits(
+                model,
+                data,
+                device,
+                active_cache,
+                persistent_cache,
+                labels=labels,
+                stage_cutoff=int(spec["stage_cutoff"]),
+                eval_batch_size=eval_batch_size,
+            )
+        else:
+            raise ValueError(f"Unknown grit ablation kind: {kind}")
+        row = {"name": name, "kind": kind, "scores": scores, **{k: v for k, v in spec.items() if k not in {"name", "kind", "zero_heads"}}}
+        if "zero_heads" in spec:
+            row["zero_heads"] = sorted(int(h) for h in spec["zero_heads"])
+        rows.append(row)
+    if seed_dir is not None:
+        seed_dir.mkdir(parents=True, exist_ok=True)
+        out = seed_dir / "grit_component_ablations.json"
+        out.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"Wrote {out}", flush=True)
+        append_seed_metrics(
+            seed_dir,
+            {
+                "kind": "grit_component_ablation",
+                "attention_kind": ATTENTION_KIND,
+                "run_tag": RUN_TAG,
+                "case": CASE_NAME,
+                "ablations": rows,
+            },
+        )
+    baseline = next((row for row in rows if row["name"] == "baseline"), None)
+    if baseline is not None:
+        print("=== ΔPBL vs baseline (positive = worse) ===", flush=True)
+        for row in rows:
+            if row["name"] == "baseline":
+                continue
+            deltas = {
+                label: float(row["scores"][label]) - float(baseline["scores"][label])
+                for label in labels
+                if label in row["scores"] and label in baseline["scores"]
+            }
+            row["delta_vs_baseline"] = deltas
+            parts = "  ".join(f"{label} {delta:+.4g}" for label, delta in deltas.items())
+            print(f"  {row['name']}: {parts}", flush=True)
+        if seed_dir is not None:
+            out = seed_dir / "grit_component_ablations.json"
+            out.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return rows
 
 
 def debug_sample_index(split: Split, network_id: int = 0, count: int = 32) -> np.ndarray:
@@ -8417,6 +8766,58 @@ def sanity_check_meshed_rpe(data_root: Path) -> None:
     )
 
 
+def cli_ablate_grit(checkpoint: Path | None = None, seed: int = 0) -> None:
+    """Post-training GRIT component ablations on the current ARCH/CASE checkpoint (no retrain)."""
+    global DATA_FRACTION, EVAL_BATCH_SIZE
+    ensure_runtime_packages()
+    apply_architecture_config()
+    DATA_FRACTION = parse_data_fraction()
+    EVAL_BATCH_SIZE = parse_eval_batch_size()
+    spec = parse_task()
+    print(f"GRIT component ablations — Task {spec.label}", flush=True)
+    print(architecture_summary(), flush=True)
+    if ATTENTION_KIND != "grit":
+        raise SystemExit(
+            f"--ablate-grit needs grit attention (use GENCO_TPGT_ARCH=v16 / v9); got {ATTENTION_KIND}"
+        )
+    drive = google_drive_root()
+    outputs = drive_output_dirs(drive, spec)
+    work, legacy_results = legacy_locations(drive)
+    if outputs is not None:
+        checkpoints, _results = outputs
+    else:
+        checkpoints = work / spec.run_dir_name
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    configure_cuda_training(device)
+    data = ensure_dataset(work, drive, spec)
+    active_cache, persistent_cache = split_cache_dirs(checkpoints, spec)
+    reconcile_split_caches(active_cache, persistent_cache, data)
+    seed_dir = checkpoints / f"seed_{seed}"
+    ckpt = checkpoint or (seed_dir / "last.pt")
+    model = TPGT().to(device)
+    if not ckpt.exists():
+        raise SystemExit(f"No checkpoint at {ckpt}")
+    payload = try_load_checkpoint_file(ckpt, device)
+    if not payload or not isinstance(payload.get("model"), dict):
+        raise SystemExit(f"Could not load weights from {ckpt}")
+    version_reason = checkpoint_version_reason(payload)
+    if version_reason is not None:
+        raise SystemExit(f"Checkpoint rejected ({version_reason})")
+    model.load_state_dict(payload["model"], strict=True)
+    model.eval()
+    print(f"Loaded {ckpt} ({architecture_summary()})", flush=True)
+    run_grit_component_ablations(
+        model,
+        data,
+        device,
+        active_cache,
+        persistent_cache,
+        labels=("N", "N-1", "N-2"),
+        eval_batch_size=EVAL_BATCH_SIZE,
+        seed_dir=seed_dir,
+    )
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--diagnose":
         ckpt: Path | None = None
@@ -8448,6 +8849,25 @@ if __name__ == "__main__":
             else:
                 raise SystemExit(f"Unknown diagnose argument: {args[index]}")
         cli_diagnose(checkpoint=ckpt, seed=seed, cases=cases, contingency=contingency)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--ablate-grit":
+        ckpt_g: Path | None = None
+        seed_g = 0
+        args_g = sys.argv[2:]
+        index_g = 0
+        while index_g < len(args_g):
+            if args_g[index_g] == "--checkpoint" and index_g + 1 < len(args_g):
+                ckpt_g = Path(args_g[index_g + 1])
+                index_g += 2
+            elif args_g[index_g] == "--seed" and index_g + 1 < len(args_g):
+                seed_g = int(args_g[index_g + 1])
+                index_g += 2
+            elif args_g[index_g] in ("--data-fraction", "--task") and index_g + 1 < len(args_g):
+                index_g += 2
+            elif args_g[index_g].startswith(("--data-fraction=", "--task=")):
+                index_g += 1
+            else:
+                raise SystemExit(f"Unknown ablate-grit argument: {args_g[index_g]}")
+        cli_ablate_grit(checkpoint=ckpt_g, seed=seed_g)
     elif len(sys.argv) > 1 and sys.argv[1] == "--verify-splits":
         cli_verify_splits()
     elif len(sys.argv) > 1 and sys.argv[1] == "--sanity-rpe":
