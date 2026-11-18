@@ -56,6 +56,12 @@ def stage_attn_params() -> int:
     elif t.ATTENTION_KIND == "grpe_elec":
         # Stage U_Q, U_K, U_V: (D_A, RPE_DIM) per type-pair head.
         total += 9 * t.HEADS * 3 * t.D_A * t.RPE_DIM
+    elif t.ATTENTION_KIND == "wire":
+        # Shared Ω per head: (H, D_A/2, K_s).
+        total += t.HEADS * (t.D_A // 2) * int(t.WIRE_SPECTRAL_DIM)
+    elif t.ATTENTION_KIND == "pair_rotary":
+        # Shared Ω per head: (H, D_A/2, 3).
+        total += t.HEADS * (t.D_A // 2) * int(t.PAIR_ROTARY_FEATURE_DIM)
     else:
         for extra in (
             (t.D_A, t.D_E),
