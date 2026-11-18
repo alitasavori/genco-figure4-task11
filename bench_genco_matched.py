@@ -22,10 +22,10 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent
 
 # Bumped when Colab must reload this module after git pull (stale pip -q install path).
-BENCH_HELPER_VERSION = "d07f94d-scatter-shim"
+BENCH_HELPER_VERSION = "protocol-warmup20-fwd"
 
-# Keep in sync with plot_runtime_fig8 TPGT timer.
-WARMUP_BATCHES = 10
+# Keep in sync with plot_runtime_fig8 / paper GENCO in-memory notes (20 warmup batches).
+WARMUP_BATCHES = 20
 MIN_BENCH_SECONDS = 20.0
 
 GENCO_MODELS: tuple[tuple[str, int], ...] = (

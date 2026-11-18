@@ -33,7 +33,9 @@ REPO_ROOT = Path(__file__).resolve().parent
 PUBLISHED_JSON = REPO_ROOT / "data" / "pf_runtime_published.json"
 PAPER_GPU_NEEDLE = "H100"
 MIN_BENCH_SECONDS = 20.0
-WARMUP_BATCHES = 10
+# Paper GENCO in-memory runtime (App. C / repro notes): 20 warmup batches, then amortized
+# outer wall / num_samples. Matched GENCO timing uses the same constant.
+WARMUP_BATCHES = 20
 
 BUS_ORDER = (14, 30, 57, 118, 500, 2000, 10000)
 NETWORK_LABELS = {
@@ -417,7 +419,7 @@ def benchmark_tpgt_grid(
     """
     import torch
 
-    from train_tpgt_task11 import clear_pair_embed_cache, move_to, pair_features, run_batch
+    from train_tpgt_task11 import clear_pair_embed_cache, forward_cases, move_to, pair_features
 
     if device.type == "cuda":
         release_cuda_memory()
@@ -432,6 +434,11 @@ def benchmark_tpgt_grid(
     paper_start = batch_sweep(bus_count)[0]
     oom_after_success = False
 
+    def _timed_forward(indices: np.ndarray) -> None:
+        # Match GENCO timed scope: solve forward only (no task_loss / mean_pbl bookkeeping).
+        with torch.inference_mode():
+            forward_cases(model, split, device_network, indices, device, pair=pair)
+
     for batch_size in batch_sweep_with_fallbacks(bus_count):
         if oom_after_success and batch_size > best_batch:
             break
@@ -440,14 +447,14 @@ def benchmark_tpgt_grid(
         indices = np.arange(min(batch_size, n_cases))
         try:
             for _ in range(WARMUP_BATCHES):
-                run_batch(model, split, device_network, indices, device, pair=pair)
+                _timed_forward(indices)
             if device.type == "cuda":
                 torch.cuda.synchronize()
 
             total_samples = 0
             wall_start = time.perf_counter()
             while time.perf_counter() - wall_start < MIN_BENCH_SECONDS:
-                run_batch(model, split, device_network, indices, device, pair=pair)
+                _timed_forward(indices)
                 total_samples += len(indices)
             if device.type == "cuda":
                 torch.cuda.synchronize()
