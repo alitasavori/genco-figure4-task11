@@ -379,6 +379,11 @@ def benchmark_tpgt_grid(
         if device.type == "cuda":
             release_cuda_memory()
 
+    # Drop device-side topology/pair tensors before the next grid.
+    del pair, device_network
+    if device.type == "cuda":
+        release_cuda_memory()
+
     if best_batch <= 0 or not np.isfinite(best_ms):
         raise RuntimeError(
             f"No batch size fit on {device} for {bus_count}-bus grid "
