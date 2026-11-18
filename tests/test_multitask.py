@@ -178,6 +178,24 @@ def test_copy_training_rpe_scales_rewrites_stale_cache_version(tmp_path, monkeyp
     assert payload.get("rpe_re_peak_raw") == 0.15
 
 
+def test_copy_training_rpe_scales_last_resort_ignores_checkpoint_version(tmp_path, monkeypatch):
+    monkeypatch.setattr(tpgt, "CACHE_VERSION", "tpgt-cache-14")
+    monkeypatch.setattr(tpgt, "CHECKPOINT_VERSION", "meshed-rpe-2-d8-w96-h4-pqvt-busBS-v9")
+    ckpt = tmp_path / "tpgt_task11_v9"
+    dest = tmp_path / "tpgt_task3.1_v9" / "cache"
+    dest.mkdir(parents=True)
+    (ckpt / "cache").mkdir(parents=True)
+    stale = {
+        "version": "tpgt-cache-12",
+        "checkpoint_version": "some-old-checkpoint",
+        "rpe_re_scale": 2.0,
+        "rpe_im_scale": 3.0,
+    }
+    (ckpt / "cache" / tpgt.RPE_SCALES_FILE).write_text(json.dumps(stale), encoding="utf-8")
+    tpgt.copy_training_rpe_scales(dest, ckpt)
+    assert tpgt.load_rpe_global_scales(dest) == (2.0, 3.0)
+
+
 def test_load_rpe_global_scales_rejects_stale_version(tmp_path):
     cache = tmp_path / "cache"
     cache.mkdir()

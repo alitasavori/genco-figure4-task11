@@ -12,8 +12,10 @@ The paper cell requires NVIDIA H100 (name contains ``H100``). An L4 cell uses th
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -314,6 +316,14 @@ def benchmark_tpgt_grid(
     return best_ms, best_batch
 
 
+def _load_tpgt_trainer():
+    """Import ``train_tpgt_task11``, reloading if Colab already imported a pre-pull copy."""
+    name = "train_tpgt_task11"
+    if name in sys.modules:
+        return importlib.reload(sys.modules[name])
+    return importlib.import_module(name)
+
+
 def run_tpgt_benchmarks(
     *,
     data_root: Path,
@@ -326,16 +336,15 @@ def run_tpgt_benchmarks(
     """Benchmark TPGT on Task 3.1 N splits for grids we have in PFΔ task 3.1."""
     import torch
 
-    from train_tpgt_task11 import (
-        TPGT,
-        TASKS,
-        apply_architecture_config,
-        cached_split,
-        ensure_runtime_packages,
-        eval_checkpoint_payload,
-        raw_dir,
-        warm_split_caches,
-    )
+    tpgt = _load_tpgt_trainer()
+    TPGT = tpgt.TPGT
+    TASKS = tpgt.TASKS
+    apply_architecture_config = tpgt.apply_architecture_config
+    cached_split = tpgt.cached_split
+    ensure_runtime_packages = tpgt.ensure_runtime_packages
+    eval_checkpoint_payload = tpgt.eval_checkpoint_payload
+    raw_dir = tpgt.raw_dir
+    warm_split_caches = tpgt.warm_split_caches
 
     gpu = require_gpu(gpu_needle)
     print(f"Timing GPU: {gpu} (needle={gpu_needle!r})", flush=True)
@@ -472,7 +481,10 @@ def run_notebook_section54(
     same in-memory protocol on L4 (exploratory; not paper-comparable absolute times).
     ``weight_run`` is the Task 1.1 checkpoint folder containing ``seed_0/``.
     """
-    from train_tpgt_task11 import TASKS, apply_architecture_config, split_cache_dirs
+    tpgt = _load_tpgt_trainer()
+    TASKS = tpgt.TASKS
+    apply_architecture_config = tpgt.apply_architecture_config
+    split_cache_dirs = tpgt.split_cache_dirs
 
     results = task_run / "results"
     results.mkdir(parents=True, exist_ok=True)

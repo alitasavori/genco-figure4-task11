@@ -3755,12 +3755,19 @@ def load_rpe_global_scales(
     persistent: Path,
     *,
     require_cache_version: bool = True,
+    require_checkpoint_version: bool = True,
 ) -> tuple[float, float] | None:
-    """Load ``(s_R, s_X)``. Checkpoint version must match; cache version is optional for copy/reuse."""
+    """Load ``(s_R, s_X)``.
+
+    Checkpoint / cache version checks can be relaxed for cross-run copy after a
+    ``CACHE_VERSION`` bump (or a stale Colab import of an older trainer).
+    """
     payload = read_rpe_scales_payload(persistent)
     if payload is None:
         return None
-    if payload.get("checkpoint_version") != CHECKPOINT_VERSION:
+    if "rpe_re_scale" not in payload or "rpe_im_scale" not in payload:
+        return None
+    if require_checkpoint_version and payload.get("checkpoint_version") != CHECKPOINT_VERSION:
         return None
     if require_cache_version and payload.get("version") != CACHE_VERSION:
         return None
@@ -3854,9 +3861,25 @@ def copy_training_rpe_scales(persistent: Path, weight_run: Path) -> None:
         weight_run / "cache",
         Path(f"/content/{weight_run.name}_cache"),
     ]
-    for folder in candidates:
-        scales = load_rpe_global_scales(folder, require_cache_version=False)
-        if scales is not None:
+    # 1) matching checkpoint_version, any cache version
+    # 2) any readable scales file (last resort for §5.4 / stale imports)
+    for require_ckpt in (True, False):
+        for folder in candidates:
+            scales = load_rpe_global_scales(
+                folder,
+                require_cache_version=False,
+                require_checkpoint_version=require_ckpt,
+            )
+            if scales is None:
+                continue
+            if not require_ckpt:
+                payload = read_rpe_scales_payload(folder)
+                print(
+                    f"RPE scales: last-resort adopt from {folder} "
+                    f"(file checkpoint_version={None if payload is None else payload.get('checkpoint_version')!r}, "
+                    f"runtime wants {CHECKPOINT_VERSION!r})",
+                    flush=True,
+                )
             _adopt_rpe_scales(persistent, folder, scales)
             return
     details: list[str] = []
