@@ -6,7 +6,8 @@ best batch size (IEEE from 64, GOC from 16). Published numbers ship in
 ``data/pf_runtime_published.json`` (regenerate with ``scripts/build_pf_runtime_published.py``).
 
 The paper cell requires NVIDIA H100 (name contains ``H100``). An L4 cell uses the
-**same protocol** with ``gpu_needle=\"L4\"`` for exploratory timing (not paper-comparable).
+**same protocol** with ``gpu_needle=\"L4\"``. Pass ``match_genco=True`` to also time
+GENCO Tiny/Small/Base on that GPU at TPGT's batches (see ``bench_genco_matched.py``).
 """
 
 from __future__ import annotations
@@ -221,30 +222,63 @@ def write_table6_html(
     return path
 
 
+def _ylim_from_values(*series: list[float] | np.ndarray, floor: float = 0.0045) -> tuple[float, float]:
+    all_vals = np.concatenate([np.asarray(s, dtype=float).ravel() for s in series if len(s)])
+    finite = all_vals[np.isfinite(all_vals) & (all_vals > 0)]
+    if not finite.size:
+        return floor, 100.0
+    y_hi = max(100.0, float(np.nanmax(finite)) * 2.0)
+    if y_hi > 100.0:
+        y_hi = float(10 ** np.ceil(np.log10(y_hi)))
+    return floor, y_hi
+
+
+def _genco_series_for_plot(
+    published: dict,
+    bus_counts: list[int],
+    genco_measured: dict[str, dict[int, float]] | None,
+) -> tuple[dict[str, list[float]], str]:
+    """Prefer live matched-batch GENCO when present; else paper published best-batch."""
+    genco_best: dict[str, list[float]] = {m: [] for m in ("base", "small", "tiny")}
+    used_measured = False
+    for buses in bus_counts:
+        g = published["grids"][str(buses)]
+        for model in ("base", "small", "tiny"):
+            measured = None
+            if genco_measured and model in genco_measured:
+                measured = genco_measured[model].get(buses)
+            if measured is not None and np.isfinite(measured):
+                genco_best[model].append(float(measured))
+                used_measured = True
+            else:
+                genco_best[model].append(g["genco"][model]["ms_per_instance"])
+    label_suffix = " (matched batch)" if used_measured else ""
+    return genco_best, label_suffix
+
+
 def plot_figure8(
     published: dict,
     tpgt_by_bus: dict[int, float],
     out_path: Path,
     *,
     tpgt_legend: str = "TPGT (measured)",
+    genco_measured: dict[str, dict[int, float]] | None = None,
 ) -> None:
     apply_plot_style()
     bus_counts = list(BUS_ORDER)
-    genco_best: dict[str, list[float]] = {m: [] for m in ("base", "small", "tiny")}
+    genco_best, genco_suffix = _genco_series_for_plot(published, bus_counts, genco_measured)
     ac_pf: list[float] = []
     dc_pf: list[float] = []
     tpgt_line: list[float] = []
 
     for buses in bus_counts:
         g = published["grids"][str(buses)]
-        for model in ("base", "small", "tiny"):
-            genco_best[model].append(g["genco"][model]["ms_per_instance"])
         ac_pf.append(g["powermodels"]["pf"]["ms_per_instance"])
         dc_pf.append(g["powermodels"]["dcpf"]["ms_per_instance"])
         tpgt_line.append(tpgt_by_bus.get(buses, float("nan")))
 
     labels = [NETWORK_LABELS[b] for b in bus_counts]
-    fig, axis = plt.subplots(figsize=(10.5, 6.0))
+    fig, axis = plt.subplots(figsize=(12.0, 7.2))
     split = bus_counts.index(500) + 1
     axis.plot(bus_counts[:split], ac_pf[:split], color="#2ca02c", linestyle="-", marker="D", label="AC-PF (NLsolve)")
     if split < len(bus_counts):
@@ -264,7 +298,7 @@ def plot_figure8(
             color="#1f6fff",
             linestyle=linestyle,
             marker="o",
-            label=f"GENCO {model.capitalize()}",
+            label=f"GENCO {model.capitalize()}{genco_suffix}",
         )
     tpgt_arr = np.array(tpgt_line, dtype=float)
     if np.any(np.isfinite(tpgt_arr)):
@@ -278,10 +312,11 @@ def plot_figure8(
             label=tpgt_legend,
         )
 
+    y_lo, y_hi = _ylim_from_values(ac_pf, dc_pf, *genco_best.values(), tpgt_arr)
     axis.set_xscale("log")
     axis.set_yscale("log")
     axis.set_xlim(11.5, 12_000)
-    axis.set_ylim(0.0045, 100)
+    axis.set_ylim(y_lo, y_hi)
     axis.set_xlabel("Bus count")
     axis.set_ylabel("Amortized per-instance\nruntime [ms]")
     axis.grid(True, which="both", alpha=0.2)
@@ -294,7 +329,76 @@ def plot_figure8(
     top.set_xticklabels(labels, rotation=30, ha="left", fontsize=10)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_figure8_genco_vs_tpgt(
+    tpgt_by_bus: dict[int, float],
+    genco_measured: dict[str, dict[int, float]],
+    out_path: Path,
+    *,
+    tpgt_legend: str = "TPGT (measured)",
+    title: str | None = None,
+) -> None:
+    """Head-to-head: GENCO Tiny/Small/Base vs TPGT only (no PowerModels)."""
+    apply_plot_style()
+    bus_counts = [b for b in (57, 118, 500) if b in tpgt_by_bus or any(b in g for g in genco_measured.values())]
+    if not bus_counts:
+        return
+    fig, axis = plt.subplots(figsize=(10.0, 6.5))
+    for model, linestyle in (("base", "-"), ("small", "--"), ("tiny", ":")):
+        xs: list[int] = []
+        ys: list[float] = []
+        for buses in bus_counts:
+            val = genco_measured.get(model, {}).get(buses)
+            if val is not None and np.isfinite(val):
+                xs.append(buses)
+                ys.append(float(val))
+        if xs:
+            axis.plot(
+                xs,
+                ys,
+                color="#1f6fff",
+                linestyle=linestyle,
+                marker="o",
+                label=f"GENCO {model.capitalize()}",
+            )
+    tpgt_x = [b for b in bus_counts if b in tpgt_by_bus and np.isfinite(tpgt_by_bus[b])]
+    tpgt_y = [float(tpgt_by_bus[b]) for b in tpgt_x]
+    if tpgt_x:
+        axis.plot(
+            tpgt_x,
+            tpgt_y,
+            color="#1F4B99",
+            linestyle="-",
+            marker="s",
+            linewidth=2.2,
+            label=tpgt_legend,
+        )
+    series = [tpgt_y]
+    for model in ("base", "small", "tiny"):
+        series.append([float(genco_measured.get(model, {}).get(b, np.nan)) for b in bus_counts])
+    y_lo, y_hi = _ylim_from_values(*series)
+    axis.set_xscale("log")
+    axis.set_yscale("log")
+    axis.set_xlim(40, 800)
+    axis.set_ylim(y_lo, y_hi)
+    axis.set_xlabel("Bus count")
+    axis.set_ylabel("Amortized per-instance\nruntime [ms]")
+    axis.grid(True, which="both", alpha=0.2)
+    style_axis(axis)
+    if title:
+        axis.set_title(title)
+    axis.legend(loc="upper left", frameon=False)
+    top = axis.twiny()
+    top.set_xscale("log")
+    top.set_xlim(axis.get_xlim())
+    top.set_xticks(bus_counts)
+    top.set_xticklabels([NETWORK_LABELS[b] for b in bus_counts], rotation=20, ha="left", fontsize=10)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -478,19 +582,59 @@ def run_tpgt_benchmarks(
     return out
 
 
+def genco_measured_from_payload(payload: dict[str, Any] | None) -> dict[str, dict[int, float]]:
+    """Flatten ``runtime_genco_matched_*.json`` → model → bus → ms."""
+    out: dict[str, dict[int, float]] = {}
+    if not payload:
+        return out
+    by_model = payload.get("by_model", payload)
+    for model, rows in by_model.items():
+        if model in ("protocol", "gpu", "data_root"):
+            continue
+        if not isinstance(rows, dict):
+            continue
+        series: dict[int, float] = {}
+        for bus_key, row in rows.items():
+            if not isinstance(row, dict):
+                continue
+            ms = row.get("ms_per_instance")
+            if ms is None or not np.isfinite(float(ms)):
+                continue
+            series[int(bus_key)] = float(ms)
+        if series:
+            out[str(model)] = series
+    return out
+
+
 def write_outputs(
     results_dir: Path,
     published: dict,
     tpgt_by_bus: dict[int, float],
     *,
     figure_name: str = "figure8_runtime_pf.png",
+    head_to_head_name: str | None = None,
     summary_name: str = "runtime_fig8_summary.json",
     tpgt_label: str = "TPGT (measured)",
     table_suffix: str = "",
+    genco_measured: dict[str, dict[int, float]] | None = None,
     extra_summary: dict[str, Any] | None = None,
 ) -> tuple[Path, list[Path]]:
     fig_path = results_dir / figure_name
-    plot_figure8(published, tpgt_by_bus, fig_path, tpgt_legend=tpgt_label)
+    plot_figure8(
+        published,
+        tpgt_by_bus,
+        fig_path,
+        tpgt_legend=tpgt_label,
+        genco_measured=genco_measured,
+    )
+    if head_to_head_name and genco_measured:
+        plot_figure8_genco_vs_tpgt(
+            tpgt_by_bus,
+            genco_measured,
+            results_dir / head_to_head_name,
+            tpgt_legend=tpgt_label,
+            title="GENCO vs TPGT (same GPU, matched batch)",
+        )
     table_paths: list[Path] = []
     for grid in BUS_ORDER:
         tpgt_ms = tpgt_by_bus.get(grid)
@@ -502,6 +646,10 @@ def write_outputs(
         "tpgt_ms_by_bus": tpgt_by_bus,
         "published_source": published.get("source"),
         "tpgt_label": tpgt_label,
+        "genco_measured_ms": {
+            model: {str(b): ms for b, ms in series.items()}
+            for model, series in (genco_measured or {}).items()
+        },
     }
     if extra_summary:
         summary.update(extra_summary)
@@ -516,6 +664,7 @@ def display_runtime_fig8(
     results_dir: Path,
     *,
     figure_name: str = "figure8_runtime_pf.png",
+    head_to_head_name: str | None = None,
     table_suffix: str = "",
 ) -> None:
     """Notebook helper: show figure + per-grid Table 6 HTML."""
@@ -526,6 +675,11 @@ def display_runtime_fig8(
         display(Image(filename=str(fig)))
     else:
         print(f"Missing figure: {fig}", flush=True)
+    if head_to_head_name:
+        head = results_dir / head_to_head_name
+        if head.is_file():
+            print("GENCO vs TPGT (matched batch, same GPU)", flush=True)
+            display(Image(filename=str(head)))
     for grid in BUS_ORDER:
         html_path = results_dir / f"table6_runtime_grid{grid}{table_suffix}.html"
         if html_path.is_file():
@@ -559,11 +713,17 @@ def run_notebook_section54(
     figure_name: str | None = None,
     summary_name: str | None = None,
     tpgt_label: str | None = None,
+    match_genco: bool = False,
+    rebench_genco: bool = True,
 ) -> Path:
-    """Colab entry: GPU gate + TPGT timing vs published GENCO curves/tables.
+    """Colab entry: GPU gate + TPGT timing vs GENCO curves/tables.
 
     Default ``gpu_needle=\"H100\"`` is the paper cell. Pass ``gpu_needle=\"L4\"`` for the
-    same in-memory protocol on L4 (exploratory; not paper-comparable absolute times).
+    same in-memory protocol on L4.
+
+    When ``match_genco=True``, also times GENCO Tiny/Small/Base on **this same GPU**
+    at TPGT's best batch per grid (installs graphkit + downloads runtime graphs as needed),
+    then writes a head-to-head figure without PowerModels.
     ``weight_run`` is the Task 1.1 checkpoint folder containing ``seed_0/``.
     """
     tpgt = _load_tpgt_trainer()
@@ -579,7 +739,9 @@ def run_notebook_section54(
     needle = str(gpu_needle).strip().upper() or PAPER_GPU_NEEDLE
     suffix = "" if needle == PAPER_GPU_NEEDLE else f"_{needle.lower()}"
     cache_path = results / (bench_cache_name or f"runtime_tpgt_bench{suffix}.json")
+    genco_cache = results / f"runtime_genco_matched{suffix}.json"
     fig_name = figure_name or f"figure8_runtime_pf{suffix}.png"
+    head_name = f"figure8_genco_vs_tpgt{suffix}.png"
     sum_name = summary_name or f"runtime_fig8_summary{suffix}.json"
     label = tpgt_label or f"TPGT ({arch}, {needle})"
 
@@ -592,10 +754,17 @@ def run_notebook_section54(
         ),
     )
     print(f"Timing GPU: {gpu} (needle={needle})", flush=True)
-    if needle != PAPER_GPU_NEEDLE:
+    if match_genco:
+        print(
+            "Matched GENCO timing enabled: same GPU + TPGT batch sizes "
+            f"(cache {genco_cache.name}).",
+            flush=True,
+        )
+    elif needle != PAPER_GPU_NEEDLE:
         print(
             "Note: GENCO Base/Small/Tiny and PowerModels curves are still the "
-            "paper's H100-published numbers; only the TPGT points are measured here.",
+            "paper's H100-published numbers; only the TPGT points are measured here. "
+            "Set match_genco=True for same-device matched-batch GENCO.",
             flush=True,
         )
 
@@ -626,23 +795,47 @@ def run_notebook_section54(
     for buses, payload in raw.items():
         tpgt_by_bus[int(buses)] = float(payload["ms_per_instance"])
 
+    genco_measured: dict[str, dict[int, float]] = {}
+    if match_genco:
+        from bench_genco_matched import batches_from_tpgt_bench, run_genco_matched_benchmark
+
+        if rebench_genco or not genco_cache.is_file():
+            batch_by_bus = batches_from_tpgt_bench(raw)
+            genco_payload = run_genco_matched_benchmark(
+                batch_by_bus=batch_by_bus,
+                results_path=genco_cache,
+                gpu_name=gpu,
+            )
+        else:
+            genco_payload = json.loads(genco_cache.read_text(encoding="utf-8"))
+            print(f"Reusing matched GENCO timings from {genco_cache}", flush=True)
+        genco_measured = genco_measured_from_payload(genco_payload)
+
     write_outputs(
         results,
         published,
         tpgt_by_bus,
         figure_name=fig_name,
+        head_to_head_name=head_name if genco_measured else None,
         summary_name=sum_name,
         tpgt_label=label,
         table_suffix=suffix,
+        genco_measured=genco_measured or None,
         extra_summary={
             "gpu": gpu,
             "gpu_needle": needle,
             "arch": arch,
             "weight_run": str(weight_run),
             "bench_cache": str(cache_path),
+            "genco_matched_cache": str(genco_cache) if match_genco else None,
             "figure": fig_name,
+            "head_to_head_figure": head_name if genco_measured else None,
             "table_suffix": suffix,
-            "paper_comparable": needle == PAPER_GPU_NEEDLE,
+            "match_genco": match_genco,
+            "paper_comparable": needle == PAPER_GPU_NEEDLE and not match_genco,
+            "tpgt_batch_by_bus": {
+                str(k): int(float(v["batch_size"])) for k, v in raw.items()
+            },
         },
     )
     return results
