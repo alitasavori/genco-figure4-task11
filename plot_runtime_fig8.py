@@ -105,6 +105,7 @@ def require_paper_gpu() -> str:
 
 
 def batch_sweep(bus_count: int) -> list[int]:
+    """Paper-style ascending batch sizes (IEEE from 64, GOC from 16)."""
     start = 64 if bus_count < 500 else 16
     sizes: list[int] = []
     batch = start
@@ -112,6 +113,34 @@ def batch_sweep(bus_count: int) -> list[int]:
         sizes.append(batch)
         batch *= 2
     return sizes
+
+
+def batch_sweep_with_fallbacks(bus_count: int) -> list[int]:
+    """Paper sweep plus smaller powers of two so L4 can still time if 64/16 OOMs."""
+    paper = batch_sweep(bus_count)
+    start = paper[0]
+    smaller: list[int] = []
+    batch = start // 2
+    while batch >= 1:
+        smaller.append(batch)
+        batch //= 2
+    return list(reversed(smaller)) + paper
+
+
+def release_cuda_memory() -> None:
+    """Drop Jupyter's last-exception refs (they pin OOM tensors) and empty the allocator."""
+    import gc
+    import sys
+
+    import torch
+
+    for name in ("last_type", "last_value", "last_traceback"):
+        if hasattr(sys, name):
+            setattr(sys, name, None)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 def _fmt_speedup(ratio: float) -> str:
@@ -279,14 +308,15 @@ def benchmark_tpgt_grid(
 ) -> tuple[float, int]:
     """Return best (ms/instance, batch_size) for one grid on the paper in-memory protocol.
 
-    Sweeps batch sizes upward; on CUDA OOM stops the sweep and keeps the best finished size
-    (paper protocol still applies among sizes that fit the GPU).
+    Sweeps batch sizes upward (with smaller fallbacks below the paper start). On CUDA OOM
+    after a successful size, stops the upward sweep and keeps the best finished size.
     """
-    import gc
-
     import torch
 
     from train_tpgt_task11 import clear_pair_embed_cache, move_to, pair_features, run_batch
+
+    if device.type == "cuda":
+        release_cuda_memory()
 
     # Cached splits are CPU; match eval path and move topology tensors onto the timing device.
     device_network = move_to(network, device)
@@ -295,15 +325,13 @@ def benchmark_tpgt_grid(
     n_cases = int(split.count)
     best_ms = float("inf")
     best_batch = 0
+    paper_start = batch_sweep(bus_count)[0]
+    oom_after_success = False
 
-    def _cuda_cleanup() -> None:
-        if device.type != "cuda":
-            return
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    for batch_size in batch_sweep(bus_count):
-        if batch_size > n_cases and n_cases < batch_size:
+    for batch_size in batch_sweep_with_fallbacks(bus_count):
+        if oom_after_success and batch_size > best_batch:
+            break
+        if batch_size > n_cases:
             continue
         indices = np.arange(min(batch_size, n_cases))
         try:
@@ -320,29 +348,42 @@ def benchmark_tpgt_grid(
             if device.type == "cuda":
                 torch.cuda.synchronize()
         except torch.OutOfMemoryError:
-            _cuda_cleanup()
+            if device.type == "cuda":
+                release_cuda_memory()
+            if best_batch > 0:
+                print(
+                    f"    batch {batch_size}: OOM — stopping upward sweep "
+                    f"(best {best_batch} @ {best_ms:.4f} ms/instance)",
+                    flush=True,
+                )
+                oom_after_success = True
+                continue
             print(
-                f"    batch {batch_size}: OOM — stopping sweep "
-                f"(best so far {best_batch} @ {best_ms:.4f} ms/instance)",
+                f"    batch {batch_size}: OOM — trying smaller/next sizes after cleanup",
                 flush=True,
             )
-            break
+            continue
 
         elapsed_ms = (time.perf_counter() - wall_start) * 1000.0
         ms_per = elapsed_ms / max(total_samples, 1)
+        note = ""
+        if batch_size < paper_start:
+            note = " (below paper start; L4 fallback)"
         print(
-            f"    batch {batch_size}: {ms_per:.4f} ms/instance ({total_samples} cases)",
+            f"    batch {batch_size}: {ms_per:.4f} ms/instance ({total_samples} cases){note}",
             flush=True,
         )
         if ms_per < best_ms:
             best_ms = ms_per
             best_batch = batch_size
-        _cuda_cleanup()
+        if device.type == "cuda":
+            release_cuda_memory()
 
     if best_batch <= 0 or not np.isfinite(best_ms):
         raise RuntimeError(
             f"No batch size fit on {device} for {bus_count}-bus grid "
-            f"(tried {batch_sweep(bus_count)})."
+            f"(tried {batch_sweep_with_fallbacks(bus_count)}). "
+            "If a prior OOM left the GPU full, Runtime → Restart session, then re-run."
         )
     return best_ms, best_batch
 
@@ -387,6 +428,7 @@ def run_tpgt_benchmarks(
     apply_architecture_config()
     spec = TASKS["3.1"]
     device = torch.device("cuda")
+    release_cuda_memory()
     warm_split_caches(
         data_root,
         active_cache,
@@ -427,6 +469,7 @@ def run_tpgt_benchmarks(
         )
         out[buses] = {"ms_per_instance": ms, "batch_size": float(batch), "grid": grid}
         print(f"  best: {ms:.4f} ms @ batch {batch}", flush=True)
+        release_cuda_memory()
     return out
 
 
