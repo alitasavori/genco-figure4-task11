@@ -22,7 +22,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent
 
 # Bumped when Colab must reload this module after git pull (stale pip -q install path).
-BENCH_HELPER_VERSION = "b8c2929-nodeps-py313"
+BENCH_HELPER_VERSION = "d07f94d-scatter-shim"
 
 # Keep in sync with plot_runtime_fig8 TPGT timer.
 WARMUP_BATCHES = 10
@@ -125,6 +125,123 @@ def _relax_graphkit_python_requires(repo: Path) -> None:
         print(f"Relaxed {path.name} requires-python to <3.14 for this Colab runtime.", flush=True)
 
 
+def _install_torch_scatter_shim() -> None:
+    """Pure-torch stand-in when PyG has no wheel (e.g. torch 2.14 + cu130 on Colab)."""
+    import types
+
+    import torch
+
+    def _normalize_dim(dim: int, ndim: int) -> int:
+        return dim if dim >= 0 else dim + ndim
+
+    def _dim_size(index: torch.Tensor, dim_size: int | None) -> int:
+        if dim_size is not None:
+            return int(dim_size)
+        if index.numel() == 0:
+            return 0
+        return int(index.max().item()) + 1
+
+    def _broadcast_index(src: torch.Tensor, index: torch.Tensor, dim: int) -> torch.Tensor:
+        index = index.long()
+        if index.shape == src.shape:
+            return index
+        if index.dim() == 1 and src.size(dim) == index.numel():
+            shape = [1] * src.dim()
+            shape[dim] = index.numel()
+            return index.view(*shape).expand_as(src)
+        return index.expand_as(src)
+
+    def scatter_add(
+        src: torch.Tensor,
+        index: torch.Tensor,
+        dim: int = -1,
+        out: torch.Tensor | None = None,
+        dim_size: int | None = None,
+    ) -> torch.Tensor:
+        dim = _normalize_dim(dim, src.dim())
+        size = list(src.shape)
+        size[dim] = _dim_size(index, dim_size)
+        if out is None:
+            out = src.new_zeros(size)
+        idx = _broadcast_index(src, index, dim)
+        return out.scatter_add_(dim, idx, src)
+
+    def scatter_mean(
+        src: torch.Tensor,
+        index: torch.Tensor,
+        dim: int = -1,
+        out: torch.Tensor | None = None,
+        dim_size: int | None = None,
+    ) -> torch.Tensor:
+        dim = _normalize_dim(dim, src.dim())
+        summed = scatter_add(src, index, dim=dim, dim_size=dim_size)
+        counts = scatter_add(torch.ones_like(src), index, dim=dim, dim_size=dim_size).clamp_min(1)
+        result = summed / counts
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
+    def scatter_max(
+        src: torch.Tensor,
+        index: torch.Tensor,
+        dim: int = -1,
+        out: torch.Tensor | None = None,
+        dim_size: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dim = _normalize_dim(dim, src.dim())
+        size = list(src.shape)
+        size[dim] = _dim_size(index, dim_size)
+        fill = (
+            torch.finfo(src.dtype).min if src.is_floating_point() else torch.iinfo(src.dtype).min
+        )
+        maxima = src.new_full(size, fill)
+        idx = _broadcast_index(src, index, dim)
+        maxima = maxima.scatter_reduce(dim, idx, src, reduce="amax", include_self=True)
+        argmax = torch.zeros_like(maxima, dtype=torch.long)
+        if out is not None:
+            out.copy_(maxima)
+            return out, argmax
+        return maxima, argmax
+
+    mod = types.ModuleType("torch_scatter")
+    mod.scatter_add = scatter_add
+    mod.scatter_mean = scatter_mean
+    mod.scatter_max = scatter_max
+    mod.__file__ = "<bench_genco_matched torch_scatter shim>"
+    sys.modules["torch_scatter"] = mod
+    print(
+        "Installed pure-torch torch_scatter shim (no wheel for this torch/CUDA).",
+        flush=True,
+    )
+
+
+def ensure_torch_scatter() -> None:
+    """Prefer the real extension; otherwise shim so graphkit can import on new Colab torch."""
+    try:
+        import torch_scatter  # noqa: F401
+
+        return
+    except ImportError:
+        pass
+
+    try:
+        import torch
+
+        tag = torch.__version__ if torch.version.cuda else f"{torch.__version__}+cpu"
+        url = f"https://data.pyg.org/whl/torch-{tag}.html"
+        pip_env = os.environ.copy()
+        pip_env["PIP_IGNORE_REQUIRES_PYTHON"] = "1"
+        _pip_install(["torch-scatter", "-f", url], env=pip_env)
+        import torch_scatter  # noqa: F401
+
+        return
+    except Exception as exc:
+        print(f"torch-scatter wheel/build unavailable ({exc})", flush=True)
+
+    _install_torch_scatter_shim()
+
+
 def ensure_graphkit(repo: Path | None = None) -> Path:
     """Clone ``genco-paper-repro`` and install for inference timing beside TPGT.
 
@@ -134,6 +251,7 @@ def ensure_graphkit(repo: Path | None = None) -> Path:
     matched-batch PF forward timing.
     """
     repo = repo or default_graphkit_root()
+    ensure_torch_scatter()
     try:
         import gridfm_graphkit  # noqa: F401
 
@@ -171,14 +289,7 @@ def ensure_graphkit(repo: Path | None = None) -> Path:
     print("Installing minimal graphkit runtime deps (keeping existing torch)…", flush=True)
     _pip_install(runtime_deps, env=pip_env)
 
-    try:
-        import torch
-
-        tag = torch.__version__ if torch.version.cuda else f"{torch.__version__}+cpu"
-        url = f"https://data.pyg.org/whl/torch-{tag}.html"
-        _pip_install(["torch-scatter", "-f", url], env=pip_env)
-    except Exception as exc:
-        print(f"torch-scatter install skipped/failed ({exc}); continuing", flush=True)
+    ensure_torch_scatter()
 
     if str(repo) not in sys.path:
         sys.path.insert(0, str(repo))
