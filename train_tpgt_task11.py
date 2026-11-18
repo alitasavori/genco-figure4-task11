@@ -3751,11 +3751,18 @@ def read_rpe_scales_payload(cache_dir: Path) -> dict | None:
         return None
 
 
-def load_rpe_global_scales(persistent: Path) -> tuple[float, float] | None:
+def load_rpe_global_scales(
+    persistent: Path,
+    *,
+    require_cache_version: bool = True,
+) -> tuple[float, float] | None:
+    """Load ``(s_R, s_X)``. Checkpoint version must match; cache version is optional for copy/reuse."""
     payload = read_rpe_scales_payload(persistent)
     if payload is None:
         return None
-    if payload.get("version") != CACHE_VERSION or payload.get("checkpoint_version") != CHECKPOINT_VERSION:
+    if payload.get("checkpoint_version") != CHECKPOINT_VERSION:
+        return None
+    if require_cache_version and payload.get("version") != CACHE_VERSION:
         return None
     return float(payload["rpe_re_scale"]), float(payload["rpe_im_scale"])
 
@@ -3808,36 +3815,68 @@ def cross_grid_checkpoint_root(checkpoints: Path, ckpt_root: Path | None) -> boo
         return ckpt_root != checkpoints
 
 
+def _adopt_rpe_scales(persistent: Path, folder: Path, scales: tuple[float, float]) -> None:
+    payload = read_rpe_scales_payload(folder)
+    raw_re = None if payload is None else payload.get("rpe_re_peak_raw")
+    raw_im = None if payload is None else payload.get("rpe_im_peak_raw")
+    old_ver = None if payload is None else payload.get("version")
+    source = "copied_from_" + folder.name
+    if old_ver and old_ver != CACHE_VERSION:
+        source = f"{source}_rewrote_{old_ver}_to_{CACHE_VERSION}"
+        print(
+            f"RPE scales: adopting {folder}/{RPE_SCALES_FILE} despite cache version "
+            f"{old_ver!r} (want {CACHE_VERSION!r}); checkpoint_version matches.",
+            flush=True,
+        )
+    save_rpe_global_scales(
+        persistent,
+        scales[0],
+        scales[1],
+        raw_re=float(raw_re) if raw_re is not None else None,
+        raw_im=float(raw_im) if raw_im is not None else None,
+        source=source,
+    )
+    log_rpe_scales_provenance(persistent, context="eval cache (adopted)")
+    print(
+        f"RPE scales for eval caches: copied from {folder} -> {rpe_scales_path(persistent)}",
+        flush=True,
+    )
+
+
 def copy_training_rpe_scales(persistent: Path, weight_run: Path) -> None:
     """Reuse ``s_R,s_X`` from another run (cross-grid Table 4 eval with foreign checkpoints)."""
     if load_rpe_global_scales(persistent) is not None:
         return
-    candidates = [weight_run / "cache", Path(f"/content/{weight_run.name}_cache")]
+    # Prefer rewriting an already-present Task 3.1 file with a matching checkpoint_version
+    # but older CACHE_VERSION (common after cache bumps), then fall back to the weight run.
+    candidates = [
+        persistent,
+        weight_run / "cache",
+        Path(f"/content/{weight_run.name}_cache"),
+    ]
     for folder in candidates:
-        scales = load_rpe_global_scales(folder)
+        scales = load_rpe_global_scales(folder, require_cache_version=False)
         if scales is not None:
-            payload = read_rpe_scales_payload(folder)
-            raw_re = None if payload is None else payload.get("rpe_re_peak_raw")
-            raw_im = None if payload is None else payload.get("rpe_im_peak_raw")
-            source = "copied_from_" + folder.name
-            save_rpe_global_scales(
-                persistent,
-                scales[0],
-                scales[1],
-                raw_re=float(raw_re) if raw_re is not None else None,
-                raw_im=float(raw_im) if raw_im is not None else None,
-                source=source,
-            )
-            log_rpe_scales_provenance(folder, context="weight run")
-            print(
-                f"RPE scales for eval caches: copied from {folder} -> {rpe_scales_path(persistent)}",
-                flush=True,
-            )
+            _adopt_rpe_scales(persistent, folder, scales)
             return
+    details: list[str] = []
+    for folder in candidates:
+        path = rpe_scales_path(folder)
+        payload = read_rpe_scales_payload(folder)
+        if not path.is_file():
+            details.append(f"{folder}: missing {RPE_SCALES_FILE}")
+        elif payload is None:
+            details.append(f"{path}: unreadable")
+        else:
+            details.append(
+                f"{path}: got version={payload.get('version')!r} "
+                f"checkpoint_version={payload.get('checkpoint_version')!r}; "
+                f"want {CACHE_VERSION!r} + {CHECKPOINT_VERSION!r}"
+            )
     raise RuntimeError(
-        f"Missing RPE scales for eval caches (expected {rpe_scales_path(persistent)}). "
+        f"Missing usable RPE scales for eval caches (expected {rpe_scales_path(persistent)}). "
         f"Train on this arch once so {weight_run / 'cache' / RPE_SCALES_FILE} exists, "
-        f"or copy that file into {persistent}."
+        f"or copy that file into {persistent}. Looked at: " + "; ".join(details)
     )
 
 

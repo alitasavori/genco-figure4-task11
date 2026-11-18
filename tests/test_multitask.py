@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -147,6 +148,34 @@ def test_copy_training_rpe_scales_from_checkpoint_cache(tmp_path):
     payload = tpgt.read_rpe_scales_payload(dest)
     assert payload is not None
     assert payload.get("rpe_re_peak_raw") == 0.8
+
+
+def test_copy_training_rpe_scales_rewrites_stale_cache_version(tmp_path, monkeypatch):
+    """Older Drive scales (matching checkpoint_version) should be adopted after a CACHE_VERSION bump."""
+    monkeypatch.setattr(tpgt, "CACHE_VERSION", "tpgt-cache-14")
+    monkeypatch.setattr(tpgt, "CHECKPOINT_VERSION", "meshed-rpe-2-d8-w96-h4-pqvt-busBS-v9")
+    ckpt = tmp_path / "tpgt_task11_v9"
+    dest = tmp_path / "tpgt_task3.1_v9" / "cache"
+    dest.mkdir(parents=True)
+    (ckpt / "cache").mkdir(parents=True)
+    stale = {
+        "version": "tpgt-cache-12",
+        "checkpoint_version": "meshed-rpe-2-d8-w96-h4-pqvt-busBS-v9",
+        "rpe_re_scale": 1.0,
+        "rpe_im_scale": 1.0,
+        "rpe_re_peak_raw": 0.15,
+        "rpe_im_peak_raw": 0.75,
+        "source": "train_fit_train",
+    }
+    (ckpt / "cache" / tpgt.RPE_SCALES_FILE).write_text(json.dumps(stale), encoding="utf-8")
+    assert tpgt.load_rpe_global_scales(ckpt / "cache") is None
+    assert tpgt.load_rpe_global_scales(ckpt / "cache", require_cache_version=False) == (1.0, 1.0)
+    tpgt.copy_training_rpe_scales(dest, ckpt)
+    assert tpgt.load_rpe_global_scales(dest) == (1.0, 1.0)
+    payload = tpgt.read_rpe_scales_payload(dest)
+    assert payload is not None
+    assert payload["version"] == "tpgt-cache-14"
+    assert payload.get("rpe_re_peak_raw") == 0.15
 
 
 def test_load_rpe_global_scales_rejects_stale_version(tmp_path):

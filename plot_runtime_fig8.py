@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -471,7 +472,7 @@ def run_notebook_section54(
     same in-memory protocol on L4 (exploratory; not paper-comparable absolute times).
     ``weight_run`` is the Task 1.1 checkpoint folder containing ``seed_0/``.
     """
-    from train_tpgt_task11 import TASKS, split_cache_dirs
+    from train_tpgt_task11 import TASKS, apply_architecture_config, split_cache_dirs
 
     results = task_run / "results"
     results.mkdir(parents=True, exist_ok=True)
@@ -500,6 +501,10 @@ def run_notebook_section54(
             "paper's H100-published numbers; only the TPGT points are measured here.",
             flush=True,
         )
+
+    # Arch must be applied before split_cache_dirs so Colab SSD path uses RUN_TAG (v9), not default v7.
+    os.environ.setdefault("GENCO_TPGT_ARCH", arch)
+    apply_architecture_config()
 
     if rebench or not cache_path.is_file():
         active, persistent = split_cache_dirs(task_run, TASKS["3.1"])
