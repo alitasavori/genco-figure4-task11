@@ -95,8 +95,41 @@ def release_cuda_memory() -> None:
         torch.cuda.ipc_collect()
 
 
+def _pip_install(args: list[str], *, env: dict[str, str] | None = None) -> None:
+    """Run ``pip install`` and surface stdout/stderr on failure (no ``-q``)."""
+    cmd = [sys.executable, "-m", "pip", "install", *args]
+    print("+ " + " ".join(cmd), flush=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    if proc.returncode == 0:
+        return
+    if proc.stdout:
+        print(proc.stdout[-6000:], flush=True)
+    if proc.stderr:
+        print(proc.stderr[-6000:], flush=True)
+    raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+
+def _relax_graphkit_python_requires(repo: Path) -> None:
+    """Paper branch pins ``<3.13``; Colab may be 3.12/3.13. Widen for editable install only."""
+    path = repo / "pyproject.toml"
+    if not path.is_file():
+        return
+    text = path.read_text(encoding="utf-8")
+    old = 'requires-python = ">=3.10,<3.13"'
+    new = 'requires-python = ">=3.10,<3.14"'
+    if old in text:
+        path.write_text(text.replace(old, new), encoding="utf-8")
+        print(f"Relaxed {path.name} requires-python to <3.14 for this Colab runtime.", flush=True)
+
+
 def ensure_graphkit(repo: Path | None = None) -> Path:
-    """Clone ``genco-paper-repro`` and ``pip install -e`` if ``gridfm_graphkit`` is missing."""
+    """Clone ``genco-paper-repro`` and install for inference timing beside TPGT.
+
+    Full ``pip install -e`` pulls ``torch>=2.7.1,<2.9`` / mlflow / datakit and breaks the
+    TPGT Colab env (and fails hard on Python 3.13). We install the package with
+    ``--no-deps``, ignore the paper Python cap, then add only imports needed for
+    matched-batch PF forward timing.
+    """
     repo = repo or default_graphkit_root()
     try:
         import gridfm_graphkit  # noqa: F401
@@ -112,28 +145,47 @@ def ensure_graphkit(repo: Path | None = None) -> Path:
             ["git", "clone", "--branch", GRAPHKIT_BRANCH, "--depth", "1", GRAPHKIT_URL, str(repo)]
         )
     else:
-        subprocess.check_call(["git", "fetch", "origin", GRAPHKIT_BRANCH], cwd=repo)
-        subprocess.check_call(["git", "checkout", GRAPHKIT_BRANCH], cwd=repo)
-        subprocess.check_call(["git", "pull", "--ff-only", "origin", GRAPHKIT_BRANCH], cwd=repo)
+        # Already cloned (e.g. failed mid-install last run); keep local tree.
+        print(f"Using existing graphkit clone at {repo}", flush=True)
 
-    print(f"Installing gridfm-graphkit from {repo}", flush=True)
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-e", str(repo), "-q"])
+    _relax_graphkit_python_requires(repo)
+    os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
+    pip_env = os.environ.copy()
+    pip_env["PIP_IGNORE_REQUIRES_PYTHON"] = "1"
+
+    print(f"Installing gridfm-graphkit from {repo} (--no-deps, ignore requires-python)", flush=True)
+    _pip_install(["-e", str(repo), "--no-deps"], env=pip_env)
+
+    # Imports used by matched PF timing (param_handler → base_task → lightning).
+    runtime_deps = [
+        "torch-geometric>=2.6.1",
+        "pyyaml>=6.0.2",
+        "networkx>=3.4.2",
+        "lightning",
+        "pytorch-lightning",
+        "seaborn",
+    ]
+    print("Installing minimal graphkit runtime deps (keeping existing torch)…", flush=True)
+    _pip_install(runtime_deps, env=pip_env)
+
     try:
         import torch
 
         tag = torch.__version__ if torch.version.cuda else f"{torch.__version__}+cpu"
         url = f"https://data.pyg.org/whl/torch-{tag}.html"
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "torch-scatter", "-f", url, "-q"]
-        )
+        _pip_install(["torch-scatter", "-f", url], env=pip_env)
     except Exception as exc:
         print(f"torch-scatter install skipped/failed ({exc}); continuing", flush=True)
+
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
 
     import importlib
 
     importlib.invalidate_caches()
     import gridfm_graphkit  # noqa: F401
 
+    print(f"gridfm_graphkit import OK from {gridfm_graphkit.__file__}", flush=True)
     return repo
 
 
