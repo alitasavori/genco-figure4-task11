@@ -1,8 +1,9 @@
 """Step-2 GRIT attention sparsity diagnostics (no retrain).
 
 Captures dense attention from a trained grit checkpoint (v16/v9), writes bus×bus
-heatmaps, reports how many senders retain 90/95/99% of attention mass (and of
-weighted-message magnitude), and scores optimistic top-k renormalized PBL.
+attention (α) and message-magnitude (α‖v‖) heatmaps, reports how many senders
+retain 90/95/99% of attention mass (and of weighted-message magnitude), and
+scores optimistic top-k renormalized PBL.
 """
 
 from __future__ import annotations
@@ -233,18 +234,17 @@ def plot_attention_heatmap(
     title: str,
     types: np.ndarray | None = None,
     type_names: tuple[str, ...] = ("PQ", "PV", "Slack"),
-    log1p: bool = False,
+    cbar_label: str = "Attention weight α",
 ) -> None:
     apply_plot_style()
-    data = np.log1p(np.maximum(grid, 0.0) * 1e3) if log1p else grid
     buses = int(grid.shape[0])
     fig, axis = plt.subplots(figsize=(8.5, 7.2))
-    im = axis.imshow(data, aspect="equal", interpolation="nearest", cmap="magma")
+    im = axis.imshow(grid, aspect="equal", interpolation="nearest", cmap="magma")
     axis.set_xlabel("Sender bus")
     axis.set_ylabel("Receiver bus")
     axis.set_title(title)
     cbar = fig.colorbar(im, ax=axis, fraction=0.046, pad=0.04)
-    cbar.set_label("log1p(1000·α)" if log1p else "Attention weight α")
+    cbar.set_label(cbar_label)
     if types is not None and buses <= 80:
         # Light type ticks so PQ/PV/Slack structure is readable on case57.
         ticks = list(range(0, buses, max(1, buses // 12)))
@@ -450,8 +450,9 @@ def run_attention_sparsity_diagnostic(
             "stages": [],
         }
 
-        # Aggregate mean attention over stages for the main 2D grid.
+        # Aggregate mean attention / message over stages for the main 2D grids.
         stage_grids = []
+        stage_msg_grids = []
         for stage_i, payload in enumerate(captured):
             attn = payload["attn"]
             contrib = payload["contrib"]
@@ -471,14 +472,21 @@ def run_attention_sparsity_diagnostic(
                 work_dir / f"heatmap_{stem}_mean_heads.png",
                 title=f"{label} stage {stage_i + 1}: mean α (batch×heads)",
                 types=types,
+                cbar_label="Attention weight α",
             )
-            plot_attention_heatmap(
-                grid,
-                work_dir / f"heatmap_{stem}_mean_heads_log.png",
-                title=f"{label} stage {stage_i + 1}: log1p mean α",
-                types=types,
-                log1p=True,
-            )
+            if contrib is not None:
+                msg_grid = mean_attention_grid(contrib)
+                stage_msg_grids.append(msg_grid)
+                plot_attention_heatmap(
+                    msg_grid,
+                    work_dir / f"heatmap_{stem}_message_mean_heads.png",
+                    title=f"{label} stage {stage_i + 1}: mean α‖v‖ (batch×heads)",
+                    types=types,
+                    cbar_label="Message magnitude α‖v‖",
+                )
+                msg_npy = work_dir / f"msg_grid_{stem}.npy"
+                np.save(msg_npy, msg_grid)
+                _fsync_file(msg_npy)
             grid_path = work_dir / f"attn_grid_{stem}.npy"
             np.save(grid_path, grid)
             _fsync_file(grid_path)
@@ -487,7 +495,7 @@ def run_attention_sparsity_diagnostic(
                 work_dir / f"mass_curve_{stem}.png",
                 title=f"{label} stage {stage_i + 1}: cumulative attention mass",
             )
-            # Per-head grids for first/last stage only (avoid PNG spam).
+            # Per-head attention grids for first/last stage only (avoid PNG spam).
             if stage_i in (0, len(captured) - 1):
                 for h in range(int(attn.shape[1])):
                     hgrid = mean_attention_grid(attn, head=h)
@@ -496,6 +504,7 @@ def run_attention_sparsity_diagnostic(
                         work_dir / f"heatmap_{stem}_head{h}.png",
                         title=f"{label} stage {stage_i + 1} head {h}",
                         types=types,
+                        cbar_label="Attention weight α",
                     )
 
             stage_entry = {
@@ -546,18 +555,27 @@ def run_attention_sparsity_diagnostic(
                 work_dir / f"heatmap_{label}_all_stages_mean.png",
                 title=f"{label}: mean α over stages×batch×heads",
                 types=types,
-            )
-            plot_attention_heatmap(
-                mean_all,
-                work_dir / f"heatmap_{label}_all_stages_mean_log.png",
-                title=f"{label}: log1p mean α over stages",
-                types=types,
-                log1p=True,
+                cbar_label="Attention weight α",
             )
             np_path = work_dir / f"attn_grid_{label}_all_stages.npy"
             np.save(np_path, mean_all)
             _fsync_file(np_path)
             label_summary["primary_heatmap"] = f"heatmap_{label}_all_stages_mean.png"
+        if stage_msg_grids:
+            mean_msg = np.mean(np.stack(stage_msg_grids, axis=0), axis=0)
+            plot_attention_heatmap(
+                mean_msg,
+                work_dir / f"heatmap_{label}_all_stages_message_mean.png",
+                title=f"{label}: mean α‖v‖ over stages×batch×heads",
+                types=types,
+                cbar_label="Message magnitude α‖v‖",
+            )
+            msg_all_path = work_dir / f"msg_grid_{label}_all_stages.npy"
+            np.save(msg_all_path, mean_msg)
+            _fsync_file(msg_all_path)
+            label_summary["primary_message_heatmap"] = (
+                f"heatmap_{label}_all_stages_message_mean.png"
+            )
 
         # Optimistic top-k: dense scores → keep k → renormalize (still needs dense scoring).
         topk_rows: list[dict[str, Any]] = []
@@ -625,14 +643,14 @@ def run_attention_sparsity_diagnostic(
 
 
 def display_attn_sparsity(out_dir: Path, labels: tuple[str, ...] = ("N", "N-1", "N-2")) -> None:
-    """Notebook helper: show primary heatmaps + mass CSV."""
+    """Notebook helper: show primary attention + message heatmaps + mass CSV."""
     from IPython.display import Image, display
     import pandas as pd
 
     for label in labels:
         for name in (
             f"heatmap_{label}_all_stages_mean.png",
-            f"heatmap_{label}_all_stages_mean_log.png",
+            f"heatmap_{label}_all_stages_message_mean.png",
         ):
             path = out_dir / name
             if path.is_file():
@@ -644,6 +662,13 @@ def display_attn_sparsity(out_dir: Path, labels: tuple[str, ...] = ("N", "N-1", 
             last = stages[-1]
             print(last.name, flush=True)
             display(Image(filename=str(last)))
+        msg_stages = sorted(
+            out_dir.glob(f"heatmap_{label}_stage*_message_mean_heads.png")
+        )
+        if msg_stages:
+            last_msg = msg_stages[-1]
+            print(last_msg.name, flush=True)
+            display(Image(filename=str(last_msg)))
         curve = sorted(out_dir.glob(f"mass_curve_{label}_stage*.png"))
         if curve:
             print(curve[-1].name, flush=True)
