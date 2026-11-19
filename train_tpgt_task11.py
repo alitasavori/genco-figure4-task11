@@ -153,6 +153,7 @@ Performance notes (Colab / large train split)
 from __future__ import annotations
 
 import contextlib
+import csv
 import hashlib
 import json
 import gc
@@ -264,7 +265,7 @@ ATTENTION_KIND = "grit"
 RAW_RPE_ATTENTION_KINDS = frozenset({"joint_mlp", "grpe", "grpe_elec", "exphormer", "efla", "wire", "pair_rotary"})
 GRPE_ATTENTION_KINDS = frozenset({"grpe", "grpe_elec"})
 # Kernels that write float32 activations into buffers incompatible with AMP Half.
-AMP_DISABLED_ATTENTION_KINDS = frozenset({"exphormer", "efla", "wire", "pair_rotary"})
+AMP_DISABLED_ATTENTION_KINDS = frozenset({"exphormer", "efla", "wire", "pair_rotary", "jsgc"})
 # Shortest-path hop bins: 0..GRPE_MAX_HOP plus one overflow bin (hop > max or unreachable).
 GRPE_MAX_HOP = 8
 GRPE_EDGE_SELF = 0
@@ -457,6 +458,21 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "CHECKPOINT_VERSION": "meshed-rpe-1-d12-w96-h4-pqvt-busBS-v17",
         "USE_NODE_SHUNT": True,
         "ATTENTION_KIND": "grit",
+        "RPE_CHANNELS": "im",
+    },
+    # JSGC-Net: type-pair Sparse GRIT (physical edges) + Jacobian coarse global correction.
+    # Keeps TPGT type-pair GRIT params; replaces dense all-pairs attention with local edges.
+    # DEPTH = correction iterations K; D/D_A/HEADS size the local type-pair GRIT pathway.
+    "v18": {
+        "D": 64,
+        "D_E": 32,
+        "D_A": 32,
+        "HEADS": 2,
+        "DEPTH": 4,
+        "RUN_TAG": "v18",
+        "CHECKPOINT_VERSION": "jsgc-typepair-k4-l2-w64-h2-da32-r16-v18",
+        "USE_NODE_SHUNT": True,
+        "ATTENTION_KIND": "jsgc",
         "RPE_CHANNELS": "im",
     },
 }
@@ -5336,10 +5352,11 @@ def apply_architecture_config() -> str:
         "efla",
         "wire",
         "pair_rotary",
+        "jsgc",
     ):
         raise ValueError(
             f"unknown ATTENTION_KIND {ATTENTION_KIND!r}; "
-            "use grit, joint_mlp, grpe, grpe_elec, exphormer, efla, wire, or pair_rotary"
+            "use grit, joint_mlp, grpe, grpe_elec, exphormer, efla, wire, pair_rotary, or jsgc"
         )
     if GRPE_MAX_HOP < 0:
         raise ValueError(f"GRPE_MAX_HOP must be >= 0, got {GRPE_MAX_HOP}")
@@ -5395,6 +5412,11 @@ def architecture_summary() -> str:
             f"pair_rotary(feat={PAIR_ROTARY_FEATURE_DIM}, blocks={D_A // 2}, "
             f"softmax+connectivity_mask)"
         )
+    elif ATTENTION_KIND == "jsgc":
+        attn_txt = (
+            f"jsgc(type-pair SparseGRIT L=2 on physical edges + Jacobi/coarse K={DEPTH}, "
+            f"d={D}, h={HEADS}, da={D_A}, de={D_E}, pairs=9)"
+        )
     else:
         attn_txt = "grit"
     rpe_txt = "+".join(RPE_FEATURE_NAMES)
@@ -5407,6 +5429,26 @@ def architecture_summary() -> str:
 
 def count_parameters(model: nn.Module) -> int:
     return sum(int(param.numel()) for param in model.parameters())
+
+
+def build_model() -> nn.Module:
+    """Construct TPGT or JSGC-Net according to ``ATTENTION_KIND`` / ARCH preset."""
+    if ATTENTION_KIND == "jsgc":
+        from jsgc_net import JSGCNet
+
+        # DEPTH preset → correction iterations; D/D_A/HEADS/D_E → local GNN size.
+        return JSGCNet(
+            d=int(D),
+            d_a=int(D_A),
+            d_e=int(D_E),
+            heads=int(HEADS),
+            layers=2,
+            k_iter=int(DEPTH),
+            r_theta=8,
+            r_v=8,
+            use_learned_local=True,
+        )
+    return TPGT()
 
 
 def parse_learning_rate(*, default: float | None = None) -> float:
@@ -6897,7 +6939,7 @@ def clear_pair_embed_cache(networks: list[Network] | DeviceNetworks) -> None:
 
 
 def pair_features(
-    model: TPGT,
+    model: nn.Module,
     network: Network,
     *,
     host: Network | None = None,
@@ -6906,7 +6948,10 @@ def pair_features(
 
     When ``host`` is set (or ``network._embed_host`` from DeviceNetworks), the embedding is also
     stored on the host so LRU rematerialization via ``move_to`` reuses it across eval passes.
+    JSGC ignores dense pair features — returns a placeholder matching ``network.rpe`` shape.
     """
+    if ATTENTION_KIND == "jsgc" or not hasattr(model, "encode_pairs"):
+        return network.rpe
     host = host if host is not None else getattr(network, "_embed_host", None)
     if not model.training and network.pair_embed is not None:
         return network.pair_embed
@@ -6927,7 +6972,7 @@ def pair_features(
 
 
 def forward_cases(
-    model: TPGT,
+    model: nn.Module,
     split: Split,
     network: Network,
     index: np.ndarray,
@@ -8113,8 +8158,8 @@ def train_seed(
     if device.type == "cuda":
         gc.collect()
         torch.cuda.empty_cache()
-    model = TPGT().to(device)
-    if wants_torch_compile():
+    model = build_model().to(device)
+    if wants_torch_compile() and ATTENTION_KIND != "jsgc":
         log("torch.compile enabled (GENCO_TPGT_COMPILE=1, GENCO_TPGT_FAST=1, or --compile / --fast)")
         model = torch.compile(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -8892,7 +8937,7 @@ def main() -> None:
     data = ensure_dataset(work, drive, spec)
     print(f"Dataset: {data}", flush=True)
     print(architecture_summary(), flush=True)
-    probe = TPGT()
+    probe = build_model()
     print(f"Model parameters: {count_parameters(probe):,}", flush=True)
     del probe
     stage_weight_text = " ".join(f"s{i + 1} {w:g}" for i, w in enumerate(physics_stage_weights(DEPTH)))
@@ -9100,7 +9145,7 @@ def cli_eval_only() -> None:
             print(f"Seed {seed}: no compatible last.pt under {seed_dir}, skipping.", flush=True)
             continue
         state, epoch, ckpt_path = picked
-        model = TPGT().to(device)
+        model = build_model().to(device)
         model.load_state_dict(state, strict=True)
         model.eval()
         print(f"Seed {seed}: loaded epoch {epoch} from {ckpt_path}", flush=True)
@@ -9184,7 +9229,7 @@ def cli_diagnose(
         val_split = load_task_split(data, "valid", active_cache, persistent_cache)
     val_net = dominant_network_id(val_split)
     network = move_to(val_split.networks[val_net], device)
-    model = TPGT().to(device)
+    model = build_model().to(device)
     seed_dir = checkpoints / f"seed_{seed}"
     ckpt = checkpoint or (seed_dir / "last.pt")
     if ckpt.exists():
@@ -9343,7 +9388,7 @@ def _cli_load_grit_checkpoint(
         purpose=purpose,
     )
     ckpt = checkpoint or (seed_dir / "last.pt")
-    model = TPGT().to(device)
+    model = build_model().to(device)
     if not ckpt.exists():
         raise SystemExit(f"No checkpoint at {ckpt}")
     payload = try_load_checkpoint_file(ckpt, device)
@@ -9482,8 +9527,152 @@ def cli_attn_rank(
         )
 
 
+def cli_jsgc_baseline(
+    *,
+    cases: int = 64,
+    k_values: tuple[int, ...] = (2, 4, 6),
+    seed: int = 0,
+) -> None:
+    """Score physics-only Jacobi+coarse baseline on Task 1.1 case57 (N / N-1 / N-2).
+
+    Writes ``jsgc_baseline_k{K}.csv`` under the seed ``jsgc_baseline/`` folder.
+    No neural network — control experiment for ARCH v18.
+    """
+    from jsgc_physics import (
+        TopologyCache,
+        ac_power_injections,
+        baseline_iterate,
+        prepare_topology,
+        reduced_to_tpgt_unknown,
+    )
+
+    ensure_runtime_packages()
+    os.environ.setdefault("GENCO_TPGT_ARCH", "v18")
+    os.environ.setdefault("GENCO_TPGT_CASE", "case57")
+    apply_architecture_config()
+    spec = parse_task()
+    drive = google_drive_root()
+    outputs = drive_output_dirs(drive, spec)
+    work, legacy_results = legacy_locations(drive)
+    if outputs is not None:
+        checkpoints, _results = outputs
+    else:
+        checkpoints = work / spec.run_dir_name
+    data = ensure_dataset(work, drive, spec)
+    active_cache, persistent_cache = split_cache_dirs(checkpoints, spec)
+    # Build train RPE scales so test caches share normalizers.
+    warm_split_caches(data, active_cache, persistent_cache, spec, load_valid=False)
+    seed_dir = checkpoints / f"seed_{seed}"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = require_persistent_output_dir(seed_dir / "jsgc_baseline", purpose="JSGC baseline")
+    print(f"JSGC baseline: data={data} out={out_dir} cases/split≤{cases}", flush=True)
+
+    rows: list[dict[str, object]] = []
+    grid = eval_case_names(spec)[0]
+    for label, topology, condition in TEST_PARTS:
+        cache_name = (
+            f"test_{grid}_{topology}_{condition}"
+            if spec.task_id == "3.1"
+            else f"test_{topology}_{condition}"
+        )
+        split = cached_split(
+            active_cache,
+            persistent_cache,
+            raw_dir(data, "test", topology, condition, grid),
+            cache_name,
+        )
+        n_take = min(int(cases), int(split.count))
+        cache_by_net: dict[int, TopologyCache] = {}
+        for k in k_values:
+            pbls: list[float] = []
+            for i in range(n_take):
+                nid = int(split.network_index[i].item())
+                network = split.networks[nid]
+                v_lab = split.voltage[i].to(dtype=torch.float64)
+                if nid not in cache_by_net:
+                    cache_by_net[nid] = prepare_topology(
+                        network.ybus.cpu(),
+                        network.types.cpu(),
+                        r_theta=8,
+                        r_v=8,
+                        v_set=v_lab,
+                    )
+                cache = cache_by_net[nid]
+                # Keep Jacobian/P at first-seen setpoints; start iterate from this scenario's Vset.
+                cache.v0 = v_lab.clone()
+                p = split.power_p[i].to(dtype=torch.float64)
+                q = split.power_q[i].to(dtype=torch.float64)
+                theta, v, _hist = baseline_iterate(p, q, cache, k=k)
+                p_calc, q_calc = ac_power_injections(theta, v, cache.g, cache.b)
+                unknown = reduced_to_tpgt_unknown(
+                    theta, v, p_calc=p_calc, q_calc=q_calc, types=network.types.cpu()
+                ).unsqueeze(0)
+                layout = network_layout(network)
+                specified, _ = pack_case(
+                    p.unsqueeze(0).float(),
+                    q.unsqueeze(0).float(),
+                    v_lab.unsqueeze(0).float(),
+                    split.angle[i].unsqueeze(0).float(),
+                    layout,
+                )
+                stats = pbl_from_unknown(
+                    specified.double(),
+                    unknown.double(),
+                    layout.types.cpu(),
+                    network.ybus.cpu().to(torch.complex128),
+                )
+                pbls.append(stats["mean"])
+            mean_p = float(np.mean(pbls)) if pbls else float("nan")
+            row = {
+                "k": k,
+                "label": label,
+                "cases": len(pbls),
+                "pbl_mean": mean_p,
+                "pbl_max_of_means": float(np.max(pbls)) if pbls else float("nan"),
+            }
+            rows.append(row)
+            print(f"  K={k} {label}: PBL mean={mean_p:.6g} over {len(pbls)} cases", flush=True)
+
+    for k in k_values:
+        csv_path = out_dir / f"jsgc_baseline_k{k}.csv"
+        with csv_path.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(
+                fh, fieldnames=["k", "label", "cases", "pbl_mean", "pbl_max_of_means"]
+            )
+            writer.writeheader()
+            writer.writerows([r for r in rows if int(r["k"]) == k])
+        print(f"Wrote {csv_path}", flush=True)
+    all_csv = out_dir / "jsgc_baseline_all.csv"
+    with all_csv.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(
+            fh, fieldnames=["k", "label", "cases", "pbl_mean", "pbl_max_of_means"]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Wrote {all_csv}", flush=True)
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--diagnose":
+    if len(sys.argv) > 1 and sys.argv[1] == "--jsgc-baseline":
+        cases_b = 64
+        seed_b = 0
+        args_b = sys.argv[2:]
+        index_b = 0
+        while index_b < len(args_b):
+            if args_b[index_b] == "--cases" and index_b + 1 < len(args_b):
+                cases_b = int(args_b[index_b + 1])
+                index_b += 2
+            elif args_b[index_b] == "--seed" and index_b + 1 < len(args_b):
+                seed_b = int(args_b[index_b + 1])
+                index_b += 2
+            elif args_b[index_b] in ("--data-fraction", "--task") and index_b + 1 < len(args_b):
+                index_b += 2
+            elif args_b[index_b].startswith(("--data-fraction=", "--task=")):
+                index_b += 1
+            else:
+                raise SystemExit(f"Unknown jsgc-baseline argument: {args_b[index_b]}")
+        cli_jsgc_baseline(cases=cases_b, seed=seed_b)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--diagnose":
         ckpt: Path | None = None
         seed = 0
         cases = 32
