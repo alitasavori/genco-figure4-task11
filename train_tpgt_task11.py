@@ -1603,7 +1603,12 @@ def _topk_renorm_attention(weights: torch.Tensor, k: int) -> torch.Tensor:
 
 
 def _lowrank_renorm_attention(weights: torch.Tensor, rank: int) -> torch.Tensor:
-    """Truncate each (N×N) attention head to rank ``r`` via SVD; clamp+row-renorm (diagnostic)."""
+    """Truncate each (N×N) attention head to rank ``r`` via SVD (diagnostic).
+
+    Raw SVD of softmax weights need not stay nonnegative, row-stochastic, or
+    support-preserving. Repair: restore the original zero pattern (masks /
+    empty rows), clamp negatives to 0, then row-renormalize.
+    """
     if rank <= 0:
         return weights
     batch, heads, buses, _ = weights.shape
@@ -1611,10 +1616,12 @@ def _lowrank_renorm_attention(weights: torch.Tensor, rank: int) -> torch.Tensor:
     if keep >= buses:
         return weights
     flat = weights.reshape(batch * heads, buses, buses)
+    support = flat > 0
     # full_matrices=False → U (N,N), S (N,), Vh (N,N) for square mats
     u_mat, singular, vh = torch.linalg.svd(flat, full_matrices=False)
     approx = (u_mat[:, :, :keep] * singular[:, :keep].unsqueeze(1)) @ vh[:, :keep, :]
-    approx = approx.reshape(batch, heads, buses, buses).clamp(min=0.0)
+    approx = approx.masked_fill(~support, 0.0).clamp(min=0.0)
+    approx = approx.reshape(batch, heads, buses, buses)
     row = approx.sum(dim=-1, keepdim=True)
     return torch.where(row > 0, approx / row.clamp(min=1e-12), weights)
 

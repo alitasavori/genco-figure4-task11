@@ -225,9 +225,11 @@ def run_attention_rank_diagnostic(
         "drive_out": str(drive_out),
         "stage_dir": str(stage_dir),
         "note": (
-            "Diagnostic only: E(r) from SVD of captured dense α / α‖v‖; "
-            "low-rank PBL truncates attention after softmax then row-renormalizes. "
-            "A production low-rank GRIT would need a separate implementation."
+            "Diagnostic only: E(r) from SVD of captured dense α / α‖v‖ (energy on "
+            "the raw matrix; no reconstruction). Low-rank PBL truncates softmax α "
+            "via SVD, then restores the original >0 support (masks), clamps≥0, and "
+            "row-renormalizes — raw SVD alone would break row sums / nonnegativity / "
+            "zeros. A production low-rank GRIT would need a separate implementation."
         ),
     }
 
