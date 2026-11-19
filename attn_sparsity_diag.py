@@ -234,13 +234,24 @@ def plot_topk_mass_curve(
 
 
 def _sample_indices(split, network_id: int, count: int) -> np.ndarray:
-    from train_tpgt_task11 import debug_sample_index
+    return _tpgt().debug_sample_index(split, network_id=network_id, count=count)
 
-    return debug_sample_index(split, network_id=network_id, count=count)
+
+def _tpgt():
+    """Import ``train_tpgt_task11`` and sync arch/case from env (needed under ``%run``)."""
+    import train_tpgt_task11 as tpgt
+
+    # ``%run train_tpgt_task11.py`` configures ``__main__``, not this import. Re-apply from env.
+    tpgt.apply_architecture_config()
+    return tpgt
 
 
 def _forward_capture(model, split, network, index, device, *, contrib: bool, topk: int | None):
-    from train_tpgt_task11 import case_pbl, forward_cases, move_to, pair_features
+    tpgt = _tpgt()
+    case_pbl = tpgt.case_pbl
+    forward_cases = tpgt.forward_cases
+    move_to = tpgt.move_to
+    pair_features = tpgt.pair_features
 
     device_network = move_to(network, device)
     pair = pair_features(model, device_network)
@@ -269,21 +280,29 @@ def run_attention_sparsity_diagnostic(
     eval_batch_size: int | None = None,
 ) -> dict[str, Any]:
     """Full Step-2 diagnostic: heatmaps, mass tables, optimistic top-k PBL."""
-    from train_tpgt_task11 import (
-        ATTENTION_KIND,
-        DEPTH,
-        HEADS,
-        TEST_PARTS,
-        TYPE_NAMES,
-        cached_split,
-        raw_dir,
-    )
+    tpgt = _tpgt()
+    ATTENTION_KIND = tpgt.ATTENTION_KIND
+    DEPTH = tpgt.DEPTH
+    HEADS = tpgt.HEADS
+    TEST_PARTS = tpgt.TEST_PARTS
+    TYPE_NAMES = tpgt.TYPE_NAMES
+    cached_split = tpgt.cached_split
+    raw_dir = tpgt.raw_dir
+    CASE_NAME = tpgt.CASE_NAME
 
     if ATTENTION_KIND != "grit":
         raise RuntimeError(f"--attn-sparsity requires grit attention, got {ATTENTION_KIND}")
+    print(f"Using CASE_NAME={CASE_NAME} for split paths under {data}", flush=True)
+    probe = raw_dir(data, "test", "n", "feasible")
+    if not (probe / "bus_data.parquet").is_file():
+        raise FileNotFoundError(
+            f"Missing test N feasible parquet at {probe / 'bus_data.parquet'} "
+            f"(CASE_NAME={CASE_NAME}). Check GENCO_TPGT_CASE and the vendor pack."
+        )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     summary: dict[str, Any] = {
+        "case": CASE_NAME,
         "depth": int(DEPTH),
         "heads": int(HEADS),
         "cases": int(cases),
