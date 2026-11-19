@@ -86,8 +86,10 @@ Performance notes (Colab / large train split)
 * **``pair_encoder``**: For GRIT arches, runs once per forward on the static
   ``118×118`` RPEs (stacked when several share bus types). For ``v10`` / ``v11`` /
   ``v11e`` / ``v12`` the encoder is ``Identity`` (raw ``r_ij`` path; GRPE also uses
-  ``hop_id``/``edge_id``; Exphormer uses ``exph_allow``/edge lists). In ``eval`` mode a
-  single-topology batch may cache pair features on ``Network.pair_embed``.
+  ``hop_id``/``edge_id``; Exphormer uses ``exph_allow``/edge lists). In ``eval`` mode
+  pair features persist on ``Network.pair_embed`` (and DeviceNetworks hosts) across
+  batches; GRIT also caches per-stage ``W_Ew e`` / ``W_Eb e`` block projections for
+  shared-topology pairs (Q/K/ξ/α still recompute every stage).
 * **Type-pair attention**: ``CorrectionStage._messages`` evaluates each of the
   nine (or fifteen for Exphormer) type-pair weight sets only on its own
   receiver-type × sender-type block (both heads batched), then takes one softmax over
@@ -1363,6 +1365,82 @@ class CorrectionStage(nn.Module):
             )
         return scores
 
+    def clear_elec_proj_cache(self) -> None:
+        """Drop cached ``W_Ew e`` / ``W_Eb e`` block projections (eval-only reuse)."""
+        self._elec_proj_cache_key = None
+        self._elec_proj_cache_blocks = None
+
+    def _elec_proj_cache_lookup(
+        self,
+        pair: torch.Tensor,
+        blocks: list[TypePairBlock],
+        *,
+        use_ew: bool,
+        use_eb: bool,
+    ) -> list[tuple[torch.Tensor | None, torch.Tensor | None]] | None:
+        """Return cached (projected, bias) per block when pair/topology/flags match."""
+        key = getattr(self, "_elec_proj_cache_key", None)
+        cached = getattr(self, "_elec_proj_cache_blocks", None)
+        if key is None or cached is None:
+            return None
+        want = self._elec_proj_cache_key_for(pair, blocks, use_ew=use_ew, use_eb=use_eb)
+        if key != want:
+            return None
+        return cached
+
+    @staticmethod
+    def _elec_proj_cache_key_for(
+        pair: torch.Tensor,
+        blocks: list[TypePairBlock],
+        *,
+        use_ew: bool,
+        use_eb: bool,
+    ) -> tuple:
+        # Shared-topology pair only (N, N, D_E). Block index tensors identify the type layout.
+        return (
+            int(pair.data_ptr()),
+            tuple(pair.shape),
+            bool(use_ew),
+            bool(use_eb),
+            tuple(
+                (
+                    int(block.pair_id),
+                    int(block.receivers.data_ptr()),
+                    int(block.senders.data_ptr()),
+                    int(block.receivers.numel()),
+                    int(block.senders.numel()),
+                )
+                for block in blocks
+            ),
+        )
+
+    def _project_elec_block(
+        self,
+        pair: torch.Tensor,
+        block: TypePairBlock,
+        *,
+        use_ew: bool,
+        use_eb: bool,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """``A=W_Ew e``, ``B=W_Eb e`` on one type-pair block (None when that term is ablated)."""
+        assert self.w_ew is not None and self.w_eb is not None
+        p = block.pair_id
+        receivers = block.receivers.view(-1, 1)
+        senders = block.senders.view(1, -1)
+        if pair.dim() == 3:
+            edge = pair[receivers, senders]
+            projected = (
+                torch.einsum("nme,hae->hnma", edge, self.w_ew[p]).unsqueeze(0) if use_ew else None
+            )
+            bias = (
+                torch.einsum("nme,hae->hnma", edge, self.w_eb[p]).unsqueeze(0) if use_eb else None
+            )
+        else:
+            edge = pair[:, receivers, senders]
+            projected = torch.einsum("bnme,hae->bhnma", edge, self.w_ew[p]) if use_ew else None
+            bias = torch.einsum("bnme,hae->bhnma", edge, self.w_eb[p]) if use_eb else None
+        return projected, bias
+
     def _messages_grit(
         self,
         hidden: torch.Tensor,
@@ -1379,31 +1457,35 @@ class CorrectionStage(nn.Module):
         use_eb = bool(getattr(self, "_grit_use_eb", True))
         use_ev = bool(getattr(self, "_grit_use_ev", True))
         zero_heads = getattr(self, "_grit_zero_heads", None)
-        for block in blocks:
+        # Inference: A_ij=W_Ew e_ij and B_ij=W_Eb e_ij are static for a fixed topology + weights.
+        # Cache per type-pair block across stages' repeated scenario forwards (shared pair only).
+        cache_ok = (not self.training) and pair.dim() == 3
+        cached_projs = (
+            self._elec_proj_cache_lookup(pair, blocks, use_ew=use_ew, use_eb=use_eb)
+            if cache_ok
+            else None
+        )
+        built_cache: list[tuple[torch.Tensor | None, torch.Tensor | None]] | None = (
+            [] if cache_ok and cached_projs is None else None
+        )
+        for block_index, block in enumerate(blocks):
             p = block.pair_id
-            receivers = block.receivers.view(-1, 1)
-            senders = block.senders.view(1, -1)
             query = torch.einsum("bnd,had->bhna", hidden[:, block.receivers], self.w_q[p])
             key = torch.einsum("bnd,had->bhna", hidden[:, block.senders], self.w_k[p])
             mixed = rho_nonlinearity(query.unsqueeze(-2) + key.unsqueeze(-3))
-            if pair.dim() == 3:
-                edge = pair[receivers, senders]
-                projected = (
-                    torch.einsum("nme,hae->hnma", edge, self.w_ew[p]).unsqueeze(0)
-                    if use_ew
-                    else None
-                )
-                bias = (
-                    torch.einsum("nme,hae->hnma", edge, self.w_eb[p]).unsqueeze(0)
-                    if use_eb
-                    else None
-                )
+            if cached_projs is not None:
+                projected, bias = cached_projs[block_index]
             else:
-                edge = pair[:, receivers, senders]
-                projected = (
-                    torch.einsum("bnme,hae->bhnma", edge, self.w_ew[p]) if use_ew else None
+                projected, bias = self._project_elec_block(
+                    pair, block, use_ew=use_ew, use_eb=use_eb
                 )
-                bias = torch.einsum("bnme,hae->bhnma", edge, self.w_eb[p]) if use_eb else None
+                if built_cache is not None:
+                    built_cache.append(
+                        (
+                            None if projected is None else projected.detach(),
+                            None if bias is None else bias.detach(),
+                        )
+                    )
             if projected is not None and bias is not None:
                 interaction = torch.relu(mixed * projected + bias)
             elif projected is not None:
@@ -1415,6 +1497,11 @@ class CorrectionStage(nn.Module):
             score = torch.einsum("bhnma,ha->bhnm", interaction, self.w_a[p, :, 0])
             scores = self._scatter_block_scores(scores, score, block, batch, buses)
             interactions.append(interaction)
+        if built_cache is not None:
+            self._elec_proj_cache_key = self._elec_proj_cache_key_for(
+                pair, blocks, use_ew=use_ew, use_eb=use_eb
+            )
+            self._elec_proj_cache_blocks = built_cache
         if scores is None:
             return hidden.new_zeros(hidden.shape)
         weights = torch.softmax(scores, dim=-1)
@@ -1675,6 +1762,13 @@ class TPGT(nn.Module):
     def encode_pairs(self, rpe: torch.Tensor) -> torch.Tensor:
         """Features for correction-stage attention (raw RPE for v10/v11/v12, else ``pair_encoder``)."""
         return rpe if self.use_raw_rpe else self.pair_encoder(rpe)
+
+    def clear_grit_elec_proj_caches(self) -> None:
+        """Invalidate per-stage ``W_Ew e`` / ``W_Eb e`` caches (weights changed or ablation flags)."""
+        for stage in self.stages:
+            clear = getattr(stage, "clear_elec_proj_cache", None)
+            if clear is not None:
+                clear()
 
     def encode_grpe(
         self,
@@ -3125,6 +3219,9 @@ def grit_component_flags(
         stage._grit_use_eb = use_eb
         stage._grit_use_ev = use_ev
         stage._grit_zero_heads = zero_heads
+        clear = getattr(stage, "clear_elec_proj_cache", None)
+        if clear is not None:
+            clear()
     try:
         yield
     finally:
@@ -3133,6 +3230,9 @@ def grit_component_flags(
             stage._grit_use_eb = eb
             stage._grit_use_ev = ev
             stage._grit_zero_heads = heads
+            clear = getattr(stage, "clear_elec_proj_cache", None)
+            if clear is not None:
+                clear()
 
 
 @contextlib.contextmanager
@@ -3171,7 +3271,6 @@ def evaluate_pbl_stage_cutoff(
     if stage_cutoff < 1 or stage_cutoff > len(model.stages):
         raise ValueError(f"stage_cutoff must be in 1..{len(model.stages)}, got {stage_cutoff}")
     model.eval()
-    clear_pair_embed_cache(networks)
     total = 0.0
     seen = 0
     with torch.no_grad():
@@ -6387,6 +6486,8 @@ class DeviceNetworks:
                 self._moved.popitem(last=False)
         else:
             self._moved.move_to_end(network_id)
+        # Host writeback target for eval pair_embed persistence across LRU rematerialization.
+        moved._embed_host = self.networks[network_id]  # type: ignore[attr-defined]
         return moved
 
     def resident(self) -> list[Network]:
@@ -6394,17 +6495,43 @@ class DeviceNetworks:
 
 
 def clear_pair_embed_cache(networks: list[Network] | DeviceNetworks) -> None:
-    for network in networks.resident() if isinstance(networks, DeviceNetworks) else networks:
+    if isinstance(networks, DeviceNetworks):
+        for host in networks.networks:
+            host.pair_embed = None
+        for network in networks.resident():
+            network.pair_embed = None
+        return
+    for network in networks:
         network.pair_embed = None
 
 
-def pair_features(model: TPGT, network: Network) -> torch.Tensor:
-    """Edge features for this topology (raw RPE for v10); cached in eval on that Network object only."""
+def pair_features(
+    model: TPGT,
+    network: Network,
+    *,
+    host: Network | None = None,
+) -> torch.Tensor:
+    """Edge features for this topology (raw RPE for v10); cached in eval on that Network object only.
+
+    When ``host`` is set (or ``network._embed_host`` from DeviceNetworks), the embedding is also
+    stored on the host so LRU rematerialization via ``move_to`` reuses it across eval passes.
+    """
+    host = host if host is not None else getattr(network, "_embed_host", None)
     if not model.training and network.pair_embed is not None:
+        return network.pair_embed
+    if not model.training and host is not None and host.pair_embed is not None:
+        cached = host.pair_embed
+        network.pair_embed = (
+            cached
+            if cached.device == network.rpe.device and cached.dtype == network.rpe.dtype
+            else cached.to(device=network.rpe.device, dtype=torch.float32, non_blocking=True)
+        )
         return network.pair_embed
     encoded = model.encode_pairs(network.rpe)
     if not model.training:
         network.pair_embed = encoded
+        if host is not None:
+            host.pair_embed = encoded
     return encoded
 
 
@@ -6588,6 +6715,12 @@ class PassBatch:
                 return pair_features(model, network)
             rpe = rpe_channel_dropout(network.rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
             return model.encode_pairs(rpe)
+        # Multi-topology: encode once, then (in eval) write each row back for later single-topo reuse.
+        if not model.training:
+            encoded_rows: list[torch.Tensor] = []
+            for network in self.networks:
+                encoded_rows.append(pair_features(model, network))
+            return torch.stack(encoded_rows)
         rpe = torch.stack([network.rpe for network in self.networks])
         rpe = rpe_channel_dropout(rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
         return model.encode_pairs(rpe)
@@ -7072,13 +7205,12 @@ def evaluate_pbl(
 ) -> float:
     """Mean final-stage PBL over ``split`` in full batches (several topologies and bus types per batch).
 
-    A single-topology batch reuses that topology's cached pair embedding, dropped once its cases are done.
+    Eval reuses ``Network.pair_embed`` across batches/topologies (and host copies under DeviceNetworks).
+    GRIT stages also cache ``W_Ew e`` / ``W_Eb e`` for shared-topology pair tensors.
     """
     model.eval()
-    clear_pair_embed_cache(networks)
     total = 0.0
     seen = 0
-    cached: dict[int, Network] = {}
     report_progress = progress_label is not None and split.count >= 256
     started = time.perf_counter()
     last_progress = started
@@ -7088,12 +7220,9 @@ def evaluate_pbl(
             batches += 1
             ids, inverse = np.unique(owners, return_inverse=True)
             inverse = inverse.reshape(-1)
-            for network_id in [key for key in cached if key not in set(ids.tolist())]:
-                cached.pop(network_id).pair_embed = None
             if len(ids) == 1:
                 network = networks[int(ids[0])]
                 _breakdown, score = run_batch(model, split, network, index, device)
-                cached[int(ids[0])] = network
                 sums = [float(score) * len(index)]
                 counts = [len(index)]
             else:
@@ -7128,8 +7257,6 @@ def evaluate_pbl(
                         flush=True,
                     )
                     last_progress = now
-    for network in cached.values():
-        network.pair_embed = None
     if seen != split.count:
         raise RuntimeError(f"Evaluated {seen} of {split.count} scenarios in {split.name}.")
     return total / seen

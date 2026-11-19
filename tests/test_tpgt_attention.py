@@ -192,6 +192,28 @@ def test_type_pair_blocks_partition_same_component_pairs() -> None:
     assert torch.equal(covered, same_component.long())
 
 
+def test_grit_elec_proj_cache_matches_uncached() -> None:
+    """Cached W_Ew e / W_Eb e in eval must match a cold forward (bit-close)."""
+    torch.manual_seed(4)
+    types = torch.tensor([0, 0, 1, 1, 2, 0, 1, 0], dtype=torch.long)
+    component = torch.zeros(types.numel(), dtype=torch.long)
+    buses = types.numel()
+    hidden = torch.randn(3, buses, D)
+    pair = torch.randn(buses, buses, D_E)
+    stage = random_stage()
+    blocks = type_pair_blocks(types, type_pair_masks(types, component))
+    stage.clear_elec_proj_cache()
+    with torch.no_grad():
+        cold = stage._messages_grit(hidden, pair, blocks)
+        warm = stage._messages_grit(hidden, pair, blocks)
+        assert getattr(stage, "_elec_proj_cache_blocks", None) is not None
+        stage.clear_elec_proj_cache()
+        cold_again = stage._messages_grit(hidden, pair, blocks)
+    assert torch.allclose(cold, warm, rtol=0.0, atol=0.0), (cold - warm).abs().max()
+    assert torch.allclose(cold, cold_again, rtol=0.0, atol=0.0), (cold - cold_again).abs().max()
+
+
 if __name__ == "__main__":
     test_batched_messages_match_reference()
+    test_grit_elec_proj_cache_matches_uncached()
     print("test_tpgt_attention OK")
