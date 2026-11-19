@@ -9406,8 +9406,11 @@ def cli_attn_rank(
     """Experiment B: SVD energy of attention / message matrices + low-rank PBL."""
     import importlib
 
+    import attn_sparsity_diag
     import attn_rank_diag
 
+    # Rank diag imports capture helpers from sparsity diag; reload both (Colab cache).
+    attn_sparsity_diag = importlib.reload(attn_sparsity_diag)
     attn_rank_diag = importlib.reload(attn_rank_diag)
 
     model, data, active_cache, persistent_cache, seed_dir, device, _ckpt = _cli_load_grit_checkpoint(

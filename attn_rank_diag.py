@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+import attn_sparsity_diag
 from attn_sparsity_diag import (
     _forward_capture,
     _fsync_file,
@@ -30,7 +31,6 @@ from attn_sparsity_diag import (
     _sample_indices,
     _tpgt,
     _write_text,
-    grit_attention_capture,
     publish_artifacts_to_drive,
     read_stage_attention,
 )
@@ -428,6 +428,8 @@ def run_attention_rank_diagnostic(
 
 def _forward_capture_lowrank(model, split, network, index, device, *, rank: int):
     """Forward with optimistic SVD truncation of attention (row-renormalized)."""
+    # Always resolve capture from the live module (Colab may keep a stale import).
+    capture_cm = attn_sparsity_diag.grit_attention_capture
     tpgt = _tpgt()
     case_pbl = tpgt.case_pbl
     forward_cases = tpgt.forward_cases
@@ -437,7 +439,7 @@ def _forward_capture_lowrank(model, split, network, index, device, *, rank: int)
     device_network = move_to(network, device)
     pair = pair_features(model, device_network)
     with torch.inference_mode():
-        with grit_attention_capture(model, contrib=False, topk=None, lowrank=int(rank)):
+        with capture_cm(model, contrib=False, topk=None, lowrank=int(rank)):
             _prediction, _target, residuals = forward_cases(
                 model, split, device_network, index, device, pair
             )
