@@ -931,6 +931,55 @@ def run_notebook_section54(
     return results
 
 
+def run_genco_batch_sweep_section54(
+    *,
+    task_run: Path,
+    grids: tuple[str, ...] | list[str] | None = ("case118",),
+    rebench: bool = True,
+    gpu_needle: str = "L4",
+) -> Path:
+    """GENCO-only batch sweep (every size) on the selected grids — no TPGT timing."""
+    import importlib
+
+    import bench_genco_matched
+
+    bench_genco_matched = importlib.reload(bench_genco_matched)
+
+    selected = normalize_bench_grids(grids)
+    buses = [GRID_TO_BUSES[g] for g in selected]
+    results = task_run / "results"
+    results.mkdir(parents=True, exist_ok=True)
+    needle = str(gpu_needle).strip().upper() or PAPER_GPU_NEEDLE
+    suffix = "" if needle == PAPER_GPU_NEEDLE else f"_{needle.lower()}"
+    grid_tag = "_".join(selected) if selected != TPGT_BENCH_GRIDS else "all"
+    json_path = results / f"runtime_genco_batch_sweep{suffix}_{grid_tag}.json"
+    csv_path = results / f"runtime_genco_batch_sweep{suffix}_{grid_tag}.csv"
+
+    gpu = require_gpu(
+        needle,
+        purpose=(
+            "GENCO paper §5.4 timings were measured on an exclusive NVIDIA H100 SXM5 80GB"
+            if needle == PAPER_GPU_NEEDLE
+            else f"This exploratory §5.4 cell requires NVIDIA {needle}"
+        ),
+    )
+    print(
+        f"GENCO batch sweep on {gpu} (needle={needle}) grids={selected} "
+        f"helper v{getattr(bench_genco_matched, 'BENCH_HELPER_VERSION', '?')}",
+        flush=True,
+    )
+    if rebench or not json_path.is_file() or not csv_path.is_file():
+        bench_genco_matched.run_genco_batch_sweep(
+            buses=buses,
+            results_path=json_path,
+            csv_path=csv_path,
+            gpu_name=gpu,
+        )
+    else:
+        print(f"Reusing GENCO sweep from {csv_path}", flush=True)
+    return results
+
+
 def run_notebook_multi_tpgt_section54(
     *,
     data_root: Path,
@@ -941,6 +990,7 @@ def run_notebook_multi_tpgt_section54(
     rebench: bool = True,
     rebench_genco: bool = True,
     match_genco: bool = True,
+    genco_batch_sweep: bool = True,
     published_json: Path = PUBLISHED_JSON,
     gpu_needle: str = "L4",
 ) -> Path:
@@ -948,6 +998,7 @@ def run_notebook_multi_tpgt_section54(
 
     Each ``runs`` entry needs ``label``, ``arch``, ``folder`` (under ``fm_root``).
     ``grids``: ``(\"case118\",)`` for IEEE-118 only, or ``TPGT_BENCH_GRIDS`` / ``(\"case57\",\"case118\",\"case500\")``.
+    When ``genco_batch_sweep=True``, also times GENCO Tiny/Small/Base at every batch size.
     """
     tpgt = _load_tpgt_trainer()
     TASKS = tpgt.TASKS
@@ -965,9 +1016,12 @@ def run_notebook_multi_tpgt_section54(
     suffix = "" if needle == PAPER_GPU_NEEDLE else f"_{needle.lower()}"
     grid_tag = "_".join(selected) if selected != TPGT_BENCH_GRIDS else "all"
     genco_cache = results / f"runtime_genco_matched{suffix}_{grid_tag}.json"
+    genco_sweep_json = results / f"runtime_genco_batch_sweep{suffix}_{grid_tag}.json"
+    genco_sweep_csv = results / f"runtime_genco_batch_sweep{suffix}_{grid_tag}.csv"
     head_name = f"figure8_genco_vs_multi_tpgt{suffix}_{grid_tag}.png"
     sum_name = f"runtime_multi_tpgt_summary{suffix}_{grid_tag}.json"
     csv_name = f"runtime_multi_tpgt{suffix}_{grid_tag}.csv"
+    sweep_csv_name = f"runtime_batch_sweep{suffix}_{grid_tag}.csv"
 
     gpu = require_gpu(
         needle,
@@ -1052,6 +1106,22 @@ def run_notebook_multi_tpgt_section54(
             print(f"Reusing matched GENCO timings from {genco_cache}", flush=True)
         genco_measured = genco_measured_from_payload(genco_payload)
 
+    genco_sweep_payload: dict[str, Any] | None = None
+    if match_genco and genco_batch_sweep:
+        genco_bench = _load_genco_matched_bench()
+        run_genco_batch_sweep = genco_bench.run_genco_batch_sweep
+        print("\n=== GENCO full batch sweep (every size) ===", flush=True)
+        if rebench_genco or not genco_sweep_csv.is_file():
+            genco_sweep_payload = run_genco_batch_sweep(
+                buses=[GRID_TO_BUSES[g] for g in selected],
+                results_path=genco_sweep_json,
+                csv_path=genco_sweep_csv,
+                gpu_name=gpu,
+            )
+        else:
+            genco_sweep_payload = json.loads(genco_sweep_json.read_text(encoding="utf-8"))
+            print(f"Reusing GENCO batch sweep from {genco_sweep_csv}", flush=True)
+
     plot_figure8_genco_vs_multi_tpgt(
         tpgt_series,
         genco_measured,
@@ -1119,10 +1189,64 @@ def run_notebook_multi_tpgt_section54(
             for model, series in genco_measured.items()
         },
         "genco_batch_by_bus": {str(b): batch for b, batch in batch_union.items()},
+        "genco_batch_sweep": bool(genco_batch_sweep and match_genco),
+        "genco_batch_sweep_csv": str(genco_sweep_csv) if genco_sweep_payload else None,
         "head_to_head_figure": head_name,
         "csv": csv_name,
     }
     (results / sum_name).write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    # Combined batch-sweep CSV: TPGT best-only rows already exist; append GENCO every-batch if present.
+    # Also write a dedicated combined file when we have GENCO sweep rows.
+    if genco_sweep_payload and genco_sweep_payload.get("rows"):
+        combined = results / sweep_csv_name
+        with combined.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(
+                [
+                    "model",
+                    "kind",
+                    "grid",
+                    "buses",
+                    "batch_size",
+                    "ms_per_instance",
+                    "is_best",
+                    "note",
+                ]
+            )
+            # TPGT: only the chosen best batch per model/grid (full TPGT sweep lives in per-run JSON logs).
+            for label, raw in tpgt_raw_by_label.items():
+                for buses, payload in raw.items():
+                    writer.writerow(
+                        [
+                            label,
+                            "tpgt",
+                            f"case{int(buses)}" if int(buses) != 500 else "case500",
+                            int(buses),
+                            int(float(payload["batch_size"])),
+                            f"{float(payload['ms_per_instance']):.6f}",
+                            1,
+                            "tpgt_best_from_sweep",
+                        ]
+                    )
+            for row in genco_sweep_payload["rows"]:
+                ms = row.get("ms_per_instance")
+                writer.writerow(
+                    [
+                        row["model"],
+                        row["kind"],
+                        row["grid"],
+                        row["buses"],
+                        row["batch_size"],
+                        f"{float(ms):.6f}" if ms is not None else "",
+                        row.get("is_best", 0),
+                        row.get("note", ""),
+                    ]
+                )
+        print(f"Wrote {combined}", flush=True)
+        summary["combined_batch_sweep_csv"] = sweep_csv_name
+        (results / sum_name).write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
     print(f"\nWrote {results / head_name}", flush=True)
     print(f"Wrote {csv_path}", flush=True)
     print(f"Wrote {results / sum_name}", flush=True)

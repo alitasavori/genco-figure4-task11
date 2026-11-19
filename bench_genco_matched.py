@@ -22,7 +22,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent
 
 # Bumped when Colab must reload this module after git pull (stale pip -q install path).
-BENCH_HELPER_VERSION = "protocol-warmup20-fwd"
+BENCH_HELPER_VERSION = "protocol-warmup20-fwd-batchsweep"
 
 # Keep in sync with plot_runtime_fig8 / paper GENCO in-memory notes (20 warmup batches).
 WARMUP_BATCHES = 20
@@ -595,4 +595,239 @@ def batches_from_tpgt_bench(tpgt_bench: dict[str, Any] | Path) -> dict[int, int]
         batch = int(float(payload["batch_size"]))
         if buses in NETWORK_BY_BUS:
             out[buses] = batch
+    return out
+
+
+def batch_sizes_for_bus(bus_count: int) -> list[int]:
+    """Same ascending sizes as TPGT L4 sweep (paper start + smaller fallbacks)."""
+    start = 64 if int(bus_count) < 500 else 16
+    paper: list[int] = []
+    batch = start
+    while batch <= 16_384:
+        paper.append(batch)
+        batch *= 2
+    smaller: list[int] = []
+    batch = start // 2
+    while batch >= 1:
+        smaller.append(batch)
+        batch //= 2
+    return list(reversed(smaller)) + paper
+
+
+def run_genco_batch_sweep(
+    *,
+    buses: list[int] | tuple[int, ...] = (118,),
+    data_root: Path | None = None,
+    results_path: Path | None = None,
+    csv_path: Path | None = None,
+    models: tuple[tuple[str, int], ...] = GENCO_MODELS,
+    max_preload: int = 2048,
+    gpu_name: str | None = None,
+) -> dict[str, Any]:
+    """Time GENCO Tiny/Small/Base at every batch size (TPGT-style sweep + OOM stop)."""
+    import csv
+    import torch
+
+    ensure_graphkit()
+    data_root = data_root or default_genco_data_root()
+    buses_list = [int(b) for b in buses if int(b) in NETWORK_BY_BUS]
+    if not buses_list:
+        raise ValueError(f"No supported buses in {buses}; choose from {sorted(NETWORK_BY_BUS)}")
+
+    # Preload enough for the largest sweep size we might try (cap by max_preload / OOM).
+    max_batch_wanted = max(max(batch_sizes_for_bus(b)) for b in buses_list)
+    ensure_runtime_networks(
+        data_root,
+        buses_list,
+        max_samples=max(max_preload, min(max_batch_wanted, max_preload)),
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type != "cuda":
+        raise RuntimeError("GENCO batch sweep requires CUDA.")
+    if gpu_name is None:
+        gpu_name = torch.cuda.get_device_name(0)
+
+    cfg_dir = REPO_ROOT / "results" / "configs" / "genco_batch_sweep"
+    out: dict[str, Any] = {
+        "protocol": {
+            "warmup_batches": WARMUP_BATCHES,
+            "min_bench_seconds": MIN_BENCH_SECONDS,
+            "kind": "genco_full_batch_sweep",
+            "compile": False,
+            "weights": "random init (paper: wall time independent of checkpoint)",
+        },
+        "gpu": gpu_name,
+        "data_root": str(data_root),
+        "by_model": {},
+        "rows": [],
+    }
+
+    for model_name, hidden in models:
+        model_payload: dict[str, Any] = {}
+        for bus_count in buses_list:
+            network = NETWORK_BY_BUS[bus_count]
+            sizes = batch_sizes_for_bus(bus_count)
+            processed = data_root / network / "processed"
+            # Need room for the largest non-OOM batch; start with max_preload.
+            preload_n = max_preload
+            print(
+                f"\n=== GENCO {model_name} sweep / {network} ({bus_count} buses) ===",
+                flush=True,
+            )
+            samples = _preload_samples(processed, preload_n)
+            cfg_path = cfg_dir / f"config_{network}_{model_name}.yaml"
+            _write_config(network, hidden, cfg_path)
+            release_cuda_memory()
+            model, normalizer, transforms = _build_model_and_pipe(cfg_path, samples, device)
+
+            sweep_rows: list[dict[str, Any]] = []
+            best_ms = float("inf")
+            best_batch = 0
+            try:
+                for batch_size in sizes:
+                    if batch_size > len(samples):
+                        # Expand preload if possible.
+                        need = min(max(batch_size, preload_n), max_preload * 4)
+                        if need > len(samples):
+                            print(
+                                f"  batch {batch_size}: skip (only {len(samples)} preloaded samples)",
+                                flush=True,
+                            )
+                            sweep_rows.append(
+                                {
+                                    "batch_size": batch_size,
+                                    "ms_per_instance": None,
+                                    "status": "skip_preload",
+                                }
+                            )
+                            continue
+                    try:
+                        ms = time_genco_batch(
+                            samples=samples,
+                            model=model,
+                            normalizer=normalizer,
+                            transforms=transforms,
+                            device=device,
+                            batch_size=batch_size,
+                        )
+                    except torch.OutOfMemoryError:
+                        release_cuda_memory()
+                        print(f"  batch {batch_size}: OOM — stopping upward sweep", flush=True)
+                        sweep_rows.append(
+                            {
+                                "batch_size": batch_size,
+                                "ms_per_instance": None,
+                                "status": "oom",
+                            }
+                        )
+                        out["rows"].append(
+                            {
+                                "model": f"GENCO {model_name.capitalize()}",
+                                "kind": "genco",
+                                "grid": f"case{bus_count}" if bus_count != 500 else "case500",
+                                "buses": bus_count,
+                                "batch_size": batch_size,
+                                "ms_per_instance": None,
+                                "is_best": 0,
+                                "note": "OOM",
+                            }
+                        )
+                        break
+                    except ValueError as exc:
+                        print(f"  batch {batch_size}: skip ({exc})", flush=True)
+                        sweep_rows.append(
+                            {
+                                "batch_size": batch_size,
+                                "ms_per_instance": None,
+                                "status": "skip",
+                                "error": str(exc),
+                            }
+                        )
+                        continue
+
+                    print(f"  batch {batch_size}: {ms:.4f} ms/instance", flush=True)
+                    sweep_rows.append(
+                        {
+                            "batch_size": batch_size,
+                            "ms_per_instance": float(ms),
+                            "status": "ok",
+                        }
+                    )
+                    if ms < best_ms:
+                        best_ms = float(ms)
+                        best_batch = int(batch_size)
+            finally:
+                del model, normalizer, transforms, samples
+                release_cuda_memory()
+
+            for row in sweep_rows:
+                is_best = int(
+                    row.get("status") == "ok"
+                    and row.get("batch_size") == best_batch
+                    and best_batch > 0
+                )
+                note = ""
+                if row.get("status") == "oom":
+                    note = "OOM"
+                elif row.get("status") not in (None, "ok"):
+                    note = str(row.get("status"))
+                out["rows"].append(
+                    {
+                        "model": f"GENCO {model_name.capitalize()}",
+                        "kind": "genco",
+                        "grid": "case500" if bus_count == 500 else f"case{bus_count}",
+                        "buses": bus_count,
+                        "batch_size": int(row["batch_size"]),
+                        "ms_per_instance": row.get("ms_per_instance"),
+                        "is_best": is_best,
+                        "note": note,
+                    }
+                )
+            model_payload[str(bus_count)] = {
+                "network": network,
+                "best_ms": None if best_batch == 0 else best_ms,
+                "best_batch": best_batch,
+                "sweep": sweep_rows,
+            }
+            if best_batch:
+                print(f"  best: {best_ms:.4f} ms @ batch {best_batch}", flush=True)
+        out["by_model"][model_name] = model_payload
+
+    if results_path is not None:
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        results_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
+        print(f"Wrote {results_path}", flush=True)
+
+    if csv_path is not None:
+        csv_path = Path(csv_path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(
+                fh,
+                fieldnames=[
+                    "model",
+                    "kind",
+                    "grid",
+                    "buses",
+                    "batch_size",
+                    "ms_per_instance",
+                    "is_best",
+                    "note",
+                ],
+            )
+            writer.writeheader()
+            for row in out["rows"]:
+                writer.writerow(
+                    {
+                        **row,
+                        "ms_per_instance": (
+                            f"{float(row['ms_per_instance']):.6f}"
+                            if row.get("ms_per_instance") is not None
+                            else ""
+                        ),
+                    }
+                )
+        print(f"Wrote {csv_path}", flush=True)
+
     return out
