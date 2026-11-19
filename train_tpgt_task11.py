@@ -32,14 +32,14 @@ The hidden sizes, depth, batch, and epoch cap below are implementation
 choices so a Colab GPU can finish a run. They are not paper hyperparameters.
 
 IEEE 118 is meshed, so pair features use the full in-service topology:
-complex effective impedance Re/Im (2 channels). See `meshed_rpe`.
+complex effective impedance (legacy Re/Im, or Im-only from v17). See `meshed_rpe`.
 
 Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
 ------------------------------------------------------------------------
 * **Correction stages** (``DEPTH``), each with its own weights; the physics
   loss sums stage residuals with GENCO weights ``0.5**(K-i)`` (last stage 1).
   Default ``DEPTH=4``; preset ``v8`` / ``v9`` / ``v10`` use ``DEPTH=8`` with wider
-  ``D/D_E/D_A/HEADS``; ``v16`` is v9 features/attention with ``DEPTH=12``.
+  ``D/D_E/D_A/HEADS``; ``v16``/``v17`` use ``DEPTH=12`` (v17 drops Real Zeff).
 * **Attention**: ``grit`` (default; v7–v9) uses pair-modulated GRIT scores on
   ``pair_encoder(RPE)``;   ``v10`` uses Approach C joint MLP scores on **raw** RPE
   ``r_ij`` (no pair encoder); ``v11`` uses Park et al. GRPE (shared hop/edge
@@ -58,7 +58,8 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
   v10: ``s=MLP([q‖k‖r])``; v11: ``s=(q·k + q·(P^Q+E^Q) + k·(P^K+E^K))/√D_A`` with
   ``o=Σ α (v+P^V+E^V)``. Softmax and type-pair blocks are unchanged. Angle step
   uses ``η_angle=1``.
-* **2-channel RPE**: ``Zeff_Re_norm``, ``Zeff_Im_norm`` (complex Laplacian effective impedance).
+* **RPE**: legacy ``Zeff_Re_norm`` + ``Zeff_Im_norm`` (v7–v16); **v17+ Im-only**
+  ``Zeff_Im_norm`` (Real Zeff dropped after ablation showed near-zero dependence).
 * **RPE channel dropout**: during training each channel is zeroed with
   probability ``RPE_CHANNEL_DROPOUT`` per optimizer step; never at eval.
 * **Versioned run folder**: checkpoints go to ``Foundation Model/tpgt_task11_<RUN_TAG>``
@@ -218,8 +219,11 @@ LAMBDA_PHYS = 0.5
 PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
-CACHE_VERSION = "tpgt-cache-14"
-RPE_FEATURE_NAMES = ("Zeff_Re_norm", "Zeff_Im_norm")
+CACHE_VERSION = "tpgt-cache-15"
+# Default / legacy (v7–v16): Re+Im. New arches (v17+) use Im-only via ``RPE_CHANNELS=im``.
+RPE_FEATURE_NAMES_RE_IM = ("Zeff_Re_norm", "Zeff_Im_norm")
+RPE_FEATURE_NAMES_IM = ("Zeff_Im_norm",)
+RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM
 RPE_DIM = len(RPE_FEATURE_NAMES)
 # v15 pair-rotary electrical pair features (ablate these, not Zeff RPE).
 PAIR_ELEC_FEATURE_NAMES = ("elec_dist", "edge_on", "edge_weight")
@@ -436,8 +440,29 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "CHECKPOINT_VERSION": "meshed-rpe-2-d12-w96-h4-pqvt-busBS-v16",
         "USE_NODE_SHUNT": True,
         "ATTENTION_KIND": "grit",
+        "RPE_CHANNELS": "re_im",
+    },
+    # v16 GRIT + DEPTH=12, but Zeff Im-only RPE (drop Real; ablation showed Re ≈ unused).
+    "v17": {
+        "D": 96,
+        "D_E": 48,
+        "D_A": 48,
+        "HEADS": 4,
+        "DEPTH": 12,
+        "RUN_TAG": "v17",
+        "CHECKPOINT_VERSION": "meshed-rpe-1-d12-w96-h4-pqvt-busBS-v17",
+        "USE_NODE_SHUNT": True,
+        "ATTENTION_KIND": "grit",
+        "RPE_CHANNELS": "im",
     },
 }
+# Legacy arches keep Re+Im; any new preset without ``RPE_CHANNELS`` defaults to Im-only.
+_LEGACY_RPE_RE_IM = frozenset(
+    {"v7", "v8", "v9", "v9d4", "v10", "v11", "v11e", "v12", "v13", "v14", "v15", "v16"}
+)
+for _arch_name, _preset in ARCH_PRESETS.items():
+    if "RPE_CHANNELS" not in _preset:
+        _preset["RPE_CHANNELS"] = "re_im" if _arch_name in _LEGACY_RPE_RE_IM else "im"
 # Fixed training subset scored with val's PBL metric each validation pass (overfitting check).
 TRAIN_PROBE_CASES = 2000
 # Reference labels must satisfy nodal balance within this mean PBL (p.u.) when checked at load.
@@ -3362,12 +3387,6 @@ def grit_ablation_specs(model: TPGT) -> list[dict[str, Any]]:
             "priority": 2,
         },
         {
-            "name": "Zeff_Re=0 (keep Im)",
-            "kind": "rpe_channel",
-            "channel": 0,
-            "priority": 3,
-        },
-        {
             "name": "W_Ew=0 (no multiplicative electrical)",
             "kind": "flags",
             "use_ew": False,
@@ -3376,6 +3395,17 @@ def grit_ablation_specs(model: TPGT) -> list[dict[str, Any]]:
             "priority": 4,
         },
     ]
+    # Legacy Re+Im arches only: zero Real Zeff (v17+ has Im-only RPE).
+    if "Zeff_Re_norm" in RPE_FEATURE_NAMES:
+        specs.insert(
+            3,
+            {
+                "name": "Zeff_Re=0 (keep Im)",
+                "kind": "rpe_channel",
+                "channel": int(RPE_FEATURE_NAMES.index("Zeff_Re_norm")),
+                "priority": 3,
+            },
+        )
     for head in range(HEADS):
         specs.append(
             {
@@ -4228,7 +4258,10 @@ def meshed_rpe(
     re_scale: float | None = None,
     im_scale: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Two pair features: normalized Re/Im of complex effective impedance (Method B).
+    """Pair features from complex effective impedance (Method B).
+
+    Legacy (``RPE_CHANNELS=re_im``): normalized Re and Im (2 channels).
+    v17+ (``RPE_CHANNELS=im``): Im only (1 channel) — Real Zeff dropped.
 
     Branch admittance ``y_ij = 1/(r_ij + j x_ij)`` on **off-diagonals only** (parallel
     branches add); diagonal entries stay zero until the Laplacian step. This is a
@@ -4236,9 +4269,10 @@ def meshed_rpe(
     Complex Laplacian ``L = diag(W 1) - W``. Then
     ``Z_eff(i,j) = L^†_ii + L^†_jj - 2 L^†_ij``.
 
-    Normalization: if ``re_scale`` / ``im_scale`` are given, divide all channels by
+    Normalization: if ``re_scale`` / ``im_scale`` are given, divide channels by
     those **global** positive scalars (same across topologies in a split). If omitted,
-    use legacy per-connected-component maxima (tests only).
+    use legacy per-connected-component maxima (tests only). ``re_scale`` is unused when
+    RPE is Im-only but still accepted for shared scale-file plumbing.
 
     ``ybus`` is unused (residual still uses full scenario Ybus).
     """
@@ -4269,10 +4303,17 @@ def meshed_rpe(
     same = component[:, None] == component[None, :]
     off_diagonal = same & ~np.eye(bus_count, dtype=bool)
     features = np.zeros((bus_count, bus_count, RPE_DIM), dtype=np.float32)
-    re = np.where(off_diagonal, z_eff.real / re_div, 0.0)
-    im = np.where(off_diagonal, z_eff.imag / im_div, 0.0)
-    features[..., 0] = re.astype(np.float32)
-    features[..., 1] = im.astype(np.float32)
+    re = np.where(off_diagonal, z_eff.real / re_div, 0.0).astype(np.float32)
+    im = np.where(off_diagonal, z_eff.imag / im_div, 0.0).astype(np.float32)
+    if RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_RE_IM and RPE_DIM == 2:
+        features[..., 0] = re
+        features[..., 1] = im
+    elif RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM and RPE_DIM == 1:
+        features[..., 0] = im
+    else:
+        raise RuntimeError(
+            f"meshed_rpe cannot map Zeff into RPE_FEATURE_NAMES={RPE_FEATURE_NAMES} RPE_DIM={RPE_DIM}"
+        )
 
     if not np.isfinite(features).all():
         raise RuntimeError("Meshed RPE contains non-finite values.")
@@ -4730,21 +4771,22 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
     )
 
     diagonal = np.arange(bus_count)
-    for channel, label in enumerate(("Re", "Im")):
+    for channel, name in enumerate(RPE_FEATURE_NAMES):
+        short = "re" if "Re" in name else "im" if "Im" in name else f"c{channel}"
         diag_ok = bool(np.allclose(rpe[diagonal, diagonal, channel], 0.0))
         checks.append(
             CorrectnessCheck(
-                f"diag_zeff_{label.lower()}_zero",
+                f"diag_zeff_{short}_zero",
                 diag_ok,
-                f"diagonal Zeff {label} is 0" if diag_ok else f"diagonal Zeff {label} must be 0",
+                f"diagonal {name} is 0" if diag_ok else f"diagonal {name} must be 0",
             )
         )
         sym_ok = bool(np.allclose(rpe[:, :, channel], rpe[:, :, channel].T, atol=1e-4))
         checks.append(
             CorrectnessCheck(
-                f"zeff_{label.lower()}_symmetric",
+                f"zeff_{short}_symmetric",
                 sym_ok,
-                f"normalized Zeff {label} symmetric" if sym_ok else f"Zeff {label} channel not symmetric",
+                f"normalized {name} symmetric" if sym_ok else f"{name} channel not symmetric",
             )
         )
 
@@ -4888,6 +4930,21 @@ def _parse_mlp_hiddens(raw: object, default: tuple[int, ...] = (128, 64)) -> tup
     return widths
 
 
+def apply_rpe_channel_config(channels: str) -> None:
+    """Set global ``RPE_FEATURE_NAMES`` / ``RPE_DIM`` from ``re_im`` or ``im``."""
+    global RPE_FEATURE_NAMES, RPE_DIM
+    key = str(channels).strip().lower().replace("+", "_").replace("-", "_")
+    if key in ("re_im", "reim", "both", "2"):
+        RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM
+    elif key in ("im", "im_only", "zeff_im", "1"):
+        RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_IM
+    else:
+        raise ValueError(
+            f"unknown RPE_CHANNELS {channels!r}; use re_im (legacy) or im (v17+)"
+        )
+    RPE_DIM = len(RPE_FEATURE_NAMES)
+
+
 def apply_architecture_config() -> str:
     """Apply ``ARCH_PRESETS`` / per-dim env overrides. Same residual, packing, and loss logic."""
     global D, D_E, D_A, HEADS, DEPTH, RUN_TAG, RUN_DIR_NAME, CHECKPOINT_VERSION
@@ -4910,6 +4967,7 @@ def apply_architecture_config() -> str:
         ATTENTION_MLP_HIDDENS = _parse_mlp_hiddens(
             preset.get("ATTENTION_MLP_HIDDENS", ATTENTION_MLP_HIDDENS)
         )
+        apply_rpe_channel_config(str(preset.get("RPE_CHANNELS", "im")))
     else:
         name = RUN_TAG
 
@@ -4943,6 +5001,9 @@ def apply_architecture_config() -> str:
     attn_override = os.environ.get("GENCO_TPGT_ATTENTION", "").strip().lower()
     if attn_override:
         ATTENTION_KIND = attn_override
+    rpe_ch_env = os.environ.get("GENCO_TPGT_RPE_CHANNELS", "").strip()
+    if rpe_ch_env:
+        apply_rpe_channel_config(rpe_ch_env)
     hop_env = os.environ.get("GENCO_TPGT_GRPE_MAX_HOP", "").strip()
     if hop_env:
         GRPE_MAX_HOP = int(hop_env)
@@ -5038,9 +5099,10 @@ def architecture_summary() -> str:
         )
     else:
         attn_txt = "grit"
+    rpe_txt = "+".join(RPE_FEATURE_NAMES)
     return (
         f"arch {RUN_TAG}: DEPTH={DEPTH} D={D} D_E={D_E} D_A={D_A} HEADS={HEADS} "
-        f"node_in={node_in} ({node_txt}) attn={attn_txt}{case_txt} "
+        f"node_in={node_in} ({node_txt}) attn={attn_txt} rpe={rpe_txt}{case_txt} "
         f"checkpoint_version={CHECKPOINT_VERSION}"
     )
 
