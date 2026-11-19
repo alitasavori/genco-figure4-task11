@@ -3283,6 +3283,138 @@ def zero_rpe_channel(networks: list[Network] | DeviceNetworks, channel: int):
             networks._moved.clear()
 
 
+@contextlib.contextmanager
+def zero_pair_elec_channel(networks: list[Network] | DeviceNetworks, channel: int):
+    """Temporarily zero one pair-rotary electrical feature channel (clears device copies)."""
+    hosts = networks.networks if isinstance(networks, DeviceNetworks) else list(networks)
+    saved: list[tuple[Network, torch.Tensor]] = []
+    for host in hosts:
+        feat, _component = ensure_network_pair_rotary(host)
+        saved.append((host, feat.detach().clone()))
+        host.pair_elec = feat.clone()
+        host.pair_elec[..., int(channel)] = 0.0
+        host.pair_embed = None
+    if isinstance(networks, DeviceNetworks):
+        networks._moved.clear()
+    try:
+        yield
+    finally:
+        for host, feat in saved:
+            host.pair_elec = feat
+            host.pair_embed = None
+        if isinstance(networks, DeviceNetworks):
+            networks._moved.clear()
+
+
+@contextlib.contextmanager
+def zero_active_pair_channel(networks: list[Network] | DeviceNetworks, channel: int):
+    """Zero the active pair representation channel (Zeff RPE or pair-elec)."""
+    if ATTENTION_KIND == "pair_rotary":
+        with zero_pair_elec_channel(networks, channel):
+            yield
+    else:
+        with zero_rpe_channel(networks, channel):
+            yield
+
+
+def active_pair_feature_names() -> tuple[str, ...]:
+    return PAIR_ELEC_FEATURE_NAMES if ATTENTION_KIND == "pair_rotary" else RPE_FEATURE_NAMES
+
+
+def run_pair_channel_split_ablations(
+    model: TPGT,
+    data: Path,
+    device: torch.device,
+    active_cache: Path,
+    persistent_cache: Path,
+    *,
+    labels: tuple[str, ...] = ("N", "N-1", "N-2"),
+    eval_batch_size: int = EVAL_BATCH_SIZE,
+    seed_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Full-split PBL for baseline and each pair/RPE channel zeroed on N / N-1 / N-2."""
+    names = active_pair_feature_names()
+    kind = "pair-elec" if ATTENTION_KIND == "pair_rotary" else "RPE"
+    rows: list[dict[str, Any]] = []
+    print(f"=== {kind} channel ablation on feasible N / N-1 / N-2 (full splits) ===", flush=True)
+    print(f"=== {kind} ablation: baseline ===", flush=True)
+    baseline_scores = score_feasible_splits(
+        model,
+        data,
+        device,
+        active_cache,
+        persistent_cache,
+        labels=labels,
+        eval_batch_size=eval_batch_size,
+    )
+    rows.append({"name": "baseline", "kind": "baseline", "scores": baseline_scores})
+    for channel, channel_name in enumerate(names):
+        print(f"=== {kind} ablation: {channel_name}=0 ===", flush=True)
+        scores: dict[str, float] = {}
+        for label, topology, condition in TEST_PARTS:
+            if label not in labels or condition != "feasible":
+                continue
+            split = cached_split(
+                active_cache,
+                persistent_cache,
+                raw_dir(data, "test", topology, condition),
+                f"test_{topology}_{condition}",
+            )
+            networks = DeviceNetworks(split.networks, device)
+            with zero_active_pair_channel(networks, channel):
+                scores[label] = evaluate_pbl(
+                    model,
+                    split,
+                    networks,
+                    device,
+                    batch_size=eval_batch_size,
+                    progress_label=label,
+                )
+            print(f"  {label}: PBL {scores[label]:.6g} ({split.count} scenarios)", flush=True)
+            if device.type == "cuda":
+                del networks
+                gc.collect()
+                torch.cuda.empty_cache()
+        rows.append(
+            {
+                "name": f"{channel_name}=0",
+                "kind": "pair_channel",
+                "channel": channel,
+                "channel_name": channel_name,
+                "scores": scores,
+            }
+        )
+    print(f"=== ΔPBL vs baseline ({kind}; positive = worse) ===", flush=True)
+    for row in rows:
+        if row["name"] == "baseline":
+            continue
+        deltas = {
+            label: float(row["scores"][label]) - float(baseline_scores[label])
+            for label in labels
+            if label in row["scores"] and label in baseline_scores
+        }
+        row["delta_vs_baseline"] = deltas
+        parts = "  ".join(f"{label} {delta:+.4g}" for label, delta in deltas.items())
+        print(f"  {row['name']}: {parts}", flush=True)
+    if seed_dir is not None:
+        seed_dir.mkdir(parents=True, exist_ok=True)
+        out = seed_dir / "pair_channel_split_ablations.json"
+        out.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"Wrote {out}", flush=True)
+        append_seed_metrics(
+            seed_dir,
+            {
+                "kind": "pair_channel_split_ablation",
+                "attention_kind": ATTENTION_KIND,
+                "feature_names": list(names),
+                "run_tag": RUN_TAG,
+                "case": CASE_NAME,
+                "ablations": rows,
+            },
+        )
+    return rows
+
+
 def evaluate_pbl_stage_cutoff(
     model: TPGT,
     split: Split,
@@ -3395,17 +3527,19 @@ def grit_ablation_specs(model: TPGT) -> list[dict[str, Any]]:
             "priority": 4,
         },
     ]
-    # Legacy Re+Im arches only: zero Real Zeff (v17+ has Im-only RPE).
-    if "Zeff_Re_norm" in RPE_FEATURE_NAMES:
+    # Per-channel Zeff RPE zeroing with full N/N-1/N-2 scores (Im-only arches: Im alone).
+    insert_at = 3
+    for channel_name in RPE_FEATURE_NAMES:
         specs.insert(
-            3,
+            insert_at,
             {
-                "name": "Zeff_Re=0 (keep Im)",
+                "name": f"{channel_name}=0",
                 "kind": "rpe_channel",
-                "channel": int(RPE_FEATURE_NAMES.index("Zeff_Re_norm")),
+                "channel": int(RPE_FEATURE_NAMES.index(channel_name)),
                 "priority": 3,
             },
         )
+        insert_at += 1
     for head in range(HEADS):
         specs.append(
             {
@@ -8828,10 +8962,11 @@ def cli_diagnose(
     rpe_ablation: bool | None = None,
     contingency: bool = True,
 ) -> None:
-    global DATA_FRACTION
+    global DATA_FRACTION, EVAL_BATCH_SIZE
     ensure_runtime_packages()
     apply_architecture_config()
     DATA_FRACTION = parse_data_fraction()
+    EVAL_BATCH_SIZE = parse_eval_batch_size()
     spec = parse_task()
     print(f"Diagnose PFΔ Task {spec.label}", flush=True)
     print(architecture_summary(), flush=True)
@@ -8906,6 +9041,18 @@ def cli_diagnose(
             device,
             val_split.networks[val_net],
             per_network,
+        )
+    # Full-split N / N-1 / N-2 PBL when each RPE or pair-elec channel is zeroed.
+    if rpe_ablation:
+        run_pair_channel_split_ablations(
+            model,
+            data,
+            device,
+            active_cache,
+            persistent_cache,
+            labels=("N", "N-1", "N-2"),
+            eval_batch_size=EVAL_BATCH_SIZE,
+            seed_dir=seed_dir,
         )
 
 
