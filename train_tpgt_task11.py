@@ -8846,8 +8846,12 @@ def cli_diagnose(
     configure_cuda_training(device)
     data = ensure_dataset(work, drive, spec)
     active_cache, persistent_cache = split_cache_dirs(checkpoints, spec)
-    reconcile_split_caches(active_cache, persistent_cache, data)
-    val_split = load_task_split(data, "valid", active_cache, persistent_cache)
+    # Ensure train RPE scales exist (CACHE_VERSION bumps invalidate old rpe_global_scales.json).
+    _train_split, val_split = warm_split_caches(
+        data, active_cache, persistent_cache, spec, load_valid=True
+    )
+    if val_split is None:
+        val_split = load_task_split(data, "valid", active_cache, persistent_cache)
     val_net = dominant_network_id(val_split)
     network = move_to(val_split.networks[val_net], device)
     model = TPGT().to(device)
@@ -8980,7 +8984,8 @@ def cli_ablate_grit(checkpoint: Path | None = None, seed: int = 0) -> None:
     configure_cuda_training(device)
     data = ensure_dataset(work, drive, spec)
     active_cache, persistent_cache = split_cache_dirs(checkpoints, spec)
-    reconcile_split_caches(active_cache, persistent_cache, data)
+    # Same prelude as training: write/adopt train ``rpe_global_scales.json`` after CACHE_VERSION bumps.
+    warm_split_caches(data, active_cache, persistent_cache, spec, load_valid=False)
     seed_dir = checkpoints / f"seed_{seed}"
     ckpt = checkpoint or (seed_dir / "last.pt")
     model = TPGT().to(device)
