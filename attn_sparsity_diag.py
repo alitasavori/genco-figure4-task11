@@ -62,7 +62,12 @@ def _local_staging_dir(drive_out: Path) -> Path:
     return stage
 
 
-def publish_artifacts_to_drive(stage_dir: Path, drive_out: Path) -> list[Path]:
+def publish_artifacts_to_drive(
+    stage_dir: Path,
+    drive_out: Path,
+    *,
+    zip_name: str = "attn_sparsity_artifacts.zip",
+) -> list[Path]:
     """Copy staged files to Drive, verify sizes, and write a single zip for reliable download."""
     drive_out.mkdir(parents=True, exist_ok=True)
     published: list[Path] = []
@@ -80,7 +85,7 @@ def publish_artifacts_to_drive(stage_dir: Path, drive_out: Path) -> list[Path]:
             )
         published.append(dst)
 
-    zip_path = drive_out / "attn_sparsity_artifacts.zip"
+    zip_path = drive_out / zip_name
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for src in sorted(p for p in stage_dir.rglob("*") if p.is_file()):
             zf.write(src, arcname=str(src.relative_to(stage_dir)).replace("\\", "/"))
@@ -106,8 +111,9 @@ def grit_attention_capture(
     *,
     contrib: bool = True,
     topk: int | None = None,
+    lowrank: int | None = None,
 ) -> Iterator[None]:
-    """Enable per-stage attention dumps (and optional top-k renormalization) for grit."""
+    """Enable per-stage attention dumps (and optional top-k / low-rank renorm) for grit."""
     stages = list(model.stages)
     prev = []
     for stage in stages:
@@ -116,20 +122,23 @@ def grit_attention_capture(
                 getattr(stage, "_capture_attn", False),
                 getattr(stage, "_capture_attn_contrib", False),
                 getattr(stage, "_attn_topk", None),
+                getattr(stage, "_attn_lowrank", None),
             )
         )
         stage._capture_attn = True
         stage._capture_attn_contrib = bool(contrib)
         stage._attn_topk = topk
+        stage._attn_lowrank = lowrank
         stage._last_attn = None
         stage._last_attn_contrib = None
     try:
         yield
     finally:
-        for stage, (cap, con, tk) in zip(stages, prev):
+        for stage, (cap, con, tk, lr) in zip(stages, prev):
             stage._capture_attn = cap
             stage._capture_attn_contrib = con
             stage._attn_topk = tk
+            stage._attn_lowrank = lr
 
 
 def read_stage_attention(model) -> list[dict[str, torch.Tensor | None]]:

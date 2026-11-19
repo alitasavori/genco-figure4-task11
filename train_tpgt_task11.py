@@ -139,7 +139,9 @@ Performance notes (Colab / large train split)
   ``--ablate-grit`` (v9/v16) scores N/N-1/N-2 after removing GRIT pieces
   (``W_Eb``, ``W_Ev``, ``W_Ew``, Re Zeff, each head, stage cutoffs 8..DEPTH-1).
   ``--attn-sparsity`` (v16/v9 grit) dumps bus×bus attention heatmaps, attention-mass /
-  message-contribution k@90/95/99, and optimistic top-k renormalized PBL (no retrain).
+  message-contribution pairs@90/95/99 out of n², and optimistic top-k renormalized PBL
+  (no retrain). ``--attn-rank`` (Experiment B) SVDs attention / message matrices,
+  reports singular energy E(r) at r=4/8/16/32, and optimistic low-rank PBL.
   ``--eval-only --task 3.1`` scores Table 4 test splits without training: same
   split-cache prelude as ``main()`` (``reconcile_split_caches``, then ``load_task_split``
   train on ``pfdelta_task3.1``). When ``--checkpoint-root`` / ``GENCO_TPGT_CHECKPOINT_ROOT``
@@ -1539,6 +1541,10 @@ class CorrectionStage(nn.Module):
         topk = getattr(self, "_attn_topk", None)
         if topk is not None:
             weights = _topk_renorm_attention(weights, int(topk))
+        # Optional diagnostic low-rank truncation (eval only; see attn_rank_diag).
+        lowrank = getattr(self, "_attn_lowrank", None)
+        if lowrank is not None:
+            weights = _lowrank_renorm_attention(weights, int(lowrank))
         capture = bool(getattr(self, "_capture_attn", False))
         contrib: torch.Tensor | None = None
         if capture:
@@ -1594,6 +1600,23 @@ def _topk_renorm_attention(weights: torch.Tensor, k: int) -> torch.Tensor:
     sparse.scatter_(-1, top_idx, top_vals)
     row = sparse.sum(dim=-1, keepdim=True)
     return torch.where(row > 0, sparse / row.clamp(min=1e-12), sparse)
+
+
+def _lowrank_renorm_attention(weights: torch.Tensor, rank: int) -> torch.Tensor:
+    """Truncate each (N×N) attention head to rank ``r`` via SVD; clamp+row-renorm (diagnostic)."""
+    if rank <= 0:
+        return weights
+    batch, heads, buses, _ = weights.shape
+    keep = min(int(rank), buses)
+    if keep >= buses:
+        return weights
+    flat = weights.reshape(batch * heads, buses, buses)
+    # full_matrices=False → U (N,N), S (N,), Vh (N,N) for square mats
+    u_mat, singular, vh = torch.linalg.svd(flat, full_matrices=False)
+    approx = (u_mat[:, :, :keep] * singular[:, :keep].unsqueeze(1)) @ vh[:, :keep, :]
+    approx = approx.reshape(batch, heads, buses, buses).clamp(min=0.0)
+    row = approx.sum(dim=-1, keepdim=True)
+    return torch.where(row > 0, approx / row.clamp(min=1e-12), weights)
 
     def _messages_joint_mlp(
         self,
@@ -9253,7 +9276,7 @@ def _cli_load_grit_checkpoint(
     seed: int,
     purpose: str,
 ) -> tuple[TPGT, Path, Path, Path, Path, torch.device, Path]:
-    """Shared loader for ``--ablate-grit`` / ``--attn-sparsity`` (grit arches only)."""
+    """Shared loader for ``--ablate-grit`` / ``--attn-sparsity`` / ``--attn-rank`` (grit)."""
     global DATA_FRACTION, EVAL_BATCH_SIZE
     ensure_runtime_packages()
     apply_architecture_config()
@@ -9375,6 +9398,56 @@ def cli_attn_sparsity(
         )
 
 
+def cli_attn_rank(
+    checkpoint: Path | None = None,
+    seed: int = 0,
+    cases: int = 16,
+) -> None:
+    """Experiment B: SVD energy of attention / message matrices + low-rank PBL."""
+    import importlib
+
+    import attn_rank_diag
+
+    attn_rank_diag = importlib.reload(attn_rank_diag)
+
+    model, data, active_cache, persistent_cache, seed_dir, device, _ckpt = _cli_load_grit_checkpoint(
+        checkpoint=checkpoint,
+        seed=seed,
+        purpose="Attention rank diagnostic",
+    )
+    out_dir = require_persistent_output_dir(
+        seed_dir / "attn_rank",
+        purpose="Attention rank diagnostic",
+    )
+    print(
+        f"attn-rank CASE_NAME={CASE_NAME} data={data} out={out_dir}",
+        flush=True,
+    )
+    attn_rank_diag.run_attention_rank_diagnostic(
+        model,
+        data,
+        device,
+        active_cache,
+        persistent_cache,
+        out_dir=out_dir,
+        cases=cases,
+        labels=("N", "N-1", "N-2"),
+        eval_batch_size=EVAL_BATCH_SIZE,
+    )
+    saved = sorted(p for p in out_dir.rglob("*") if p.is_file())
+    pngs = [p for p in saved if p.suffix.lower() == ".png"]
+    zips = [p for p in saved if p.suffix.lower() == ".zip"]
+    print(f"Saved {len(saved)} attention-rank artifact(s) on Drive under {out_dir}:", flush=True)
+    print(f"  PNGs={len(pngs)}  zips={len(zips)}", flush=True)
+    for path in saved:
+        print(f"  {path.relative_to(out_dir)} ({path.stat().st_size} bytes)", flush=True)
+    if not pngs:
+        raise SystemExit(
+            f"No PNGs found under {out_dir} after publish — Drive sync failed; "
+            "re-run after pull (staging→copy path)."
+        )
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--diagnose":
         ckpt: Path | None = None
@@ -9448,6 +9521,29 @@ if __name__ == "__main__":
             else:
                 raise SystemExit(f"Unknown attn-sparsity argument: {args_a[index_a]}")
         cli_attn_sparsity(checkpoint=ckpt_a, seed=seed_a, cases=cases_a)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--attn-rank":
+        ckpt_r: Path | None = None
+        seed_r = 0
+        cases_r = 16
+        args_r = sys.argv[2:]
+        index_r = 0
+        while index_r < len(args_r):
+            if args_r[index_r] == "--checkpoint" and index_r + 1 < len(args_r):
+                ckpt_r = Path(args_r[index_r + 1])
+                index_r += 2
+            elif args_r[index_r] == "--seed" and index_r + 1 < len(args_r):
+                seed_r = int(args_r[index_r + 1])
+                index_r += 2
+            elif args_r[index_r] == "--cases" and index_r + 1 < len(args_r):
+                cases_r = int(args_r[index_r + 1])
+                index_r += 2
+            elif args_r[index_r] in ("--data-fraction", "--task") and index_r + 1 < len(args_r):
+                index_r += 2
+            elif args_r[index_r].startswith(("--data-fraction=", "--task=")):
+                index_r += 1
+            else:
+                raise SystemExit(f"Unknown attn-rank argument: {args_r[index_r]}")
+        cli_attn_rank(checkpoint=ckpt_r, seed=seed_r, cases=cases_r)
     elif len(sys.argv) > 1 and sys.argv[1] == "--verify-splits":
         cli_verify_splits()
     elif len(sys.argv) > 1 and sys.argv[1] == "--sanity-rpe":
