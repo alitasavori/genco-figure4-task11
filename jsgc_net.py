@@ -411,10 +411,10 @@ class JSGCNet(nn.Module):
         Returns ``(prediction_unknown, residuals)`` with residuals (B,N,2) per iteration.
         """
         del rpe, pair_type_masks, pair, kwargs  # unused (dense-GRIT path args)
-        # Import by module name used for %run (often __main__) so TypeLayout identity matches.
         import sys
 
-        _tpgt = sys.modules.get("__main__")
+        # Prefer the aliased training module (``__main__`` under %run).
+        _tpgt = sys.modules.get("train_tpgt_task11") or sys.modules.get("__main__")
         if _tpgt is None or not hasattr(_tpgt, "assemble"):
             import train_tpgt_task11 as _tpgt  # type: ignore[no-redef]
         assemble = _tpgt.assemble
@@ -423,13 +423,12 @@ class JSGCNet(nn.Module):
 
         if ybus is None:
             raise ValueError("JSGCNet.forward requires ybus")
-        # ``types`` may be a tensor or (rarely) a layout; ``layout`` kw preferred.
         if layout is None:
             if torch.is_tensor(types):
                 layout = type_layout(types if types.dim() == 1 else types[0])
             else:
-                layout = type_layout(types)
-        types_tensor = layout.types if hasattr(layout, "types") else types
+                layout = types  # already a layout; do not re-wrap across module copies
+        types_tensor = getattr(layout, "types", types)
         if not torch.is_tensor(types_tensor):
             raise TypeError("JSGCNet.forward could not resolve bus-type tensor")
         types_1d = types_tensor if types_tensor.dim() == 1 else types_tensor[0]

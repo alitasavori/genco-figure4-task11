@@ -881,13 +881,11 @@ def per_case_layout(
 def type_layout(types: torch.Tensor | TypeLayout, pair_type_masks: torch.Tensor | None = None) -> TypeLayout:
     """``types`` as a layout: (N,) shared or (B, N) per case (builds indices with a device sync).
 
-    Duck-type non-tensors so ``%run train_tpgt_task11.py`` (module ``__main__``) layouts still
-    match when ``jsgc_net`` imports helpers from package ``train_tpgt_task11`` (two TypeLayout
-    classes → ``isinstance`` would otherwise fail).
+    Only tensors are (re)built. Any non-tensor is treated as an existing layout. This matters under
+    ``%run``: layouts may be ``__main__.TypeLayout`` while helpers imported as
+    ``train_tpgt_task11.TypeLayout`` fail ``isinstance``, so never call ``.dim()`` on layouts.
     """
-    if isinstance(types, TypeLayout) or (
-        not torch.is_tensor(types) and hasattr(types, "index") and hasattr(types, "types")
-    ):
+    if not torch.is_tensor(types):
         return types  # type: ignore[return-value]
     if types.dim() == 1:
         return shared_layout(types, pair_type_masks)
@@ -5438,10 +5436,37 @@ def count_parameters(model: nn.Module) -> int:
     return sum(int(param.numel()) for param in model.parameters())
 
 
+def alias_tpgt_module_for_run() -> None:
+    """Under ``%run`` / ``python train_tpgt_task11.py``, ``__name__`` is ``__main__``.
+
+    A later ``import train_tpgt_task11`` would load a *second* copy of this file and a second
+    ``TypeLayout`` class. Point the package name at this module and drop a stale ``jsgc_net``
+    import so helpers and layouts share one class identity.
+    """
+    mod = sys.modules.get(__name__)
+    if mod is None:
+        for loaded in sys.modules.values():
+            if loaded is not None and getattr(loaded, "TypeLayout", None) is TypeLayout:
+                mod = loaded
+                break
+    if mod is None:
+        return
+    if sys.modules.get("train_tpgt_task11") is not mod:
+        sys.modules["train_tpgt_task11"] = mod
+    # Force JSGC to bind against the aliased module on next import.
+    sys.modules.pop("jsgc_net", None)
+    sys.modules.pop("jsgc_physics", None)
+
+
 def build_model() -> nn.Module:
     """Construct TPGT or JSGC-Net according to ``ATTENTION_KIND`` / ARCH preset."""
     if ATTENTION_KIND == "jsgc":
-        from jsgc_net import JSGCNet
+        alias_tpgt_module_for_run()
+        import jsgc_net as _jsgc_net
+        import importlib
+
+        _jsgc_net = importlib.reload(_jsgc_net)
+        JSGCNet = _jsgc_net.JSGCNet
 
         # DEPTH preset → correction iterations; D/D_A/HEADS/D_E → local GNN size.
         return JSGCNet(
@@ -8879,6 +8904,7 @@ def test_model(
 
 def main() -> None:
     global BATCH_SIZE, DATA_FRACTION, MICRO_BATCH_SIZE, EVAL_BATCH_SIZE, VAL_EVERY, LEARNING_RATE
+    alias_tpgt_module_for_run()
     ensure_runtime_packages()
     apply_architecture_config()
     DATA_FRACTION = parse_data_fraction()
@@ -9660,6 +9686,8 @@ def cli_jsgc_baseline(
 
 
 if __name__ == "__main__":
+    # Before any JSGC import: one TypeLayout identity for %run and ``import train_tpgt_task11``.
+    alias_tpgt_module_for_run()
     if len(sys.argv) > 1 and sys.argv[1] == "--jsgc-baseline":
         cases_b = 64
         seed_b = 0
