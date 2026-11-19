@@ -1,9 +1,9 @@
 """Step-2 GRIT attention sparsity diagnostics (no retrain).
 
 Captures dense attention from a trained grit checkpoint (v16/v9), writes bus×bus
-attention (α) and message-magnitude (α‖v‖) heatmaps, reports how many senders
-retain 90/95/99% of attention mass (and of weighted-message magnitude), and
-scores optimistic top-k renormalized PBL.
+attention (α) and message-magnitude (α‖v‖) heatmaps, reports how many (i,j)
+pairs out of n² retain 90/95/99% of attention mass (approx. mean_k·n; same for
+weighted-message magnitude), and scores optimistic top-k renormalized PBL.
 """
 
 from __future__ import annotations
@@ -195,13 +195,30 @@ def summarize_mass(
         }
 
     keys = [f"k@{int(t * 100)}" for t in MASS_THRESHOLDS] + ["entropy", "max"]
-    overall = _mean_keys(per_recv, keys)
+    n2 = float(buses * buses)
+
+    def _with_pairs(stats: dict[str, float]) -> dict[str, float]:
+        """Map mean senders/row → approximate active pairs out of n² (pairs ≈ k·n)."""
+        out = dict(stats)
+        out["n"] = float(buses)
+        out["n2"] = n2
+        for t in MASS_THRESHOLDS:
+            tag = int(t * 100)
+            k = float(stats.get(f"k@{tag}", float("nan")))
+            pairs = k * float(buses)
+            out[f"pairs@{tag}"] = pairs
+            out[f"frac@{tag}"] = pairs / n2 if n2 > 0 else float("nan")
+        return out
+
+    overall = _with_pairs(_mean_keys(per_recv, keys))
     by_head = {
-        str(h): _mean_keys([r for r in per_recv if int(r["head"]) == h], keys)
+        str(h): _with_pairs(_mean_keys([r for r in per_recv if int(r["head"]) == h], keys))
         for h in range(heads)
     }
     by_type = {
-        name: _mean_keys([r for r in per_recv if r["recv_type"] == name], keys)
+        name: _with_pairs(
+            _mean_keys([r for r in per_recv if r["recv_type"] == name], keys)
+        )
         for name in type_names
     }
     return {
@@ -210,6 +227,8 @@ def summarize_mass(
         "by_recv_type": by_type,
         "n_rows": len(per_recv),
         "shape": [batch, heads, buses, buses],
+        "n": buses,
+        "n2": int(n2),
     }
 
 
@@ -532,19 +551,30 @@ def run_attention_sparsity_diagnostic(
                             stage_i + 1,
                             metric_name,
                             group,
-                            payload_stats.get("k@90", ""),
-                            payload_stats.get("k@95", ""),
-                            payload_stats.get("k@99", ""),
+                            payload_stats.get("n", ""),
+                            payload_stats.get("n2", ""),
+                            payload_stats.get("pairs@90", ""),
+                            payload_stats.get("pairs@95", ""),
+                            payload_stats.get("pairs@99", ""),
+                            payload_stats.get("frac@90", ""),
+                            payload_stats.get("frac@95", ""),
+                            payload_stats.get("frac@99", ""),
                             payload_stats.get("entropy", ""),
                             payload_stats.get("max", ""),
                         ]
                     )
 
+            ov = attn_stats["overall"]
+            n2 = int(ov.get("n2", 0) or 0)
             print(
-                f"  stage {stage_i + 1}: attn k@90/95/99 = "
-                f"{attn_stats['overall'].get('k@90', float('nan')):.1f} / "
-                f"{attn_stats['overall'].get('k@95', float('nan')):.1f} / "
-                f"{attn_stats['overall'].get('k@99', float('nan')):.1f}",
+                f"  stage {stage_i + 1}: attn pairs@90/95/99 = "
+                f"{ov.get('pairs@90', float('nan')):.0f} / "
+                f"{ov.get('pairs@95', float('nan')):.0f} / "
+                f"{ov.get('pairs@99', float('nan')):.0f} "
+                f"of {n2} (n²) "
+                f"[{100.0 * ov.get('frac@90', float('nan')):.1f}% / "
+                f"{100.0 * ov.get('frac@95', float('nan')):.1f}% / "
+                f"{100.0 * ov.get('frac@99', float('nan')):.1f}%]",
                 flush=True,
             )
 
@@ -615,9 +645,14 @@ def run_attention_sparsity_diagnostic(
                 "stage",
                 "metric",
                 "group",
-                "k@90",
-                "k@95",
-                "k@99",
+                "n",
+                "n2",
+                "pairs@90",
+                "pairs@95",
+                "pairs@99",
+                "frac@90",
+                "frac@95",
+                "frac@99",
                 "entropy",
                 "max",
             ]
