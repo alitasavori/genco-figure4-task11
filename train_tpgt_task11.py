@@ -9362,9 +9362,17 @@ def cli_attn_sparsity(
         eval_batch_size=EVAL_BATCH_SIZE,
     )
     saved = sorted(p for p in out_dir.rglob("*") if p.is_file())
+    pngs = [p for p in saved if p.suffix.lower() == ".png"]
+    zips = [p for p in saved if p.suffix.lower() == ".zip"]
     print(f"Saved {len(saved)} attention-sparsity artifact(s) on Drive under {out_dir}:", flush=True)
+    print(f"  PNGs={len(pngs)}  zips={len(zips)}", flush=True)
     for path in saved:
         print(f"  {path.relative_to(out_dir)} ({path.stat().st_size} bytes)", flush=True)
+    if not pngs:
+        raise SystemExit(
+            f"No PNGs found under {out_dir} after publish — Drive sync failed; "
+            "re-run after pull (staging→copy path)."
+        )
 
 
 if __name__ == "__main__":

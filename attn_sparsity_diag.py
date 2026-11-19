@@ -11,6 +11,9 @@ import contextlib
 import csv
 import json
 import os
+import shutil
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -44,6 +47,56 @@ def _write_bytes(path: Path, data: bytes) -> None:
 
 def _write_text(path: Path, text: str) -> None:
     _write_bytes(path, text.encode("utf-8"))
+
+
+def _local_staging_dir(drive_out: Path) -> Path:
+    """Local SSD staging — Colab Drive FUSE often drops many small PNGs written directly."""
+    if Path("/content").is_dir():
+        stage = Path("/content") / f"{drive_out.name}_staging"
+    else:
+        stage = Path(tempfile.mkdtemp(prefix=f"{drive_out.name}_"))
+    if stage.exists():
+        shutil.rmtree(stage)
+    stage.mkdir(parents=True, exist_ok=True)
+    return stage
+
+
+def publish_artifacts_to_drive(stage_dir: Path, drive_out: Path) -> list[Path]:
+    """Copy staged files to Drive, verify sizes, and write a single zip for reliable download."""
+    drive_out.mkdir(parents=True, exist_ok=True)
+    published: list[Path] = []
+    for src in sorted(p for p in stage_dir.rglob("*") if p.is_file()):
+        rel = src.relative_to(stage_dir)
+        dst = drive_out / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        _fsync_file(dst)
+        if not dst.is_file() or dst.stat().st_size != src.stat().st_size:
+            raise RuntimeError(
+                f"Drive publish failed for {rel}: "
+                f"src={src.stat().st_size if src.is_file() else 'missing'} "
+                f"dst={dst.stat().st_size if dst.is_file() else 'missing'}"
+            )
+        published.append(dst)
+
+    zip_path = drive_out / "attn_sparsity_artifacts.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for src in sorted(p for p in stage_dir.rglob("*") if p.is_file()):
+            zf.write(src, arcname=str(src.relative_to(stage_dir)).replace("\\", "/"))
+    _fsync_file(zip_path)
+    published.append(zip_path)
+
+    pngs = [p for p in published if p.suffix.lower() == ".png"]
+    print(
+        f"Published {len(published)} files to Drive ({len(pngs)} PNGs) under {drive_out}",
+        flush=True,
+    )
+    print(f"  zip: {zip_path} ({zip_path.stat().st_size} bytes)", flush=True)
+    for path in pngs[:12]:
+        print(f"  png: {path.name} ({path.stat().st_size} bytes)", flush=True)
+    if len(pngs) > 12:
+        print(f"  ... and {len(pngs) - 12} more PNGs", flush=True)
+    return published
 
 
 @contextlib.contextmanager
@@ -341,7 +394,12 @@ def run_attention_sparsity_diagnostic(
             f"(CASE_NAME={CASE_NAME}). Check GENCO_TPGT_CASE and the vendor pack."
         )
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    drive_out = Path(out_dir)
+    drive_out.mkdir(parents=True, exist_ok=True)
+    # Write PNGs/CSV/JSON on local disk first; publish to Drive at the end.
+    stage_dir = _local_staging_dir(drive_out)
+    work_dir = stage_dir
+    print(f"Staging artifacts locally at {work_dir} (then copy to {drive_out})", flush=True)
     summary: dict[str, Any] = {
         "case": CASE_NAME,
         "depth": int(DEPTH),
@@ -351,9 +409,11 @@ def run_attention_sparsity_diagnostic(
         "mass_thresholds": list(MASS_THRESHOLDS),
         "topks": list(topks),
         "by_label": {},
+        "drive_out": str(drive_out),
+        "stage_dir": str(stage_dir),
     }
 
-    mass_csv = out_dir / "attention_mass_by_stage.csv"
+    mass_csv = work_dir / "attention_mass_by_stage.csv"
     mass_rows: list[list[Any]] = []
 
     for label, topology, condition in TEST_PARTS:
@@ -408,23 +468,23 @@ def run_attention_sparsity_diagnostic(
             stem = f"{label}_stage{stage_i + 1:02d}"
             plot_attention_heatmap(
                 grid,
-                out_dir / f"heatmap_{stem}_mean_heads.png",
+                work_dir / f"heatmap_{stem}_mean_heads.png",
                 title=f"{label} stage {stage_i + 1}: mean α (batch×heads)",
                 types=types,
             )
             plot_attention_heatmap(
                 grid,
-                out_dir / f"heatmap_{stem}_mean_heads_log.png",
+                work_dir / f"heatmap_{stem}_mean_heads_log.png",
                 title=f"{label} stage {stage_i + 1}: log1p mean α",
                 types=types,
                 log1p=True,
             )
-            grid_path = out_dir / f"attn_grid_{stem}.npy"
+            grid_path = work_dir / f"attn_grid_{stem}.npy"
             np.save(grid_path, grid)
             _fsync_file(grid_path)
             curve_marks = plot_topk_mass_curve(
                 attn,
-                out_dir / f"mass_curve_{stem}.png",
+                work_dir / f"mass_curve_{stem}.png",
                 title=f"{label} stage {stage_i + 1}: cumulative attention mass",
             )
             # Per-head grids for first/last stage only (avoid PNG spam).
@@ -433,7 +493,7 @@ def run_attention_sparsity_diagnostic(
                     hgrid = mean_attention_grid(attn, head=h)
                     plot_attention_heatmap(
                         hgrid,
-                        out_dir / f"heatmap_{stem}_head{h}.png",
+                        work_dir / f"heatmap_{stem}_head{h}.png",
                         title=f"{label} stage {stage_i + 1} head {h}",
                         types=types,
                     )
@@ -483,18 +543,18 @@ def run_attention_sparsity_diagnostic(
             mean_all = np.mean(np.stack(stage_grids, axis=0), axis=0)
             plot_attention_heatmap(
                 mean_all,
-                out_dir / f"heatmap_{label}_all_stages_mean.png",
+                work_dir / f"heatmap_{label}_all_stages_mean.png",
                 title=f"{label}: mean α over stages×batch×heads",
                 types=types,
             )
             plot_attention_heatmap(
                 mean_all,
-                out_dir / f"heatmap_{label}_all_stages_mean_log.png",
+                work_dir / f"heatmap_{label}_all_stages_mean_log.png",
                 title=f"{label}: log1p mean α over stages",
                 types=types,
                 log1p=True,
             )
-            np_path = out_dir / f"attn_grid_{label}_all_stages.npy"
+            np_path = work_dir / f"attn_grid_{label}_all_stages.npy"
             np.save(np_path, mean_all)
             _fsync_file(np_path)
             label_summary["primary_heatmap"] = f"heatmap_{label}_all_stages_mean.png"
@@ -548,16 +608,20 @@ def run_attention_sparsity_diagnostic(
         fh.flush()
         os.fsync(fh.fileno())
 
-    summary_path = out_dir / "attn_sparsity_summary.json"
+    summary_path = work_dir / "attn_sparsity_summary.json"
     _write_text(summary_path, json.dumps(summary, indent=2))
-    # Durable inventory so a later session can see what survived on Drive.
-    files = sorted(p for p in out_dir.rglob("*") if p.is_file())
-    manifest_lines = [f"{p.relative_to(out_dir)}\t{p.stat().st_size}" for p in files]
-    _write_text(out_dir / "MANIFEST.txt", "\n".join(manifest_lines) + "\n")
-    print(f"Wrote {summary_path}", flush=True)
-    print(f"Wrote {mass_csv}", flush=True)
-    print(f"Heatmaps + numerics under Drive path {out_dir} ({len(files)} files)", flush=True)
+    files = sorted(p for p in work_dir.rglob("*") if p.is_file())
+    manifest_lines = [f"{p.relative_to(work_dir)}\t{p.stat().st_size}" for p in files]
+    _write_text(work_dir / "MANIFEST.txt", "\n".join(manifest_lines) + "\n")
+    print(f"Wrote staged {summary_path}", flush=True)
+    print(f"Wrote staged {mass_csv}", flush=True)
+    print(f"Staged {len(files)} files under {work_dir}", flush=True)
+    published = publish_artifacts_to_drive(work_dir, drive_out)
+    summary["published_files"] = [str(path) for path in published]
+    summary["n_png"] = sum(1 for path in published if path.suffix.lower() == ".png")
+    _write_text(drive_out / "attn_sparsity_summary.json", json.dumps(summary, indent=2))
     return summary
+
 
 
 def display_attn_sparsity(out_dir: Path, labels: tuple[str, ...] = ("N", "N-1", "N-2")) -> None:
