@@ -225,11 +225,13 @@ def run_attention_rank_diagnostic(
         "drive_out": str(drive_out),
         "stage_dir": str(stage_dir),
         "note": (
-            "Diagnostic only: E(r) from SVD of captured dense α / α‖v‖ (energy on "
-            "the raw matrix; no reconstruction). Low-rank PBL truncates softmax α "
-            "via SVD, then restores the original >0 support (masks), clamps≥0, and "
-            "row-renormalizes — raw SVD alone would break row sums / nonnegativity / "
-            "zeros. A production low-rank GRIT would need a separate implementation."
+            "Diagnostic only: E(r) from SVD of captured dense α / α‖v‖. "
+            "Low-rank PBL compares three post-softmax SVD modes in-process: "
+            "raw (UΣVᵀ only), clamp_renorm (clamp≥0 + row-norm; first attn-rank "
+            "behavior), repaired (+ restore original >0 support). Also reports "
+            "||repaired−raw||_F and ||repaired−clamp_renorm||_F. Identical "
+            "clamp_renorm vs repaired PBL means support masking was a no-op, not "
+            "that the hook failed. Production low-rank GRIT needs a separate impl."
         ),
     }
 
@@ -357,7 +359,43 @@ def run_attention_rank_diagnostic(
                         ]
                     )
 
-        # Optimistic low-rank attention → PBL (same sample as sparsity top-k).
+        # Offline repair delta on captured dense α (same process; no saved PBL reuse).
+        # Δ_repair = ||α_repaired − α_raw||_F  (and vs clamp_renorm = pre-b6db7c0 path).
+        repair_rows: list[dict[str, Any]] = []
+        lowrank_variants = _tpgt()._lowrank_attention_variants
+        print("  repair check (captured dense α → SVD variants):", flush=True)
+        for r in ranks:
+            deltas_raw: list[float] = []
+            deltas_clamp: list[float] = []
+            for payload in captured:
+                attn = payload["attn"]
+                if attn is None:
+                    continue
+                variants = lowrank_variants(attn.to(device), int(r))
+                raw = variants["raw"]
+                clamp_renorm = variants["clamp_renorm"]
+                repaired = variants["repaired"]
+                deltas_raw.append(float(torch.linalg.vector_norm(repaired - raw).item()))
+                deltas_clamp.append(
+                    float(torch.linalg.vector_norm(repaired - clamp_renorm).item())
+                )
+            d_raw = float(np.mean(deltas_raw)) if deltas_raw else float("nan")
+            d_clamp = float(np.mean(deltas_clamp)) if deltas_clamp else float("nan")
+            repair_rows.append(
+                {
+                    "rank": int(r),
+                    "delta_repair_vs_raw_fro": d_raw,
+                    "delta_repair_vs_clamp_renorm_fro": d_clamp,
+                }
+            )
+            print(
+                f"    r={r}: ||repaired−raw||_F={d_raw:.6g}  "
+                f"||repaired−clamp_renorm||_F={d_clamp:.6g}",
+                flush=True,
+            )
+        label_summary["repair_delta"] = repair_rows
+
+        # Optimistic low-rank PBL: raw vs clamp_renorm vs repaired (same process).
         _, _, dense_pbl = _forward_capture(
             model, split, network, index, device, contrib=False, topk=None
         )
@@ -366,14 +404,25 @@ def run_attention_rank_diagnostic(
         print(f"  dense sample PBL={dense_pbl:.6g}", flush=True)
 
         for r in ranks:
-            _, _, pbl_r = _forward_capture_lowrank(
-                model, split, network, index, device, rank=int(r)
-            )
-            delta = float(pbl_r - dense_pbl)
-            topk_rows.append({"rank": int(r), "pbl": float(pbl_r), "delta": delta})
-            pbl_rows.append([label, "lowrank", int(r), float(pbl_r), delta])
+            mode_pbls: dict[str, float] = {}
+            for mode in ("raw", "clamp_renorm", "repaired"):
+                _, _, pbl_r = _forward_capture_lowrank(
+                    model,
+                    split,
+                    network,
+                    index,
+                    device,
+                    rank=int(r),
+                    mode=mode,
+                )
+                mode_pbls[mode] = float(pbl_r)
+                delta = float(pbl_r - dense_pbl)
+                pbl_rows.append([label, mode, int(r), float(pbl_r), delta])
+            topk_rows.append({"rank": int(r), **mode_pbls})
             print(
-                f"  low-rank r={r} sample PBL={pbl_r:.6g} (Δ {delta:+.4g})",
+                f"  low-rank r={r} PBL raw/clamp_renorm/repaired = "
+                f"{mode_pbls['raw']:.6g} / {mode_pbls['clamp_renorm']:.6g} / "
+                f"{mode_pbls['repaired']:.6g}",
                 flush=True,
             )
 
@@ -428,8 +477,17 @@ def run_attention_rank_diagnostic(
     return summary
 
 
-def _forward_capture_lowrank(model, split, network, index, device, *, rank: int):
-    """Forward with optimistic SVD truncation of attention (row-renormalized)."""
+def _forward_capture_lowrank(
+    model,
+    split,
+    network,
+    index,
+    device,
+    *,
+    rank: int,
+    mode: str = "repaired",
+):
+    """Forward with SVD-truncated attention; ``mode`` in raw / clamp_renorm / repaired."""
     # Always resolve capture from the live module (Colab may keep a stale import).
     capture_cm = attn_sparsity_diag.grit_attention_capture
     tpgt = _tpgt()
@@ -441,7 +499,13 @@ def _forward_capture_lowrank(model, split, network, index, device, *, rank: int)
     device_network = move_to(network, device)
     pair = pair_features(model, device_network)
     with torch.inference_mode():
-        with capture_cm(model, contrib=False, topk=None, lowrank=int(rank)):
+        with capture_cm(
+            model,
+            contrib=False,
+            topk=None,
+            lowrank=int(rank),
+            lowrank_mode=str(mode),
+        ):
             _prediction, _target, residuals = forward_cases(
                 model, split, device_network, index, device, pair
             )

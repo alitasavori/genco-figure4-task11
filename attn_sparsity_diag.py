@@ -112,6 +112,7 @@ def grit_attention_capture(
     contrib: bool = True,
     topk: int | None = None,
     lowrank: int | None = None,
+    lowrank_mode: str = "repaired",
 ) -> Iterator[None]:
     """Enable per-stage attention dumps (and optional top-k / low-rank renorm) for grit."""
     stages = list(model.stages)
@@ -123,22 +124,25 @@ def grit_attention_capture(
                 getattr(stage, "_capture_attn_contrib", False),
                 getattr(stage, "_attn_topk", None),
                 getattr(stage, "_attn_lowrank", None),
+                getattr(stage, "_attn_lowrank_mode", "repaired"),
             )
         )
         stage._capture_attn = True
         stage._capture_attn_contrib = bool(contrib)
         stage._attn_topk = topk
         stage._attn_lowrank = lowrank
+        stage._attn_lowrank_mode = str(lowrank_mode)
         stage._last_attn = None
         stage._last_attn_contrib = None
     try:
         yield
     finally:
-        for stage, (cap, con, tk, lr) in zip(stages, prev):
+        for stage, (cap, con, tk, lr, lrm) in zip(stages, prev):
             stage._capture_attn = cap
             stage._capture_attn_contrib = con
             stage._attn_topk = tk
             stage._attn_lowrank = lr
+            stage._attn_lowrank_mode = lrm
 
 
 def read_stage_attention(model) -> list[dict[str, torch.Tensor | None]]:

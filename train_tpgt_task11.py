@@ -1544,7 +1544,8 @@ class CorrectionStage(nn.Module):
         # Optional diagnostic low-rank truncation (eval only; see attn_rank_diag).
         lowrank = getattr(self, "_attn_lowrank", None)
         if lowrank is not None:
-            weights = _lowrank_renorm_attention(weights, int(lowrank))
+            mode = str(getattr(self, "_attn_lowrank_mode", "repaired"))
+            weights = _lowrank_renorm_attention(weights, int(lowrank), mode=mode)
         capture = bool(getattr(self, "_capture_attn", False))
         contrib: torch.Tensor | None = None
         if capture:
@@ -1602,28 +1603,51 @@ def _topk_renorm_attention(weights: torch.Tensor, k: int) -> torch.Tensor:
     return torch.where(row > 0, sparse / row.clamp(min=1e-12), sparse)
 
 
-def _lowrank_renorm_attention(weights: torch.Tensor, rank: int) -> torch.Tensor:
-    """Truncate each (N×N) attention head to rank ``r`` via SVD (diagnostic).
+def _lowrank_attention_variants(
+    weights: torch.Tensor,
+    rank: int,
+) -> dict[str, torch.Tensor]:
+    """SVD truncate each head; return raw / clamp_renorm / repaired tensors.
 
-    Raw SVD of softmax weights need not stay nonnegative, row-stochastic, or
-    support-preserving. Repair: restore the original zero pattern (masks /
-    empty rows), clamp negatives to 0, then row-renormalize.
+    ``raw``: U_r Σ_r V_r^T only (may be negative, unnormalized, fill zeros).
+    ``clamp_renorm``: clamp≥0 then row-normalize (behavior since first attn-rank).
+    ``repaired``: restore original >0 support, clamp≥0, row-normalize.
     """
     if rank <= 0:
-        return weights
+        return {"raw": weights, "clamp_renorm": weights, "repaired": weights}
     batch, heads, buses, _ = weights.shape
     keep = min(int(rank), buses)
     if keep >= buses:
-        return weights
+        return {"raw": weights, "clamp_renorm": weights, "repaired": weights}
     flat = weights.reshape(batch * heads, buses, buses)
     support = flat > 0
-    # full_matrices=False → U (N,N), S (N,), Vh (N,N) for square mats
     u_mat, singular, vh = torch.linalg.svd(flat, full_matrices=False)
-    approx = (u_mat[:, :, :keep] * singular[:, :keep].unsqueeze(1)) @ vh[:, :keep, :]
-    approx = approx.masked_fill(~support, 0.0).clamp(min=0.0)
-    approx = approx.reshape(batch, heads, buses, buses)
-    row = approx.sum(dim=-1, keepdim=True)
-    return torch.where(row > 0, approx / row.clamp(min=1e-12), weights)
+    raw_flat = (u_mat[:, :, :keep] * singular[:, :keep].unsqueeze(1)) @ vh[:, :keep, :]
+    raw = raw_flat.reshape(batch, heads, buses, buses)
+
+    clamp_flat = raw_flat.clamp(min=0.0)
+    clamp = clamp_flat.reshape(batch, heads, buses, buses)
+    row_c = clamp.sum(dim=-1, keepdim=True)
+    clamp_renorm = torch.where(row_c > 0, clamp / row_c.clamp(min=1e-12), weights)
+
+    repaired_flat = raw_flat.masked_fill(~support, 0.0).clamp(min=0.0)
+    repaired = repaired_flat.reshape(batch, heads, buses, buses)
+    row_r = repaired.sum(dim=-1, keepdim=True)
+    repaired = torch.where(row_r > 0, repaired / row_r.clamp(min=1e-12), weights)
+    return {"raw": raw, "clamp_renorm": clamp_renorm, "repaired": repaired}
+
+
+def _lowrank_renorm_attention(
+    weights: torch.Tensor,
+    rank: int,
+    *,
+    mode: str = "repaired",
+) -> torch.Tensor:
+    """Truncate attention to rank ``r`` (diagnostic). See ``_lowrank_attention_variants``."""
+    variants = _lowrank_attention_variants(weights, rank)
+    if mode not in variants:
+        raise ValueError(f"Unknown low-rank mode {mode!r}; expected one of {sorted(variants)}")
+    return variants[mode]
 
     def _messages_joint_mlp(
         self,
