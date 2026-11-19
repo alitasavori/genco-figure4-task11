@@ -411,15 +411,28 @@ class JSGCNet(nn.Module):
         Returns ``(prediction_unknown, residuals)`` with residuals (B,N,2) per iteration.
         """
         del rpe, pair_type_masks, pair, kwargs  # unused (dense-GRIT path args)
-        from train_tpgt_task11 import assemble, flat_start, type_layout
+        # Import by module name used for %run (often __main__) so TypeLayout identity matches.
+        import sys
+
+        _tpgt = sys.modules.get("__main__")
+        if _tpgt is None or not hasattr(_tpgt, "assemble"):
+            import train_tpgt_task11 as _tpgt  # type: ignore[no-redef]
+        assemble = _tpgt.assemble
+        flat_start = _tpgt.flat_start
+        type_layout = _tpgt.type_layout
 
         if ybus is None:
             raise ValueError("JSGCNet.forward requires ybus")
+        # ``types`` may be a tensor or (rarely) a layout; ``layout`` kw preferred.
         if layout is None:
-            layout = type_layout(types if types.dim() == 1 else types[0])
-        types_1d = layout.types if getattr(layout, "types", types).dim() == 1 else types[0]
-        if types_1d.dim() > 1:
-            types_1d = types_1d[0]
+            if torch.is_tensor(types):
+                layout = type_layout(types if types.dim() == 1 else types[0])
+            else:
+                layout = type_layout(types)
+        types_tensor = layout.types if hasattr(layout, "types") else types
+        if not torch.is_tensor(types_tensor):
+            raise TypeError("JSGCNet.forward could not resolve bus-type tensor")
+        types_1d = types_tensor if types_tensor.dim() == 1 else types_tensor[0]
         cache = self.get_cache(ybus if ybus.dim() == 2 else ybus[0], types_1d)
         device = specified.device
         dtype = specified.dtype

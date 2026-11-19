@@ -879,9 +879,16 @@ def per_case_layout(
 
 
 def type_layout(types: torch.Tensor | TypeLayout, pair_type_masks: torch.Tensor | None = None) -> TypeLayout:
-    """``types`` as a layout: (N,) shared or (B, N) per case (builds indices with a device sync)."""
-    if isinstance(types, TypeLayout):
-        return types
+    """``types`` as a layout: (N,) shared or (B, N) per case (builds indices with a device sync).
+
+    Duck-type non-tensors so ``%run train_tpgt_task11.py`` (module ``__main__``) layouts still
+    match when ``jsgc_net`` imports helpers from package ``train_tpgt_task11`` (two TypeLayout
+    classes → ``isinstance`` would otherwise fail).
+    """
+    if isinstance(types, TypeLayout) or (
+        not torch.is_tensor(types) and hasattr(types, "index") and hasattr(types, "types")
+    ):
+        return types  # type: ignore[return-value]
     if types.dim() == 1:
         return shared_layout(types, pair_type_masks)
     return per_case_layout(types, pair_type_masks)
