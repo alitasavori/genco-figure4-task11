@@ -66,6 +66,27 @@ UTILITY_BY_GRID: dict[int, str] = {
 
 # Task 3.1 PFΔ cross-grid eval: intact-N feasible packs under outer case118/.
 TPGT_BENCH_GRIDS = ("case57", "case118", "case500")
+GRID_TO_BUSES = {"case57": 57, "case118": 118, "case500": 500}
+
+
+def normalize_bench_grids(grids: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    """Accept ``(\"case118\",)`` or ``(\"118\",)``; default all Task 3.1 bench grids."""
+    if grids is None:
+        return TPGT_BENCH_GRIDS
+    out: list[str] = []
+    for raw in grids:
+        key = str(raw).strip().lower()
+        if key.isdigit():
+            key = f"case{key}"
+        if not key.startswith("case"):
+            key = f"case{key}"
+        if key not in GRID_TO_BUSES:
+            raise ValueError(f"Unknown grid {raw!r}; choose from {TPGT_BENCH_GRIDS}")
+        if key not in out:
+            out.append(key)
+    if not out:
+        raise ValueError("grids must be non-empty")
+    return tuple(out)
 
 
 def load_published(path: Path = PUBLISHED_JSON) -> dict[str, Any]:
@@ -344,8 +365,29 @@ def plot_figure8_genco_vs_tpgt(
     title: str | None = None,
 ) -> None:
     """Head-to-head: GENCO Tiny/Small/Base vs TPGT only (no PowerModels)."""
+    plot_figure8_genco_vs_multi_tpgt(
+        {tpgt_legend: tpgt_by_bus},
+        genco_measured,
+        out_path,
+        title=title,
+    )
+
+
+def plot_figure8_genco_vs_multi_tpgt(
+    tpgt_series: dict[str, dict[int, float]],
+    genco_measured: dict[str, dict[int, float]],
+    out_path: Path,
+    *,
+    title: str | None = None,
+) -> None:
+    """Head-to-head: GENCO Tiny/Small/Base vs one or more TPGT checkpoints."""
     apply_plot_style()
-    bus_counts = [b for b in (57, 118, 500) if b in tpgt_by_bus or any(b in g for g in genco_measured.values())]
+    bus_counts = [
+        b
+        for b in (57, 118, 500)
+        if any(b in series for series in tpgt_series.values())
+        or any(b in g for g in genco_measured.values())
+    ]
     if not bus_counts:
         return
     fig, axis = plt.subplots(figsize=(10.0, 6.5))
@@ -366,25 +408,38 @@ def plot_figure8_genco_vs_tpgt(
                 marker="o",
                 label=f"GENCO {model.capitalize()}",
             )
-    tpgt_x = [b for b in bus_counts if b in tpgt_by_bus and np.isfinite(tpgt_by_bus[b])]
-    tpgt_y = [float(tpgt_by_bus[b]) for b in tpgt_x]
-    if tpgt_x:
+    tpgt_colors = ("#1F4B99", "#C44E52", "#55A868", "#8172B2", "#CCB974", "#64B5CD")
+    markers = ("s", "D", "^", "v", "P", "X")
+    series_for_ylim: list[list[float]] = []
+    for idx, (label, tpgt_by_bus) in enumerate(tpgt_series.items()):
+        tpgt_x = [b for b in bus_counts if b in tpgt_by_bus and np.isfinite(tpgt_by_bus[b])]
+        tpgt_y = [float(tpgt_by_bus[b]) for b in tpgt_x]
+        if not tpgt_x:
+            continue
+        series_for_ylim.append(tpgt_y)
         axis.plot(
             tpgt_x,
             tpgt_y,
-            color="#1F4B99",
+            color=tpgt_colors[idx % len(tpgt_colors)],
             linestyle="-",
-            marker="s",
+            marker=markers[idx % len(markers)],
             linewidth=2.2,
-            label=tpgt_legend,
+            label=label,
         )
-    series = [tpgt_y]
     for model in ("base", "small", "tiny"):
-        series.append([float(genco_measured.get(model, {}).get(b, np.nan)) for b in bus_counts])
-    y_lo, y_hi = _ylim_from_values(*series)
+        series_for_ylim.append(
+            [float(genco_measured.get(model, {}).get(b, np.nan)) for b in bus_counts]
+        )
+    y_lo, y_hi = _ylim_from_values(*series_for_ylim)
+    x_lo = max(40.0, min(bus_counts) * 0.7)
+    x_hi = min(800.0, max(bus_counts) * 1.4)
+    if len(bus_counts) == 1:
+        # Single-grid timing: keep log x readable around that bus count.
+        only = float(bus_counts[0])
+        x_lo, x_hi = only * 0.55, only * 1.8
     axis.set_xscale("log")
     axis.set_yscale("log")
-    axis.set_xlim(40, 800)
+    axis.set_xlim(x_lo, x_hi)
     axis.set_ylim(y_lo, y_hi)
     axis.set_xlabel("Bus count")
     axis.set_ylabel("Amortized per-instance\nruntime [ms]")
@@ -528,8 +583,9 @@ def run_tpgt_benchmarks(
     persistent_cache: Path,
     arch: str = "v9",
     gpu_needle: str = PAPER_GPU_NEEDLE,
+    grids: tuple[str, ...] | list[str] | None = None,
 ) -> dict[int, dict[str, float]]:
-    """Benchmark TPGT on Task 3.1 N splits for grids we have in PFΔ task 3.1."""
+    """Benchmark TPGT on Task 3.1 N splits for selected grids (default 57/118/500)."""
     import torch
 
     tpgt = _load_tpgt_trainer()
@@ -542,11 +598,12 @@ def run_tpgt_benchmarks(
     raw_dir = tpgt.raw_dir
     warm_split_caches = tpgt.warm_split_caches
 
+    selected = normalize_bench_grids(grids)
     gpu = require_gpu(gpu_needle)
-    print(f"Timing GPU: {gpu} (needle={gpu_needle!r})", flush=True)
+    print(f"Timing GPU: {gpu} (needle={gpu_needle!r}) grids={selected}", flush=True)
     ensure_runtime_packages()
     # Force Task 3.1 pack root (case118/...), ignoring a leftover GENCO_TPGT_CASE from case57 training.
-    os.environ.setdefault("GENCO_TPGT_ARCH", arch)
+    os.environ["GENCO_TPGT_ARCH"] = arch
     os.environ["GENCO_TPGT_TASK"] = "3.1"
     os.environ["GENCO_TPGT_CASE"] = "case118"
     apply_architecture_config()
@@ -572,7 +629,7 @@ def run_tpgt_benchmarks(
     print(f"Loaded TPGT {arch} epoch {epoch} from {ckpt_path}", flush=True)
 
     out: dict[int, dict[str, float]] = {}
-    for grid in TPGT_BENCH_GRIDS:
+    for grid in selected:
         # Same paths/cache names as Task 3.1 Table 4 scoring (n/feasible under case118/).
         cache_name = f"test_{grid}_n_feasible"
         split = cached_split(
@@ -594,6 +651,8 @@ def run_tpgt_benchmarks(
         out[buses] = {"ms_per_instance": ms, "batch_size": float(batch), "grid": grid}
         print(f"  best: {ms:.4f} ms @ batch {batch}", flush=True)
         release_cuda_memory()
+    del model
+    release_cuda_memory()
     return out
 
 
@@ -730,6 +789,7 @@ def run_notebook_section54(
     tpgt_label: str | None = None,
     match_genco: bool = False,
     rebench_genco: bool = True,
+    grids: tuple[str, ...] | list[str] | None = None,
 ) -> Path:
     """Colab entry: GPU gate + TPGT timing vs GENCO curves/tables.
 
@@ -740,6 +800,7 @@ def run_notebook_section54(
     at TPGT's best batch per grid (installs graphkit + downloads runtime graphs as needed),
     then writes a head-to-head figure without PowerModels.
     ``weight_run`` is the Task 1.1 checkpoint folder containing ``seed_0/``.
+    ``grids`` defaults to all of ``TPGT_BENCH_GRIDS``; pass ``(\"case118\",)`` for 118-only.
     """
     tpgt = _load_tpgt_trainer()
     TASKS = tpgt.TASKS
@@ -751,13 +812,17 @@ def run_notebook_section54(
     ensure_published_json(published_json)
     published = load_published(published_json)
     tpgt_by_bus: dict[int, float] = {}
+    selected = normalize_bench_grids(grids)
     needle = str(gpu_needle).strip().upper() or PAPER_GPU_NEEDLE
     suffix = "" if needle == PAPER_GPU_NEEDLE else f"_{needle.lower()}"
-    cache_path = results / (bench_cache_name or f"runtime_tpgt_bench{suffix}.json")
-    genco_cache = results / f"runtime_genco_matched{suffix}.json"
-    fig_name = figure_name or f"figure8_runtime_pf{suffix}.png"
-    head_name = f"figure8_genco_vs_tpgt{suffix}.png"
-    sum_name = summary_name or f"runtime_fig8_summary{suffix}.json"
+    grid_tag = "_".join(selected) if selected != TPGT_BENCH_GRIDS else "all"
+    cache_path = results / (
+        bench_cache_name or f"runtime_tpgt_bench{suffix}_{grid_tag}.json"
+    )
+    genco_cache = results / f"runtime_genco_matched{suffix}_{grid_tag}.json"
+    fig_name = figure_name or f"figure8_runtime_pf{suffix}_{grid_tag}.png"
+    head_name = f"figure8_genco_vs_tpgt{suffix}_{grid_tag}.png"
+    sum_name = summary_name or f"runtime_fig8_summary{suffix}_{grid_tag}.json"
     label = tpgt_label or f"TPGT ({arch}, {needle})"
 
     gpu = require_gpu(
@@ -768,7 +833,7 @@ def run_notebook_section54(
             else f"This exploratory §5.4 cell requires NVIDIA {needle}"
         ),
     )
-    print(f"Timing GPU: {gpu} (needle={needle})", flush=True)
+    print(f"Timing GPU: {gpu} (needle={needle}) grids={selected}", flush=True)
     if match_genco:
         print(
             "Matched GENCO timing enabled: same GPU + TPGT batch sizes "
@@ -785,7 +850,7 @@ def run_notebook_section54(
 
     # Arch must be applied before split_cache_dirs so Colab SSD path uses RUN_TAG (v9), not default v7.
     # Task 3.1 parquet lives under outer case118/ even when an earlier cell set GENCO_TPGT_CASE=case57.
-    os.environ.setdefault("GENCO_TPGT_ARCH", arch)
+    os.environ["GENCO_TPGT_ARCH"] = arch
     os.environ["GENCO_TPGT_TASK"] = "3.1"
     os.environ["GENCO_TPGT_CASE"] = "case118"
     apply_architecture_config()
@@ -799,6 +864,7 @@ def run_notebook_section54(
             persistent_cache=persistent,
             arch=arch,
             gpu_needle=needle,
+            grids=selected,
         )
         cache_path.write_text(
             json.dumps({str(k): v for k, v in raw.items()}, indent=2),
@@ -849,6 +915,7 @@ def run_notebook_section54(
             "gpu_needle": needle,
             "arch": arch,
             "weight_run": str(weight_run),
+            "grids": list(selected),
             "bench_cache": str(cache_path),
             "genco_matched_cache": str(genco_cache) if match_genco else None,
             "figure": fig_name,
@@ -862,6 +929,229 @@ def run_notebook_section54(
         },
     )
     return results
+
+
+def run_notebook_multi_tpgt_section54(
+    *,
+    data_root: Path,
+    fm_root: Path,
+    runs: list[dict[str, str]] | tuple[dict[str, str], ...],
+    task_run: Path,
+    grids: tuple[str, ...] | list[str] | None = ("case118",),
+    rebench: bool = True,
+    rebench_genco: bool = True,
+    match_genco: bool = True,
+    published_json: Path = PUBLISHED_JSON,
+    gpu_needle: str = "L4",
+) -> Path:
+    """Time several TPGT checkpoints on the same GPU/grids and overlay vs matched GENCO.
+
+    Each ``runs`` entry needs ``label``, ``arch``, ``folder`` (under ``fm_root``).
+    ``grids``: ``(\"case118\",)`` for IEEE-118 only, or ``TPGT_BENCH_GRIDS`` / ``(\"case57\",\"case118\",\"case500\")``.
+    """
+    tpgt = _load_tpgt_trainer()
+    TASKS = tpgt.TASKS
+    apply_architecture_config = tpgt.apply_architecture_config
+    split_cache_dirs = tpgt.split_cache_dirs
+
+    if not runs:
+        raise ValueError("runs must list at least one {label, arch, folder} checkpoint")
+
+    selected = normalize_bench_grids(grids)
+    results = task_run / "results"
+    results.mkdir(parents=True, exist_ok=True)
+    ensure_published_json(published_json)
+    needle = str(gpu_needle).strip().upper() or PAPER_GPU_NEEDLE
+    suffix = "" if needle == PAPER_GPU_NEEDLE else f"_{needle.lower()}"
+    grid_tag = "_".join(selected) if selected != TPGT_BENCH_GRIDS else "all"
+    genco_cache = results / f"runtime_genco_matched{suffix}_{grid_tag}.json"
+    head_name = f"figure8_genco_vs_multi_tpgt{suffix}_{grid_tag}.png"
+    sum_name = f"runtime_multi_tpgt_summary{suffix}_{grid_tag}.json"
+    csv_name = f"runtime_multi_tpgt{suffix}_{grid_tag}.csv"
+
+    gpu = require_gpu(
+        needle,
+        purpose=(
+            "GENCO paper §5.4 timings were measured on an exclusive NVIDIA H100 SXM5 80GB"
+            if needle == PAPER_GPU_NEEDLE
+            else f"This exploratory §5.4 cell requires NVIDIA {needle}"
+        ),
+    )
+    print(
+        f"Multi-TPGT §5.4 on {gpu} (needle={needle}) grids={selected} "
+        f"({len(runs)} checkpoints)",
+        flush=True,
+    )
+
+    os.environ["GENCO_TPGT_TASK"] = "3.1"
+    os.environ["GENCO_TPGT_CASE"] = "case118"
+
+    tpgt_series: dict[str, dict[int, float]] = {}
+    tpgt_raw_by_label: dict[str, dict[int, dict[str, float]]] = {}
+    batch_union: dict[int, int] = {}
+
+    for entry in runs:
+        label = str(entry["label"])
+        arch = str(entry["arch"])
+        folder = str(entry["folder"])
+        weight_run = Path(fm_root) / folder
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in label)
+        cache_path = results / f"runtime_tpgt_bench{suffix}_{safe}_{grid_tag}.json"
+        print(f"\n=== TPGT {label} (arch={arch}, {weight_run.name}) ===", flush=True)
+
+        os.environ["GENCO_TPGT_ARCH"] = arch
+        apply_architecture_config()
+        if rebench or not cache_path.is_file():
+            active, persistent = split_cache_dirs(task_run, TASKS["3.1"])
+            raw = run_tpgt_benchmarks(
+                data_root=data_root,
+                ckpt_root=weight_run,
+                active_cache=active,
+                persistent_cache=persistent,
+                arch=arch,
+                gpu_needle=needle,
+                grids=selected,
+            )
+            cache_path.write_text(
+                json.dumps({str(k): v for k, v in raw.items()}, indent=2),
+                encoding="utf-8",
+            )
+        else:
+            raw = {
+                int(k): v for k, v in json.loads(cache_path.read_text(encoding="utf-8")).items()
+            }
+            print(f"Reusing TPGT timings from {cache_path}", flush=True)
+
+        tpgt_raw_by_label[label] = raw
+        tpgt_series[label] = {
+            int(buses): float(payload["ms_per_instance"]) for buses, payload in raw.items()
+        }
+        for buses, payload in raw.items():
+            b = int(buses)
+            batch = int(float(payload["batch_size"]))
+            # Matched GENCO uses the max TPGT-feasible batch seen for that bus.
+            batch_union[b] = max(batch_union.get(b, 0), batch)
+
+    genco_measured: dict[str, dict[int, float]] = {}
+    if match_genco:
+        genco_bench = _load_genco_matched_bench()
+        run_genco_matched_benchmark = genco_bench.run_genco_matched_benchmark
+        print(
+            f"\nMatched GENCO helper v{getattr(genco_bench, 'BENCH_HELPER_VERSION', '?')} "
+            f"from {genco_bench.__file__}",
+            flush=True,
+        )
+        if rebench_genco or not genco_cache.is_file():
+            genco_payload = run_genco_matched_benchmark(
+                batch_by_bus=batch_union,
+                results_path=genco_cache,
+                gpu_name=gpu,
+            )
+        else:
+            genco_payload = json.loads(genco_cache.read_text(encoding="utf-8"))
+            print(f"Reusing matched GENCO timings from {genco_cache}", flush=True)
+        genco_measured = genco_measured_from_payload(genco_payload)
+
+    plot_figure8_genco_vs_multi_tpgt(
+        tpgt_series,
+        genco_measured,
+        results / head_name,
+        title=f"GENCO vs TPGT checkpoints ({needle}, matched batch)",
+    )
+
+    # Flat CSV for easy comparison (esp. single-grid 118-only runs).
+    import csv
+
+    bus_order = [GRID_TO_BUSES[g] for g in selected]
+    csv_path = results / csv_name
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        header = ["model", "kind"]
+        for buses in bus_order:
+            header.extend([f"ms_{buses}", f"batch_{buses}"])
+        writer.writerow(header)
+        for label, raw in tpgt_raw_by_label.items():
+            row: list[Any] = [label, "tpgt"]
+            for buses in bus_order:
+                payload = raw.get(buses)
+                if payload is None:
+                    row.extend(["", ""])
+                else:
+                    row.extend(
+                        [
+                            f"{float(payload['ms_per_instance']):.6f}",
+                            int(float(payload["batch_size"])),
+                        ]
+                    )
+            writer.writerow(row)
+        for model in ("tiny", "small", "base"):
+            row = [f"GENCO {model.capitalize()}", "genco"]
+            for buses in bus_order:
+                ms = genco_measured.get(model, {}).get(buses)
+                batch = batch_union.get(buses, "")
+                row.extend(
+                    [f"{float(ms):.6f}" if ms is not None else "", batch]
+                )
+            writer.writerow(row)
+
+    summary = {
+        "gpu": gpu,
+        "gpu_needle": needle,
+        "grids": list(selected),
+        "match_genco": match_genco,
+        "runs": [
+            {
+                "label": e["label"],
+                "arch": e["arch"],
+                "folder": e["folder"],
+                "ms_by_bus": {
+                    str(b): ms for b, ms in tpgt_series[e["label"]].items()
+                },
+                "batch_by_bus": {
+                    str(b): int(float(tpgt_raw_by_label[e["label"]][b]["batch_size"]))
+                    for b in tpgt_raw_by_label[e["label"]]
+                },
+            }
+            for e in runs
+        ],
+        "genco_measured_ms": {
+            model: {str(b): ms for b, ms in series.items()}
+            for model, series in genco_measured.items()
+        },
+        "genco_batch_by_bus": {str(b): batch for b, batch in batch_union.items()},
+        "head_to_head_figure": head_name,
+        "csv": csv_name,
+    }
+    (results / sum_name).write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"\nWrote {results / head_name}", flush=True)
+    print(f"Wrote {csv_path}", flush=True)
+    print(f"Wrote {results / sum_name}", flush=True)
+    return results
+
+
+def display_multi_runtime_fig8(
+    results_dir: Path,
+    *,
+    head_to_head_name: str,
+    csv_name: str | None = None,
+) -> None:
+    """Notebook helper for multi-TPGT L4 comparison."""
+    from IPython.display import HTML, Image, display
+
+    head = results_dir / head_to_head_name
+    if head.is_file():
+        display(Image(filename=str(head)))
+    else:
+        print(f"Missing figure: {head}", flush=True)
+    if csv_name:
+        csv_path = results_dir / csv_name
+        if csv_path.is_file():
+            try:
+                import pandas as pd
+
+                display(pd.read_csv(csv_path))
+            except Exception:
+                display(HTML(f"<pre>{csv_path.read_text(encoding='utf-8')}</pre>"))
 
 
 def main() -> int:
