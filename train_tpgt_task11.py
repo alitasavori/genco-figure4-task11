@@ -3723,7 +3723,70 @@ def run_grit_component_ablations(
         if seed_dir is not None:
             out = seed_dir / "grit_component_ablations.json"
             out.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    if seed_dir is not None:
+        write_grit_ablation_csv(rows, labels=labels, seed_dir=seed_dir)
     return rows
+
+
+def write_grit_ablation_csv(
+    rows: list[dict[str, Any]],
+    *,
+    labels: tuple[str, ...] = ("N", "N-1", "N-2"),
+    seed_dir: Path,
+) -> Path:
+    """Flat CSV next to the JSON (and mirrored under repo ``results/`` when present)."""
+    import csv
+
+    what = {
+        "baseline": "-",
+        "W_Eb=0 (no additive electrical)": "Additive electrical term",
+        "W_Ev=0 (node values only)": "Pair-conditioned values",
+        "Zeff_Re_norm=0": "Real Zeff (keep Im)",
+        "Zeff_Im_norm=0": "Imag Zeff (keep Re)",
+        "W_Ew=0 (no multiplicative electrical)": "Multiplicative electrical term",
+    }
+    baseline = next((row for row in rows if row["name"] == "baseline"), None)
+    base_scores = baseline["scores"] if baseline else {}
+    path = seed_dir / "grit_component_ablations.csv"
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        header = ["ablation", "what_removed", *labels]
+        for label in labels:
+            header.append(f"delta_{label}")
+        writer.writerow(header)
+        for row in rows:
+            name = str(row["name"])
+            short = name.split(" (", 1)[0]
+            if name.startswith("head_") and name.endswith("=0"):
+                desc = f"Head {name[5:-2]} output"
+            elif name.startswith("stage_cutoff_"):
+                desc = f"Stop after stage {name.split('_')[-1]}"
+            else:
+                desc = what.get(name, short)
+            scores = row.get("scores", {})
+            deltas = row.get("delta_vs_baseline") or {
+                label: float(scores.get(label, float("nan"))) - float(base_scores.get(label, 0.0))
+                for label in labels
+            }
+            writer.writerow(
+                [
+                    short,
+                    desc,
+                    *[scores.get(label, "") for label in labels],
+                    *[deltas.get(label, 0.0 if name == "baseline" else "") for label in labels],
+                ]
+            )
+    print(f"Wrote {path}", flush=True)
+    # Local repo mirror for case57 v16 seed0 (best-effort; skip if locked/missing).
+    if CASE_NAME == "case57" and RUN_TAG == "v16":
+        mirror = Path(__file__).resolve().parent / "results" / "grit_component_ablations_case57_v16_seed0.csv"
+        try:
+            mirror.parent.mkdir(parents=True, exist_ok=True)
+            mirror.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+            print(f"Wrote {mirror}", flush=True)
+        except OSError as exc:
+            print(f"Could not mirror CSV to {mirror}: {exc}", flush=True)
+    return path
 
 
 def debug_sample_index(split: Split, network_id: int = 0, count: int = 32) -> np.ndarray:
