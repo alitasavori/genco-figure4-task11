@@ -138,6 +138,8 @@ Performance notes (Colab / large train split)
   ``GENCO_TPGT_RPE_ABLATION=0``, bus-shunt (``busBS``) with ``GENCO_TPGT_SHUNT_ABLATION=0``.
   ``--ablate-grit`` (v9/v16) scores N/N-1/N-2 after removing GRIT pieces
   (``W_Eb``, ``W_Ev``, ``W_Ew``, Re Zeff, each head, stage cutoffs 8..DEPTH-1).
+  ``--attn-sparsity`` (v16/v9 grit) dumps bus×bus attention heatmaps, attention-mass /
+  message-contribution k@90/95/99, and optimistic top-k renormalized PBL (no retrain).
   ``--eval-only --task 3.1`` scores Table 4 test splits without training: same
   split-cache prelude as ``main()`` (``reconcile_split_caches``, then ``load_task_split``
   train on ``pfdelta_task3.1``). When ``--checkpoint-root`` / ``GENCO_TPGT_CHECKPOINT_ROOT``
@@ -1533,6 +1535,16 @@ class CorrectionStage(nn.Module):
         weights = torch.nan_to_num(weights, nan=0.0)
         row_sum = weights.sum(dim=-1, keepdim=True)
         weights = torch.where(row_sum > 0, weights / row_sum.clamp(min=1e-12), weights)
+        # Optional diagnostic / optimistic sparsification (eval only; see attn_sparsity_diag).
+        topk = getattr(self, "_attn_topk", None)
+        if topk is not None:
+            weights = _topk_renorm_attention(weights, int(topk))
+        capture = bool(getattr(self, "_capture_attn", False))
+        contrib: torch.Tensor | None = None
+        if capture:
+            self._last_attn = weights.detach()
+            if bool(getattr(self, "_capture_attn_contrib", False)):
+                contrib = weights.new_zeros((batch, HEADS, buses, buses))
         mixed_heads = weights.new_zeros((batch, HEADS, buses, D_A))
         for block, interaction in zip(blocks, interactions):
             p = block.pair_id
@@ -1545,11 +1557,43 @@ class CorrectionStage(nn.Module):
             if use_ev:
                 pooled = torch.einsum("bhnm,bhnma->bhna", block_weights, interaction)
                 gathered = gathered + torch.einsum("bhna,hxa->bhnx", pooled, self.w_ev[p])
+            if contrib is not None:
+                # Pair message magnitude α_ij‖v_ij‖ (optimistic sparsity signal).
+                if use_ev:
+                    ev = torch.einsum("bhnma,hxa->bhnmx", interaction, self.w_ev[p])
+                    pair_val = value.unsqueeze(-3) + ev
+                    pair_norm = pair_val.norm(dim=-1)
+                else:
+                    pair_norm = value.norm(dim=-1).unsqueeze(-2).expand_as(block_weights)
+                block_contrib = block_weights * pair_norm
+                contrib[
+                    :,
+                    :,
+                    block.receivers.view(-1, 1),
+                    block.senders.view(1, -1),
+                ] = block_contrib.to(contrib.dtype)
             mixed_heads = mixed_heads.index_add(2, block.receivers, gathered.to(mixed_heads.dtype))
+        if capture and contrib is not None:
+            self._last_attn_contrib = contrib.detach()
         if zero_heads:
             for head in zero_heads:
                 mixed_heads[:, int(head)].zero_()
         return torch.einsum("bhna,hda->bnd", mixed_heads, self.w_o)
+
+
+def _topk_renorm_attention(weights: torch.Tensor, k: int) -> torch.Tensor:
+    """Keep the strongest ``k`` senders per receiver/head; renormalize (optimistic sparse test)."""
+    if k <= 0:
+        return weights
+    buses = int(weights.shape[-1])
+    keep = min(int(k), buses)
+    if keep >= buses:
+        return weights
+    top_vals, top_idx = torch.topk(weights, k=keep, dim=-1)
+    sparse = weights.new_zeros(weights.shape)
+    sparse.scatter_(-1, top_idx, top_vals)
+    row = sparse.sum(dim=-1, keepdim=True)
+    return torch.where(row > 0, sparse / row.clamp(min=1e-12), sparse)
 
     def _messages_joint_mlp(
         self,
@@ -9106,23 +9150,28 @@ def sanity_check_meshed_rpe(data_root: Path) -> None:
     )
 
 
-def cli_ablate_grit(checkpoint: Path | None = None, seed: int = 0) -> None:
-    """Post-training GRIT component ablations on the current ARCH/CASE checkpoint (no retrain)."""
+def _cli_load_grit_checkpoint(
+    *,
+    checkpoint: Path | None,
+    seed: int,
+    purpose: str,
+) -> tuple[TPGT, Path, Path, Path, Path, torch.device, Path]:
+    """Shared loader for ``--ablate-grit`` / ``--attn-sparsity`` (grit arches only)."""
     global DATA_FRACTION, EVAL_BATCH_SIZE
     ensure_runtime_packages()
     apply_architecture_config()
     DATA_FRACTION = parse_data_fraction()
     EVAL_BATCH_SIZE = parse_eval_batch_size()
     spec = parse_task()
-    print(f"GRIT component ablations — Task {spec.label}", flush=True)
+    print(f"{purpose} — Task {spec.label}", flush=True)
     print(architecture_summary(), flush=True)
     if ATTENTION_KIND != "grit":
         raise SystemExit(
-            f"--ablate-grit needs grit attention (use GENCO_TPGT_ARCH=v16 / v9); got {ATTENTION_KIND}"
+            f"{purpose} needs grit attention (use GENCO_TPGT_ARCH=v16 / v9); got {ATTENTION_KIND}"
         )
     drive = google_drive_root()
     outputs = drive_output_dirs(drive, spec)
-    work, legacy_results = legacy_locations(drive)
+    work, _legacy_results = legacy_locations(drive)
     if outputs is not None:
         checkpoints, _results = outputs
     else:
@@ -9131,7 +9180,6 @@ def cli_ablate_grit(checkpoint: Path | None = None, seed: int = 0) -> None:
     configure_cuda_training(device)
     data = ensure_dataset(work, drive, spec)
     active_cache, persistent_cache = split_cache_dirs(checkpoints, spec)
-    # Same prelude as training: write/adopt train ``rpe_global_scales.json`` after CACHE_VERSION bumps.
     warm_split_caches(data, active_cache, persistent_cache, spec, load_valid=False)
     seed_dir = checkpoints / f"seed_{seed}"
     ckpt = checkpoint or (seed_dir / "last.pt")
@@ -9147,6 +9195,16 @@ def cli_ablate_grit(checkpoint: Path | None = None, seed: int = 0) -> None:
     model.load_state_dict(payload["model"], strict=True)
     model.eval()
     print(f"Loaded {ckpt} ({architecture_summary()})", flush=True)
+    return model, data, active_cache, persistent_cache, seed_dir, device, ckpt
+
+
+def cli_ablate_grit(checkpoint: Path | None = None, seed: int = 0) -> None:
+    """Post-training GRIT component ablations on the current ARCH/CASE checkpoint (no retrain)."""
+    model, data, active_cache, persistent_cache, seed_dir, device, _ckpt = _cli_load_grit_checkpoint(
+        checkpoint=checkpoint,
+        seed=seed,
+        purpose="GRIT component ablations",
+    )
     run_grit_component_ablations(
         model,
         data,
@@ -9156,6 +9214,33 @@ def cli_ablate_grit(checkpoint: Path | None = None, seed: int = 0) -> None:
         labels=("N", "N-1", "N-2"),
         eval_batch_size=EVAL_BATCH_SIZE,
         seed_dir=seed_dir,
+    )
+
+
+def cli_attn_sparsity(
+    checkpoint: Path | None = None,
+    seed: int = 0,
+    cases: int = 16,
+) -> None:
+    """Step-2 attention sparsity: heatmaps, mass@90/95/99, optimistic top-k PBL."""
+    from attn_sparsity_diag import run_attention_sparsity_diagnostic
+
+    model, data, active_cache, persistent_cache, seed_dir, device, _ckpt = _cli_load_grit_checkpoint(
+        checkpoint=checkpoint,
+        seed=seed,
+        purpose="Attention sparsity diagnostic",
+    )
+    out_dir = seed_dir / "attn_sparsity"
+    run_attention_sparsity_diagnostic(
+        model,
+        data,
+        device,
+        active_cache,
+        persistent_cache,
+        out_dir=out_dir,
+        cases=cases,
+        labels=("N", "N-1", "N-2"),
+        eval_batch_size=EVAL_BATCH_SIZE,
     )
 
 
@@ -9209,6 +9294,29 @@ if __name__ == "__main__":
             else:
                 raise SystemExit(f"Unknown ablate-grit argument: {args_g[index_g]}")
         cli_ablate_grit(checkpoint=ckpt_g, seed=seed_g)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--attn-sparsity":
+        ckpt_a: Path | None = None
+        seed_a = 0
+        cases_a = 16
+        args_a = sys.argv[2:]
+        index_a = 0
+        while index_a < len(args_a):
+            if args_a[index_a] == "--checkpoint" and index_a + 1 < len(args_a):
+                ckpt_a = Path(args_a[index_a + 1])
+                index_a += 2
+            elif args_a[index_a] == "--seed" and index_a + 1 < len(args_a):
+                seed_a = int(args_a[index_a + 1])
+                index_a += 2
+            elif args_a[index_a] == "--cases" and index_a + 1 < len(args_a):
+                cases_a = int(args_a[index_a + 1])
+                index_a += 2
+            elif args_a[index_a] in ("--data-fraction", "--task") and index_a + 1 < len(args_a):
+                index_a += 2
+            elif args_a[index_a].startswith(("--data-fraction=", "--task=")):
+                index_a += 1
+            else:
+                raise SystemExit(f"Unknown attn-sparsity argument: {args_a[index_a]}")
+        cli_attn_sparsity(checkpoint=ckpt_a, seed=seed_a, cases=cases_a)
     elif len(sys.argv) > 1 and sys.argv[1] == "--verify-splits":
         cli_verify_splits()
     elif len(sys.argv) > 1 and sys.argv[1] == "--sanity-rpe":
