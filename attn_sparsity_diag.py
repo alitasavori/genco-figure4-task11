@@ -419,10 +419,10 @@ def run_attention_sparsity_diagnostic(
                 types=types,
                 log1p=True,
             )
-                grid_path = out_dir / f"attn_grid_{stem}.npy"
-                np.save(grid_path, grid)
-                _fsync_file(grid_path)
-                curve_marks = plot_topk_mass_curve(
+            grid_path = out_dir / f"attn_grid_{stem}.npy"
+            np.save(grid_path, grid)
+            _fsync_file(grid_path)
+            curve_marks = plot_topk_mass_curve(
                 attn,
                 out_dir / f"mass_curve_{stem}.png",
                 title=f"{label} stage {stage_i + 1}: cumulative attention mass",
