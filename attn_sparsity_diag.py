@@ -238,10 +238,29 @@ def _sample_indices(split, network_id: int, count: int) -> np.ndarray:
 
 
 def _tpgt():
-    """Import ``train_tpgt_task11`` and sync arch/case from env (needed under ``%run``)."""
+    """Resolve the trainer module with the active ``CASE_NAME`` / arch.
+
+    Under ``%run train_tpgt_task11.py``, config lives on ``__main__``. A plain
+    ``import train_tpgt_task11`` is a second module that can stay at default
+    ``case118`` (and Colab may keep a stale ``attn_sparsity_diag`` in
+    ``sys.modules`` across pulls). Prefer ``__main__`` when it looks like the
+    trainer; otherwise import + ``apply_architecture_config()``.
+    """
+    import sys
+
+    main = sys.modules.get("__main__")
+    if (
+        main is not None
+        and getattr(main, "__file__", None)
+        and str(getattr(main, "__file__", "")).endswith("train_tpgt_task11.py")
+        and hasattr(main, "raw_dir")
+        and hasattr(main, "CASE_NAME")
+        and hasattr(main, "cached_split")
+    ):
+        return main
+
     import train_tpgt_task11 as tpgt
 
-    # ``%run train_tpgt_task11.py`` configures ``__main__``, not this import. Re-apply from env.
     tpgt.apply_architecture_config()
     return tpgt
 

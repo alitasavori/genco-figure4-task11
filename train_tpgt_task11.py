@@ -9223,7 +9223,12 @@ def cli_attn_sparsity(
     cases: int = 16,
 ) -> None:
     """Step-2 attention sparsity: heatmaps, mass@90/95/99, optimistic top-k PBL."""
-    from attn_sparsity_diag import run_attention_sparsity_diagnostic
+    import importlib
+
+    import attn_sparsity_diag
+
+    # Colab kernels keep the first import across git pulls; always reload from disk.
+    attn_sparsity_diag = importlib.reload(attn_sparsity_diag)
 
     model, data, active_cache, persistent_cache, seed_dir, device, _ckpt = _cli_load_grit_checkpoint(
         checkpoint=checkpoint,
@@ -9231,7 +9236,11 @@ def cli_attn_sparsity(
         purpose="Attention sparsity diagnostic",
     )
     out_dir = seed_dir / "attn_sparsity"
-    run_attention_sparsity_diagnostic(
+    print(
+        f"attn-sparsity CASE_NAME={CASE_NAME} data={data} out={out_dir}",
+        flush=True,
+    )
+    attn_sparsity_diag.run_attention_sparsity_diagnostic(
         model,
         data,
         device,
