@@ -3747,6 +3747,7 @@ def write_grit_ablation_csv(
     }
     baseline = next((row for row in rows if row["name"] == "baseline"), None)
     base_scores = baseline["scores"] if baseline else {}
+    require_persistent_output_dir(seed_dir, purpose="GRIT component ablation CSV")
     path = seed_dir / "grit_component_ablations.csv"
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
@@ -3776,6 +3777,8 @@ def write_grit_ablation_csv(
                     *[deltas.get(label, 0.0 if name == "baseline" else "") for label in labels],
                 ]
             )
+        fh.flush()
+        os.fsync(fh.fileno())
     print(f"Wrote {path}", flush=True)
     # Local repo mirror for case57 v16 seed0 (best-effort; skip if locked/missing).
     if CASE_NAME == "case57" and RUN_TAG == "v16":
@@ -6525,6 +6528,37 @@ def task_results_dir(checkpoints: Path, results_root: Path, spec: TaskSpec | Non
     return checkpoints / "results"
 
 
+def is_persistent_drive_path(path: Path) -> bool:
+    """True when ``path`` lives under Colab MyDrive or the Windows Google Drive client."""
+    resolved = path.expanduser().resolve()
+    markers = (
+        Path("/content/drive/MyDrive"),
+        Path("/content/drive/My Drive"),
+        WINDOWS_DRIVE,
+        COLAB_DRIVE,
+    )
+    for marker in markers:
+        try:
+            if marker.is_dir() and resolved.is_relative_to(marker.resolve()):
+                return True
+        except (OSError, ValueError):
+            continue
+    text = str(resolved).replace("\\", "/").lower()
+    return "/content/drive/mydrive" in text or "/my drive/foundation model" in text
+
+
+def require_persistent_output_dir(path: Path, *, purpose: str) -> Path:
+    """Create ``path`` and refuse ephemeral ``/content/...`` outputs on Colab."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    if in_colab() and not is_persistent_drive_path(path):
+        raise RuntimeError(
+            f"{purpose} must write under Google Drive (MyDrive/Foundation Model/...), "
+            f"got ephemeral path {path}. Mount Drive and re-run the prep cell."
+        )
+    return path
+
+
 def drive_output_dirs(drive: Path | None, spec: TaskSpec | None = None) -> tuple[Path, Path] | None:
     """Checkpoint directory and TPGT result directory on Drive, both versioned by ``RUN_TAG``.
 
@@ -9233,18 +9267,27 @@ def _cli_load_grit_checkpoint(
             f"{purpose} needs grit attention (use GENCO_TPGT_ARCH=v16 / v9); got {ATTENTION_KIND}"
         )
     drive = google_drive_root()
+    if in_colab() and drive is None:
+        raise SystemExit(f"{purpose}: Google Drive is not mounted; run the Colab prep cell.")
     outputs = drive_output_dirs(drive, spec)
     work, _legacy_results = legacy_locations(drive)
     if outputs is not None:
         checkpoints, _results = outputs
     else:
+        if in_colab():
+            raise SystemExit(
+                f"{purpose}: Drive is mounted but Foundation Model output dirs are unavailable."
+            )
         checkpoints = work / spec.run_dir_name
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     configure_cuda_training(device)
     data = ensure_dataset(work, drive, spec)
     active_cache, persistent_cache = split_cache_dirs(checkpoints, spec)
     warm_split_caches(data, active_cache, persistent_cache, spec, load_valid=False)
-    seed_dir = checkpoints / f"seed_{seed}"
+    seed_dir = require_persistent_output_dir(
+        checkpoints / f"seed_{seed}",
+        purpose=purpose,
+    )
     ckpt = checkpoint or (seed_dir / "last.pt")
     model = TPGT().to(device)
     if not ckpt.exists():
@@ -9258,6 +9301,7 @@ def _cli_load_grit_checkpoint(
     model.load_state_dict(payload["model"], strict=True)
     model.eval()
     print(f"Loaded {ckpt} ({architecture_summary()})", flush=True)
+    print(f"Persistent seed dir (Drive): {seed_dir}", flush=True)
     return model, data, active_cache, persistent_cache, seed_dir, device, ckpt
 
 
@@ -9298,7 +9342,10 @@ def cli_attn_sparsity(
         seed=seed,
         purpose="Attention sparsity diagnostic",
     )
-    out_dir = seed_dir / "attn_sparsity"
+    out_dir = require_persistent_output_dir(
+        seed_dir / "attn_sparsity",
+        purpose="Attention sparsity diagnostic",
+    )
     print(
         f"attn-sparsity CASE_NAME={CASE_NAME} data={data} out={out_dir}",
         flush=True,
@@ -9314,6 +9361,10 @@ def cli_attn_sparsity(
         labels=("N", "N-1", "N-2"),
         eval_batch_size=EVAL_BATCH_SIZE,
     )
+    saved = sorted(p for p in out_dir.rglob("*") if p.is_file())
+    print(f"Saved {len(saved)} attention-sparsity artifact(s) on Drive under {out_dir}:", flush=True)
+    for path in saved:
+        print(f"  {path.relative_to(out_dir)} ({path.stat().st_size} bytes)", flush=True)
 
 
 if __name__ == "__main__":

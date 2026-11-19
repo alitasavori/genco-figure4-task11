@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import csv
 import json
+import os
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -24,6 +25,25 @@ from plot_style import apply_plot_style, style_axis
 
 MASS_THRESHOLDS = (0.90, 0.95, 0.99)
 DEFAULT_TOPKS = (4, 8, 16, 24, 32)
+
+
+def _fsync_file(path: Path) -> None:
+    """Best-effort durable write so Colab Drive sync sees the file before session death."""
+    try:
+        with path.open("rb", buffering=0) as fh:
+            os.fsync(fh.fileno())
+    except OSError:
+        pass
+
+
+def _write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    _fsync_file(path)
+
+
+def _write_text(path: Path, text: str) -> None:
+    _write_bytes(path, text.encode("utf-8"))
 
 
 @contextlib.contextmanager
@@ -182,6 +202,7 @@ def plot_attention_heatmap(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
+    _fsync_file(out_path)
 
 
 def plot_topk_mass_curve(
@@ -230,6 +251,7 @@ def plot_topk_mass_curve(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
+    _fsync_file(out_path)
     return marks
 
 
@@ -332,6 +354,181 @@ def run_attention_sparsity_diagnostic(
     }
 
     mass_csv = out_dir / "attention_mass_by_stage.csv"
+    mass_rows: list[list[Any]] = []
+
+    for label, topology, condition in TEST_PARTS:
+        if label not in labels or condition != "feasible":
+            continue
+        print(f"=== Attention sparsity: {label} ===", flush=True)
+        split = cached_split(
+            active_cache,
+            persistent_cache,
+            raw_dir(data, "test", topology, condition),
+            f"test_{topology}_{condition}",
+        )
+        # Intact N: network 0. Contingencies: largest group (most cases).
+        if label == "N":
+            net_id = 0
+        else:
+            counts = torch.bincount(split.network_index, minlength=len(split.networks))
+            net_id = int(torch.argmax(counts))
+        network = split.networks[net_id]
+        index = _sample_indices(split, net_id, cases)
+        print(
+            f"  network_id={net_id} buses={int(network.ybus.shape[0])} "
+            f"cases={len(index)}",
+            flush=True,
+        )
+
+        captured, types, _dense_pbl = _forward_capture(
+            model, split, network, index, device, contrib=True, topk=None
+        )
+        label_summary: dict[str, Any] = {
+            "network_id": net_id,
+            "n_buses": int(network.ybus.shape[0]),
+            "n_cases": int(len(index)),
+            "stages": [],
+        }
+
+        # Aggregate mean attention over stages for the main 2D grid.
+        stage_grids = []
+        for stage_i, payload in enumerate(captured):
+            attn = payload["attn"]
+            contrib = payload["contrib"]
+            if attn is None:
+                continue
+            attn_stats = summarize_mass(attn, types, type_names=TYPE_NAMES)
+            contrib_stats = (
+                summarize_mass(contrib, types, type_names=TYPE_NAMES)
+                if contrib is not None
+                else None
+            )
+            grid = mean_attention_grid(attn)
+            stage_grids.append(grid)
+            stem = f"{label}_stage{stage_i + 1:02d}"
+            plot_attention_heatmap(
+                grid,
+                out_dir / f"heatmap_{stem}_mean_heads.png",
+                title=f"{label} stage {stage_i + 1}: mean α (batch×heads)",
+                types=types,
+            )
+            plot_attention_heatmap(
+                grid,
+                out_dir / f"heatmap_{stem}_mean_heads_log.png",
+                title=f"{label} stage {stage_i + 1}: log1p mean α",
+                types=types,
+                log1p=True,
+            )
+                grid_path = out_dir / f"attn_grid_{stem}.npy"
+                np.save(grid_path, grid)
+                _fsync_file(grid_path)
+                curve_marks = plot_topk_mass_curve(
+                attn,
+                out_dir / f"mass_curve_{stem}.png",
+                title=f"{label} stage {stage_i + 1}: cumulative attention mass",
+            )
+            # Per-head grids for first/last stage only (avoid PNG spam).
+            if stage_i in (0, len(captured) - 1):
+                for h in range(int(attn.shape[1])):
+                    hgrid = mean_attention_grid(attn, head=h)
+                    plot_attention_heatmap(
+                        hgrid,
+                        out_dir / f"heatmap_{stem}_head{h}.png",
+                        title=f"{label} stage {stage_i + 1} head {h}",
+                        types=types,
+                    )
+
+            stage_entry = {
+                "stage": stage_i + 1,
+                "attention_mass": attn_stats,
+                "message_contrib_mass": contrib_stats,
+                "curve_k": curve_marks,
+            }
+            label_summary["stages"].append(stage_entry)
+
+            for metric_name, stats in (
+                ("attention", attn_stats),
+                ("message_contrib", contrib_stats),
+            ):
+                if stats is None:
+                    continue
+                for group, payload_stats in (
+                    ("overall", stats["overall"]),
+                    *[("head_" + h, v) for h, v in stats["by_head"].items()],
+                    *[("type_" + t, v) for t, v in stats["by_recv_type"].items()],
+                ):
+                    mass_rows.append(
+                        [
+                            label,
+                            stage_i + 1,
+                            metric_name,
+                            group,
+                            payload_stats.get("k@90", ""),
+                            payload_stats.get("k@95", ""),
+                            payload_stats.get("k@99", ""),
+                            payload_stats.get("entropy", ""),
+                            payload_stats.get("max", ""),
+                        ]
+                    )
+
+            print(
+                f"  stage {stage_i + 1}: attn k@90/95/99 = "
+                f"{attn_stats['overall'].get('k@90', float('nan')):.1f} / "
+                f"{attn_stats['overall'].get('k@95', float('nan')):.1f} / "
+                f"{attn_stats['overall'].get('k@99', float('nan')):.1f}",
+                flush=True,
+            )
+
+        if stage_grids:
+            mean_all = np.mean(np.stack(stage_grids, axis=0), axis=0)
+            plot_attention_heatmap(
+                mean_all,
+                out_dir / f"heatmap_{label}_all_stages_mean.png",
+                title=f"{label}: mean α over stages×batch×heads",
+                types=types,
+            )
+            plot_attention_heatmap(
+                mean_all,
+                out_dir / f"heatmap_{label}_all_stages_mean_log.png",
+                title=f"{label}: log1p mean α over stages",
+                types=types,
+                log1p=True,
+            )
+            np_path = out_dir / f"attn_grid_{label}_all_stages.npy"
+            np.save(np_path, mean_all)
+            _fsync_file(np_path)
+            label_summary["primary_heatmap"] = f"heatmap_{label}_all_stages_mean.png"
+
+        # Optimistic top-k: dense scores → keep k → renormalize (still needs dense scoring).
+        topk_rows: list[dict[str, Any]] = []
+        _, _, dense_pbl = _forward_capture(
+            model, split, network, index, device, contrib=False, topk=None
+        )
+        topk_rows.append({"k": "dense", "pbl": float(dense_pbl)})
+        print(f"  dense sample PBL={dense_pbl:.6g}", flush=True)
+
+        for k in topks:
+            _, _, pbl_k = _forward_capture(
+                model, split, network, index, device, contrib=False, topk=int(k)
+            )
+            topk_rows.append(
+                {
+                    "k": int(k),
+                    "pbl": float(pbl_k),
+                    "delta": float(pbl_k - dense_pbl),
+                }
+            )
+            print(
+                f"  top-k={k} sample PBL={pbl_k:.6g} (Δ {pbl_k - dense_pbl:+.4g})",
+                flush=True,
+            )
+
+        label_summary["topk_pbl_sample"] = topk_rows
+        summary["by_label"][label] = label_summary
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     with mass_csv.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(
@@ -347,181 +544,19 @@ def run_attention_sparsity_diagnostic(
                 "max",
             ]
         )
-
-        for label, topology, condition in TEST_PARTS:
-            if label not in labels or condition != "feasible":
-                continue
-            print(f"=== Attention sparsity: {label} ===", flush=True)
-            split = cached_split(
-                active_cache,
-                persistent_cache,
-                raw_dir(data, "test", topology, condition),
-                f"test_{topology}_{condition}",
-            )
-            # Intact N: network 0. Contingencies: largest group (most cases).
-            if label == "N":
-                net_id = 0
-            else:
-                counts = torch.bincount(split.network_index, minlength=len(split.networks))
-                net_id = int(torch.argmax(counts))
-            network = split.networks[net_id]
-            index = _sample_indices(split, net_id, cases)
-            print(
-                f"  network_id={net_id} buses={int(network.ybus.shape[0])} "
-                f"cases={len(index)}",
-                flush=True,
-            )
-
-            captured, types, _dense_pbl = _forward_capture(
-                model, split, network, index, device, contrib=True, topk=None
-            )
-            label_summary: dict[str, Any] = {
-                "network_id": net_id,
-                "n_buses": int(network.ybus.shape[0]),
-                "n_cases": int(len(index)),
-                "stages": [],
-            }
-
-            # Aggregate mean attention over stages for the main 2D grid.
-            stage_grids = []
-            for stage_i, payload in enumerate(captured):
-                attn = payload["attn"]
-                contrib = payload["contrib"]
-                if attn is None:
-                    continue
-                attn_stats = summarize_mass(attn, types, type_names=TYPE_NAMES)
-                contrib_stats = (
-                    summarize_mass(contrib, types, type_names=TYPE_NAMES)
-                    if contrib is not None
-                    else None
-                )
-                grid = mean_attention_grid(attn)
-                stage_grids.append(grid)
-                stem = f"{label}_stage{stage_i + 1:02d}"
-                plot_attention_heatmap(
-                    grid,
-                    out_dir / f"heatmap_{stem}_mean_heads.png",
-                    title=f"{label} stage {stage_i + 1}: mean α (batch×heads)",
-                    types=types,
-                )
-                plot_attention_heatmap(
-                    grid,
-                    out_dir / f"heatmap_{stem}_mean_heads_log.png",
-                    title=f"{label} stage {stage_i + 1}: log1p mean α",
-                    types=types,
-                    log1p=True,
-                )
-                np.save(out_dir / f"attn_grid_{stem}.npy", grid)
-                curve_marks = plot_topk_mass_curve(
-                    attn,
-                    out_dir / f"mass_curve_{stem}.png",
-                    title=f"{label} stage {stage_i + 1}: cumulative attention mass",
-                )
-                # Per-head grids for first/last stage only (avoid PNG spam).
-                if stage_i in (0, len(captured) - 1):
-                    for h in range(int(attn.shape[1])):
-                        hgrid = mean_attention_grid(attn, head=h)
-                        plot_attention_heatmap(
-                            hgrid,
-                            out_dir / f"heatmap_{stem}_head{h}.png",
-                            title=f"{label} stage {stage_i + 1} head {h}",
-                            types=types,
-                        )
-
-                stage_entry = {
-                    "stage": stage_i + 1,
-                    "attention_mass": attn_stats,
-                    "message_contrib_mass": contrib_stats,
-                    "curve_k": curve_marks,
-                }
-                label_summary["stages"].append(stage_entry)
-
-                for metric_name, stats in (
-                    ("attention", attn_stats),
-                    ("message_contrib", contrib_stats),
-                ):
-                    if stats is None:
-                        continue
-                    for group, payload_stats in (
-                        ("overall", stats["overall"]),
-                        *[("head_" + h, v) for h, v in stats["by_head"].items()],
-                        *[("type_" + t, v) for t, v in stats["by_recv_type"].items()],
-                    ):
-                        writer.writerow(
-                            [
-                                label,
-                                stage_i + 1,
-                                metric_name,
-                                group,
-                                payload_stats.get("k@90", ""),
-                                payload_stats.get("k@95", ""),
-                                payload_stats.get("k@99", ""),
-                                payload_stats.get("entropy", ""),
-                                payload_stats.get("max", ""),
-                            ]
-                        )
-
-                print(
-                    f"  stage {stage_i + 1}: attn k@90/95/99 = "
-                    f"{attn_stats['overall'].get('k@90', float('nan')):.1f} / "
-                    f"{attn_stats['overall'].get('k@95', float('nan')):.1f} / "
-                    f"{attn_stats['overall'].get('k@99', float('nan')):.1f}",
-                    flush=True,
-                )
-
-            if stage_grids:
-                mean_all = np.mean(np.stack(stage_grids, axis=0), axis=0)
-                plot_attention_heatmap(
-                    mean_all,
-                    out_dir / f"heatmap_{label}_all_stages_mean.png",
-                    title=f"{label}: mean α over stages×batch×heads",
-                    types=types,
-                )
-                plot_attention_heatmap(
-                    mean_all,
-                    out_dir / f"heatmap_{label}_all_stages_mean_log.png",
-                    title=f"{label}: log1p mean α over stages",
-                    types=types,
-                    log1p=True,
-                )
-                np.save(out_dir / f"attn_grid_{label}_all_stages.npy", mean_all)
-                label_summary["primary_heatmap"] = f"heatmap_{label}_all_stages_mean.png"
-
-            # Optimistic top-k: dense scores → keep k → renormalize (still needs dense scoring).
-            topk_rows: list[dict[str, Any]] = []
-            _, _, dense_pbl = _forward_capture(
-                model, split, network, index, device, contrib=False, topk=None
-            )
-            topk_rows.append({"k": "dense", "pbl": float(dense_pbl)})
-            print(f"  dense sample PBL={dense_pbl:.6g}", flush=True)
-
-            for k in topks:
-                _, _, pbl_k = _forward_capture(
-                    model, split, network, index, device, contrib=False, topk=int(k)
-                )
-                topk_rows.append(
-                    {
-                        "k": int(k),
-                        "pbl": float(pbl_k),
-                        "delta": float(pbl_k - dense_pbl),
-                    }
-                )
-                print(
-                    f"  top-k={k} sample PBL={pbl_k:.6g} (Δ {pbl_k - dense_pbl:+.4g})",
-                    flush=True,
-                )
-
-            label_summary["topk_pbl_sample"] = topk_rows
-            summary["by_label"][label] = label_summary
-
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+        writer.writerows(mass_rows)
+        fh.flush()
+        os.fsync(fh.fileno())
 
     summary_path = out_dir / "attn_sparsity_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    _write_text(summary_path, json.dumps(summary, indent=2))
+    # Durable inventory so a later session can see what survived on Drive.
+    files = sorted(p for p in out_dir.rglob("*") if p.is_file())
+    manifest_lines = [f"{p.relative_to(out_dir)}\t{p.stat().st_size}" for p in files]
+    _write_text(out_dir / "MANIFEST.txt", "\n".join(manifest_lines) + "\n")
     print(f"Wrote {summary_path}", flush=True)
     print(f"Wrote {mass_csv}", flush=True)
-    print(f"Heatmaps under {out_dir}", flush=True)
+    print(f"Heatmaps + numerics under Drive path {out_dir} ({len(files)} files)", flush=True)
     return summary
 
 
