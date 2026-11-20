@@ -18,6 +18,7 @@ from train_tpgt_task11 import (  # noqa: E402
     TPGT,
     Network,
     Split,
+    architecture_summary,
     audit_residual_correctness,
     audit_rpe_correctness,
     bus_shunt_b,
@@ -162,6 +163,77 @@ def test_v19_node_features_pq5_pv_slack7():
         tpgt.USE_NODE_SHUNT = previous
         tpgt.USE_NODE_SUPPLY_DEMAND = previous_sd
         tpgt.refresh_node_feature_config()
+
+
+def test_v20_grit_pair_update_flag():
+    previous = tpgt.USE_NODE_SHUNT
+    previous_sd = tpgt.USE_NODE_SUPPLY_DEMAND
+    previous_pair = tpgt.GRIT_UPDATE_PAIR
+    previous_kind = tpgt.ATTENTION_KIND
+    try:
+        tpgt.USE_NODE_SHUNT = True
+        tpgt.USE_NODE_SUPPLY_DEMAND = True
+        tpgt.GRIT_UPDATE_PAIR = True
+        tpgt.ATTENTION_KIND = "grit"
+        tpgt.refresh_node_feature_config()
+        model = TPGT()
+        assert model.stages[0].update_pair is True
+        assert model.stages[0].w_oe is not None
+        assert model.stages[0].pair_norm is not None
+        assert "pair_upd" in architecture_summary()
+    finally:
+        tpgt.USE_NODE_SHUNT = previous
+        tpgt.USE_NODE_SUPPLY_DEMAND = previous_sd
+        tpgt.GRIT_UPDATE_PAIR = previous_pair
+        tpgt.ATTENTION_KIND = previous_kind
+        tpgt.refresh_node_feature_config()
+
+
+def test_pv_slack_gen_pack_residual_subtracts_demand():
+    """PV/Slack pack Ps/Qs; residual injects Ps−Pd / Qs−Qd (matches supply/demand features)."""
+    previous_sd = tpgt.USE_NODE_SUPPLY_DEMAND
+    try:
+        tpgt.USE_NODE_SUPPLY_DEMAND = True
+        # buses: 0=PQ, 1=PV, 2=Slack
+        types = torch.tensor([0, 1, 2])
+        demand_p = torch.tensor([[0.5, 0.2, 0.3]])
+        demand_q = torch.tensor([[0.1, 0.05, 0.08]])
+        supply_p = torch.tensor([[0.0, 0.7, 1.2]])
+        supply_q = torch.tensor([[0.0, 0.4, 0.6]])
+        # Net injections (= Ps−Pd) used for PQ packing and as the physical truth.
+        power_p = supply_p - demand_p
+        power_q = supply_q - demand_q
+        voltage = torch.tensor([[1.0, 1.02, 1.05]])
+        angle = torch.tensor([[0.1, -0.05, 0.0]])
+        specified, target = pack_case(
+            power_p, power_q, voltage, angle, types, supply_p=supply_p, supply_q=supply_q
+        )
+        # PV specified P is generation Ps, not net.
+        assert torch.allclose(specified[0, 1, 0], supply_p[0, 1])
+        assert not torch.allclose(specified[0, 1, 0], power_p[0, 1])
+        # Slack targets are generation Ps/Qs.
+        assert torch.allclose(target[0, 2, 0], supply_p[0, 2])
+        assert torch.allclose(target[0, 2, 1], supply_q[0, 2])
+        # Synthetic Ybus: choose flow so net injection matches power_*; residual ~0 with demand.
+        # Build diagonal-ish ybus so S = V conj(Y V) is controllable via a identity-scaled network.
+        # Use assemble+identity residual path: for V∠θ with Y=0, flow=0, residual = inj.
+        ybus = torch.zeros(3, 3, dtype=torch.complex64)
+        residual = nodal_residual(
+            specified, target, types, ybus, demand_p=demand_p, demand_q=demand_q
+        )
+        # With Y=0, flow=0 → residual equals net injection (Ps−Pd, Qs−Qd).
+        assert torch.allclose(residual[0, 0, 0], power_p[0, 0], atol=1e-5)
+        assert torch.allclose(residual[0, 0, 1], power_q[0, 0], atol=1e-5)
+        assert torch.allclose(residual[0, 1, 0], power_p[0, 1], atol=1e-5)  # Ps−Pd
+        assert torch.allclose(residual[0, 1, 1], power_q[0, 1], atol=1e-5)
+        assert torch.allclose(residual[0, 2, 0], power_p[0, 2], atol=1e-5)
+        assert torch.allclose(residual[0, 2, 1], power_q[0, 2], atol=1e-5)
+        # Forgetting demand on PV would leave residual at Ps (wrong).
+        residual_no_dem = nodal_residual(specified, target, types, ybus)
+        assert torch.allclose(residual_no_dem[0, 1, 0], supply_p[0, 1], atol=1e-5)
+        assert abs(float(residual_no_dem[0, 1, 0] - residual[0, 1, 0])) > 0.1
+    finally:
+        tpgt.USE_NODE_SUPPLY_DEMAND = previous_sd
 
 
 def test_pair_encoder_weight_norms():

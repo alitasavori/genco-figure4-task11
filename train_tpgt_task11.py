@@ -63,9 +63,9 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
 * **RPE**: legacy ``Zeff_Re_norm`` + ``Zeff_Im_norm`` (v7–v16 / v19); **v17+ Im-only**
   ``Zeff_Im_norm`` (Real Zeff dropped after ablation showed near-zero dependence),
   except ``v19`` keeps Re+Im like v16.
-* **Node features**: v9–v16 ``(P,Q,V,θ,busBS)`` with net ``P=Ps−Pd``; **v19** keeps PQ
-  at 5-D ``(P,Q,V,θ,busBS)`` and gives PV/Slack ``(Pd,Qd,Ps,Qs,V,θ,busBS)``
-  (packing + AC residual still use net ``P,Q``).
+* **Node features**: v9–v16 ``(P,Q,V,θ,busBS)`` with net ``P=Ps−Pd``; **v19/v20** keep PQ
+  at 5-D ``(P,Q,V,θ,busBS)`` and give PV/Slack ``(Pd,Qd,Ps,Qs,V,θ,busBS)``.
+  PV/Slack pack ``Ps/Qs``; AC residual injects ``Ps−Pd``, ``Qs−Qd``.
 * **RPE channel dropout**: during training each channel is zeroed with
   probability ``RPE_CHANNEL_DROPOUT`` per optimizer step; never at eval.
 * **Versioned run folder**: checkpoints go to ``Foundation Model/tpgt_task11_<RUN_TAG>``
@@ -96,7 +96,9 @@ Performance notes (Colab / large train split)
   ``hop_id``/``edge_id``; Exphormer uses ``exph_allow``/edge lists). In ``eval`` mode
   pair features persist on ``Network.pair_embed`` (and DeviceNetworks hosts) across
   batches; GRIT also caches per-stage ``W_Ew e`` / ``W_Eb e`` block projections for
-  shared-topology pairs (Q/K/ξ/α still recompute every stage).
+  shared-topology pairs (Q/K/ξ/α still recompute every stage). **v20**
+  (``GRIT_UPDATE_PAIR``) additionally updates pair embeddings each stage from ξ
+  (Ma et al. GRIT ``update_e``), so ``e_ij`` is no longer static across depth.
 * **Type-pair attention**: ``CorrectionStage._messages`` evaluates each of the
   nine (or fifteen for Exphormer) type-pair weight sets only on its own
   receiver-type × sender-type block (both heads batched), then takes one softmax over
@@ -249,9 +251,10 @@ CHECKPOINT_VERSION = "meshed-rpe-2-d4-v7"
 RUN_TAG = "v7"
 CASE_NAME = "case118"
 RUN_DIR_NAME = f"tpgt_task11_{RUN_TAG}"
-# Residual/state packing stays 2 known slots per type (net P=Ps−Pd, Q=Qs−Qd).
-# v9 node encoders: (P, Q, V, θ, Bs) for all types.
-# v19: PQ stays (P,Q,V,θ,Bs); PV/Slack use (Pd,Qd,Ps,Qs,V,θ,Bs). Physics still net P/Q.
+# Residual/state packing stays 2 known slots per type.
+# v9 node encoders: (P, Q, V, θ, Bs) for all types (net P=Ps−Pd).
+# v19/v20: PQ stays net (P,Q,V,θ,Bs); PV/Slack features (Pd,Qd,Ps,Qs,V,θ,Bs).
+# PV/Slack pack generation Ps/Qs; AC residual injects Ps−Pd and Qs−Qd.
 NODE_SPECIFIED_DIM = 2
 NODE_PQVT_DIM = 4
 NODE_SUPPLY_DEMAND_DIM = 4  # Pd, Qd, Ps, Qs
@@ -263,6 +266,9 @@ NODE_ENCODER_FEATURE_NAMES_PV_SLACK = ("Pd", "Qd", "Ps", "Qs", "V", "theta", "bu
 USE_NODE_SHUNT = False
 # When True (v19): PV/Slack encoders get supply/demand channels; PQ stays 5-D.
 USE_NODE_SUPPLY_DEMAND = False
+# When True (v20): each GRIT stage updates pair features from ξ then LN residual
+# (Ma et al. ICML 2023 GRIT ``update_e``). Default False keeps static e_ij across depth.
+GRIT_UPDATE_PAIR = False
 # ``grit``: ReLU(ρ(W_Q^{t_i←t_j} h_i + W_K^{t_i←t_j} h_j) ⊙ W_Ew e_ij + W_Eb e_ij) then linear score.
 # ``joint_mlp``: q_{i|t_j}=W_Q^{t_i←t_j} h_i, k_{j|t_i}=W_K^{t_i←t_j} h_j;
 #   s_ij = MLP_{t_i←t_j}^{ℓ,h}([q_{i|t_j} ‖ k_{j|t_i} ‖ r_ij]) on raw RPE (Approach C; v10).
@@ -488,7 +494,7 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "RPE_CHANNELS": "im",
     },
     # v16 GRIT/capacity/RPE; PQ stays (P,Q,V,θ,Bs); PV/Slack get (Pd,Qd,Ps,Qs,V,θ,Bs).
-    # Packing + AC residual still use net P=Ps−Pd, Q=Qs−Qd. Folder ``tpgt_task11_*_v19``.
+    # PV/Slack pack Ps/Qs; residual injects Ps−Pd, Qs−Qd. Folder ``tpgt_task11_*_v19``.
     "v19": {
         "D": 96,
         "D_E": 48,
@@ -496,16 +502,46 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "HEADS": 4,
         "DEPTH": 12,
         "RUN_TAG": "v19",
-        "CHECKPOINT_VERSION": "meshed-rpe-2-d12-w96-h4-pq5-pvslack7-busBS-v19",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d12-w96-h4-pq5-pvslack7-genpack-v19",
         "USE_NODE_SHUNT": True,
         "USE_NODE_SUPPLY_DEMAND": True,
+        "ATTENTION_KIND": "grit",
+        "RPE_CHANNELS": "re_im",
+    },
+    # v19 + GRIT node-pair update each stage (Ma et al. ``update_e``). Folder ``…_v20``.
+    "v20": {
+        "D": 96,
+        "D_E": 48,
+        "D_A": 48,
+        "HEADS": 4,
+        "DEPTH": 12,
+        "RUN_TAG": "v20",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d12-w96-h4-pq5-pvslack7-pairupd-genpack-v20",
+        "USE_NODE_SHUNT": True,
+        "USE_NODE_SUPPLY_DEMAND": True,
+        "GRIT_UPDATE_PAIR": True,
         "ATTENTION_KIND": "grit",
         "RPE_CHANNELS": "re_im",
     },
 }
 # Legacy arches keep Re+Im; any new preset without ``RPE_CHANNELS`` defaults to Im-only.
 _LEGACY_RPE_RE_IM = frozenset(
-    {"v7", "v8", "v9", "v9d4", "v10", "v11", "v11e", "v12", "v13", "v14", "v15", "v16", "v19"}
+    {
+        "v7",
+        "v8",
+        "v9",
+        "v9d4",
+        "v10",
+        "v11",
+        "v11e",
+        "v12",
+        "v13",
+        "v14",
+        "v15",
+        "v16",
+        "v19",
+        "v20",
+    }
 )
 for _arch_name, _preset in ARCH_PRESETS.items():
     if "RPE_CHANNELS" not in _preset:
@@ -1047,6 +1083,7 @@ class CorrectionStage(nn.Module):
 
     Attention kind is selected by ``ATTENTION_KIND`` at construction:
     * ``grit`` (default): pair-conditioned GRIT scores and edge-augmented values.
+      With ``GRIT_UPDATE_PAIR`` (v20), also returns updated ``e_ij`` each stage.
     * ``joint_mlp`` (v10): nine type-pair × head score MLPs on raw RPE.
     * ``grpe`` (v11): Park GRPE with shared hop/edge embeddings in score and values.
     * ``grpe_elec`` (v11e): GRPE plus stage-specific Zeff bilinear ``U_Q/U_K/U_V``.
@@ -1077,6 +1114,9 @@ class CorrectionStage(nn.Module):
         self.score_w3 = self.score_b3 = None
         self.u_q = self.u_k = self.u_v = None
         self.w_ew = self.w_eb = self.w_a = self.w_ev = None
+        self.w_oe = None
+        self.pair_norm = None
+        self.update_pair = bool(GRIT_UPDATE_PAIR) and self.attention_kind == "grit"
         self.edge_bias = None
         self.update_virt = None
         self.norm_virt = None
@@ -1151,6 +1191,11 @@ class CorrectionStage(nn.Module):
             self.w_a = nn.Parameter(torch.empty(*shape, 1, D_A))
             self.w_ev = nn.Parameter(torch.empty(*shape, D_A, D_A))
             grit_params = [self.w_ew, self.w_eb, self.w_a, self.w_ev]
+            if self.update_pair:
+                # GRIT O_e: map multi-head ξ → D_E for residual pair update.
+                self.w_oe = nn.Parameter(torch.empty(HEADS, D_E, D_A))
+                grit_params.append(self.w_oe)
+                self.pair_norm = nn.LayerNorm(D_E)
         for parameter in (
             self.w_q,
             self.w_k,
@@ -1192,8 +1237,11 @@ class CorrectionStage(nn.Module):
         types_efla: torch.Tensor | None = None,
         wire_rho: torch.Tensor | None = None,
         pair_elec: torch.Tensor | None = None,
+        demand_p: torch.Tensor | None = None,
+        demand_q: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        residual_in = nodal_residual(specified, unknown, layout, ybus)
+        residual_kw = residual_demand_kwargs(demand_p, demand_q)
+        residual_in = nodal_residual(specified, unknown, layout, ybus, **residual_kw)
         z_next: torch.Tensor | None = None
         if self.attention_kind == "exphormer":
             if z_virt is None or exph_allow is None or exph_tau is None or virt_rpe is None or types is None:
@@ -1234,7 +1282,11 @@ class CorrectionStage(nn.Module):
                 types_use = types_use[0]
             message = self._messages_pair_rotary(hidden, pair_elec, types_use, component)
         else:
-            message = self._messages(hidden, pair, layout.blocks, grpe=grpe)
+            message_out = self._messages(hidden, pair, layout.blocks, grpe=grpe)
+            if self.update_pair:
+                message, pair = message_out  # type: ignore[misc]
+            else:
+                message = message_out  # type: ignore[assignment]
         updated = torch.zeros_like(hidden)
         for type_id, update in enumerate(self.update):
             if not layout.present[type_id]:
@@ -1263,9 +1315,11 @@ class CorrectionStage(nn.Module):
                     buses = layout.index[type_id]
                     delta[:, buses, 1] = delta[:, buses, 1] * ETA_ANGLE
         unknown_next = constrain_unknown(unknown + ETA * delta, layout)
-        residual_out = nodal_residual(specified, unknown_next, layout, ybus)
+        residual_out = nodal_residual(specified, unknown_next, layout, ybus, **residual_kw)
         if z_next is not None:
             return hidden_next, unknown_next, residual_out, z_next
+        if self.update_pair:
+            return hidden_next, unknown_next, residual_out, pair
         return hidden_next, unknown_next, residual_out
 
     def _messages_exphormer(
@@ -1418,7 +1472,8 @@ class CorrectionStage(nn.Module):
             if grpe is None:
                 raise ValueError(f"{self.attention_kind} attention requires shared GrpePairFeatures")
             return self._messages_grpe(hidden, pair, blocks, grpe)
-        return self._messages_grit(hidden, pair, blocks)
+        grit_out = self._messages_grit(hidden, pair, blocks)
+        return grit_out
 
     def _scatter_block_scores(
         self,
@@ -1523,7 +1578,7 @@ class CorrectionStage(nn.Module):
         hidden: torch.Tensor,
         pair: torch.Tensor,
         blocks: list[TypePairBlock],
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         batch, buses, _ = hidden.shape
         scores: torch.Tensor | None = None
         interactions = []
@@ -1534,9 +1589,10 @@ class CorrectionStage(nn.Module):
         use_eb = bool(getattr(self, "_grit_use_eb", True))
         use_ev = bool(getattr(self, "_grit_use_ev", True))
         zero_heads = getattr(self, "_grit_zero_heads", None)
-        # Inference: A_ij=W_Ew e_ij and B_ij=W_Eb e_ij are static for a fixed topology + weights.
+        # Inference: A_ij=W_Ew e_ij and B_ij=W_Eb e_ij are static for a fixed topology + weights
+        # unless GRIT_UPDATE_PAIR (v20) refreshes e each stage from ξ.
         # Cache per type-pair block across stages' repeated scenario forwards (shared pair only).
-        cache_ok = (not self.training) and pair.dim() == 3
+        cache_ok = (not self.training) and pair.dim() == 3 and not self.update_pair
         cached_projs = (
             self._elec_proj_cache_lookup(pair, blocks, use_ew=use_ew, use_eb=use_eb)
             if cache_ok
@@ -1580,7 +1636,12 @@ class CorrectionStage(nn.Module):
             )
             self._elec_proj_cache_blocks = built_cache
         if scores is None:
-            return hidden.new_zeros(hidden.shape)
+            zeros = hidden.new_zeros(hidden.shape)
+            if self.update_pair:
+                if pair.dim() == 3:
+                    pair = pair.unsqueeze(0).expand(batch, -1, -1, -1).clone()
+                return zeros, pair
+            return zeros
         weights = torch.softmax(scores, dim=-1)
         weights = torch.nan_to_num(weights, nan=0.0)
         row_sum = weights.sum(dim=-1, keepdim=True)
@@ -1633,7 +1694,29 @@ class CorrectionStage(nn.Module):
         if zero_heads:
             for head in zero_heads:
                 mixed_heads[:, int(head)].zero_()
-        return torch.einsum("bhna,hda->bnd", mixed_heads, self.w_o)
+        message = torch.einsum("bhna,hda->bnd", mixed_heads, self.w_o)
+        if not self.update_pair:
+            return message
+        # Ma et al. GRIT: e ← LN(e + O_e(ξ)); ξ already used for this stage's scores/values.
+        assert self.w_oe is not None and self.pair_norm is not None
+        if pair.dim() == 3:
+            pair_next = pair.unsqueeze(0).expand(batch, -1, -1, -1).clone()
+        else:
+            pair_next = pair.clone()
+        for block, interaction in zip(blocks, interactions):
+            if block.receivers.numel() == 0 or block.senders.numel() == 0:
+                continue
+            delta = torch.einsum("bhnma,hea->bnme", interaction, self.w_oe)
+            if block.mask.dim() == 2:
+                delta = delta.masked_fill(~block.mask.unsqueeze(-1), 0.0)
+            else:
+                delta = delta.masked_fill(~block.mask.unsqueeze(-1), 0.0)
+            receivers = block.receivers.view(-1, 1)
+            senders = block.senders.view(1, -1)
+            pair_next[:, receivers, senders, :] = pair_next[:, receivers, senders, :] + delta.to(
+                pair_next.dtype
+            )
+        return message, self.pair_norm(pair_next)
 
 
 def _topk_renorm_attention(weights: torch.Tensor, k: int) -> torch.Tensor:
@@ -2128,6 +2211,9 @@ class TPGT(nn.Module):
             if pair_elec is None or component is None:
                 raise ValueError("pair_rotary attention requires pair_elec and component")
             pair_elec = pair_elec.to(dtype=act_dtype)
+        if self.use_node_supply_demand and (demand_p is None or demand_q is None):
+            raise ValueError("supply/demand packing requires demand_p/q for AC residual")
+        stage_demand = {"demand_p": demand_p, "demand_q": demand_q} if self.use_node_supply_demand else {}
         for stage in self.stages:
             if self.attention_kind == "exphormer":
                 hidden, unknown, residual, z_virt = stage(
@@ -2147,6 +2233,7 @@ class TPGT(nn.Module):
                     exph_edge_tau=exph_edge_tau,
                     exph_pair_id=exph_pair_id,
                     use_dense_exph=self.use_dense_exph,
+                    **stage_demand,
                 )
             elif self.attention_kind == "efla":
                 hidden, unknown, residual = stage(
@@ -2160,6 +2247,7 @@ class TPGT(nn.Module):
                     elec_a=elec_a,
                     component=component,
                     types_efla=shared_types,
+                    **stage_demand,
                 )
             elif self.attention_kind == "wire":
                 hidden, unknown, residual = stage(
@@ -2172,6 +2260,7 @@ class TPGT(nn.Module):
                     types=shared_types,
                     component=component,
                     wire_rho=wire_rho,
+                    **stage_demand,
                 )
             elif self.attention_kind == "pair_rotary":
                 hidden, unknown, residual = stage(
@@ -2184,10 +2273,29 @@ class TPGT(nn.Module):
                     types=shared_types,
                     component=component,
                     pair_elec=pair_elec,
+                    **stage_demand,
+                )
+            elif getattr(stage, "update_pair", False):
+                hidden, unknown, residual, pair = stage(
+                    hidden,
+                    unknown,
+                    specified,
+                    pair,
+                    layout,
+                    ybus,
+                    grpe=grpe,
+                    **stage_demand,
                 )
             else:
                 hidden, unknown, residual = stage(
-                    hidden, unknown, specified, pair, layout, ybus, grpe=grpe
+                    hidden,
+                    unknown,
+                    specified,
+                    pair,
+                    layout,
+                    ybus,
+                    grpe=grpe,
+                    **stage_demand,
                 )
             residuals.append(residual)
         return unknown, residuals
@@ -2230,11 +2338,35 @@ def pack_case(
     voltage: torch.Tensor,
     angle: torch.Tensor,
     types: torch.Tensor | TypeLayout,
+    *,
+    supply_p: torch.Tensor | None = None,
+    supply_q: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Specified quantities stay fixed. The target is the unknown part of the solution."""
+    """Specified quantities stay fixed. The target is the unknown part of the solution.
+
+    Default: all power slots use net injection ``power_*`` (= Ps−Pd).
+
+    With ``supply_p`` / ``supply_q`` (v19/v20): PQ stays on net ``power_*``; PV/Slack
+    power slots use generation ``Ps/Qs``. Pair with ``nodal_residual(..., demand_*)``
+    so physics injects ``Ps−Pd`` / ``Qs−Qd``.
+    """
     layout = type_layout(types)
+    use_gen = supply_p is not None or supply_q is not None
+    if use_gen and (supply_p is None or supply_q is None):
+        raise ValueError("pack_case supply_p and supply_q must be passed together")
     if layout.per_case:
         pq, pv, slack, _angle = layout.masks
+        if use_gen:
+            assert supply_p is not None and supply_q is not None
+            p_spec = torch.where(slack, voltage, torch.where(pv, supply_p, power_p))
+            q_or_vth = torch.where(
+                pq, power_q, torch.where(pv, voltage, angle)
+            )
+            specified = torch.stack((p_spec, q_or_vth), dim=-1)
+            t0 = torch.where(pq, voltage, torch.where(pv, supply_q, supply_p))
+            t1 = torch.where(slack, supply_q, angle)
+            target = torch.stack((t0, t1), dim=-1)
+            return specified, target
         specified = torch.stack(
             (torch.where(slack, voltage, power_p), torch.where(pq, power_q, torch.where(pv, voltage, angle))), dim=-1
         )
@@ -2249,6 +2381,17 @@ def pack_case(
     specified[:, pq, 1] = power_q[:, pq]
     target[:, pq, 0] = voltage[:, pq]
     target[:, pq, 1] = angle[:, pq]
+    if use_gen:
+        assert supply_p is not None and supply_q is not None
+        specified[:, pv, 0] = supply_p[:, pv]
+        specified[:, pv, 1] = voltage[:, pv]
+        target[:, pv, 0] = supply_q[:, pv]
+        target[:, pv, 1] = angle[:, pv]
+        specified[:, slack, 0] = voltage[:, slack]
+        specified[:, slack, 1] = angle[:, slack]
+        target[:, slack, 0] = supply_p[:, slack]
+        target[:, slack, 1] = supply_q[:, slack]
+        return specified, target
     specified[:, pv, 0] = power_p[:, pv]
     specified[:, pv, 1] = voltage[:, pv]
     target[:, pv, 0] = power_q[:, pv]
@@ -2301,6 +2444,9 @@ def nodal_residual(
     unknown: torch.Tensor,
     types: torch.Tensor | TypeLayout,
     ybus: torch.Tensor,
+    *,
+    demand_p: torch.Tensor | None = None,
+    demand_q: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """AC mismatch in per unit. Ybus is already per unit, so this does not divide by baseMVA again.
 
@@ -2308,10 +2454,33 @@ def nodal_residual(
     is float64, so float64 models can be checked to round-off).
     Evaluated in complex128: with TF32 enabled, a complex64 Ybus matmul on CUDA has a ~0.02 p.u. mean
     error floor on case118 (|Y| up to ~390 with heavy cancellation), 10^4 x the label accuracy.
+
+    When ``demand_p`` / ``demand_q`` are set (v19/v20 gen packing), PV/Slack assembled
+    power is treated as generation and load is subtracted: inject ``Ps−Pd``, ``Qs−Qd``.
+    PQ stays on already-net packed injections (demand not applied again).
     """
     layout = type_layout(types)
     physical = constrain_unknown(unknown, layout)
     power_p, power_q, voltage, angle = assemble(specified, physical, layout)
+    if demand_p is not None or demand_q is not None:
+        if demand_p is None or demand_q is None:
+            raise ValueError("nodal_residual demand_p and demand_q must be passed together")
+        batch = int(specified.shape[0])
+        pd_ = _expand_bus_channel(demand_p, batch, specified.device, power_p.dtype)
+        qd_ = _expand_bus_channel(demand_q, batch, specified.device, power_q.dtype)
+        if layout.per_case:
+            gen_bus = layout.masks[1] | layout.masks[2]
+            power_p = torch.where(gen_bus, power_p - pd_, power_p)
+            power_q = torch.where(gen_bus, power_q - qd_, power_q)
+        else:
+            power_p = power_p.clone()
+            power_q = power_q.clone()
+            for type_id in (1, 2):
+                if not layout.present[type_id]:
+                    continue
+                buses = layout.index[type_id]
+                power_p[:, buses] = power_p[:, buses] - pd_[:, buses]
+                power_q[:, buses] = power_q[:, buses] - qd_[:, buses]
     voltage_complex = voltage.double() * torch.exp(1j * angle.double())
     if ybus.dim() == 2:
         current = torch.matmul(ybus.to(torch.complex128), voltage_complex.transpose(0, 1)).transpose(0, 1)
@@ -2385,8 +2554,50 @@ def pbl_from_unknown(
     unknown: torch.Tensor,
     types: torch.Tensor,
     ybus: torch.Tensor,
+    *,
+    demand_p: torch.Tensor | None = None,
+    demand_q: torch.Tensor | None = None,
 ) -> dict[str, float]:
-    return pbl_stats(nodal_residual(specified, unknown, types, ybus))
+    return pbl_stats(
+        nodal_residual(
+            specified, unknown, types, ybus, demand_p=demand_p, demand_q=demand_q
+        )
+    )
+
+
+def pack_supply_kwargs(
+    split: "Split",
+    index: torch.Tensor | np.ndarray,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """``supply_p/q`` for ``pack_case`` when ``USE_NODE_SUPPLY_DEMAND``; else empty."""
+    if not USE_NODE_SUPPLY_DEMAND:
+        return {}
+    if split.supply_p is None or split.supply_q is None:
+        raise ValueError(
+            "USE_NODE_SUPPLY_DEMAND requires split.supply_*; rebuild split cache "
+            f"(CACHE_VERSION={CACHE_VERSION})."
+        )
+    chosen = torch.as_tensor(index, dtype=torch.long)
+    if device.type == "cuda":
+        rows = torch.stack((split.supply_p[chosen], split.supply_q[chosen]))
+        supply_p, supply_q = host_to_device(rows, device).unbind(0)
+    else:
+        supply_p = split.supply_p[chosen].to(device, non_blocking=True)
+        supply_q = split.supply_q[chosen].to(device, non_blocking=True)
+    return {"supply_p": supply_p, "supply_q": supply_q}
+
+
+def residual_demand_kwargs(
+    demand_p: torch.Tensor | None,
+    demand_q: torch.Tensor | None,
+) -> dict[str, torch.Tensor]:
+    """Demand kwargs for ``nodal_residual`` / stage forwards under supply-demand packing."""
+    if not USE_NODE_SUPPLY_DEMAND:
+        return {}
+    if demand_p is None or demand_q is None:
+        raise ValueError("USE_NODE_SUPPLY_DEMAND requires demand_p and demand_q for residual")
+    return {"demand_p": demand_p, "demand_q": demand_q}
 
 
 def state_rmse_by_type(
@@ -2497,7 +2708,14 @@ def eval_batch_with_pair(
     power_q = split.power_q[chosen].to(device, non_blocking=True)
     voltage = split.voltage[chosen].to(device, non_blocking=True)
     angle = split.angle[chosen].to(device, non_blocking=True)
-    specified, target = pack_case(power_p, power_q, voltage, angle, network.types)
+    specified, target = pack_case(
+        power_p,
+        power_q,
+        voltage,
+        angle,
+        network.types,
+        **pack_supply_kwargs(split, chosen, device),
+    )
     if shunt_b is None:
         shunt_b = network_shunt_b(network)
     hop_id, edge_id = ensure_network_grpe_ids(network)
@@ -3055,13 +3273,22 @@ def collect_forward_diagnostics(
     power_q = split.power_q[chosen].to(device, non_blocking=True)
     voltage = split.voltage[chosen].to(device, non_blocking=True)
     angle = split.angle[chosen].to(device, non_blocking=True)
-    specified, target = pack_case(power_p, power_q, voltage, angle, network.types)
+    specified, target = pack_case(
+        power_p,
+        power_q,
+        voltage,
+        angle,
+        network.types,
+        **pack_supply_kwargs(split, chosen, device),
+    )
     types = network.types
     ybus = network.ybus
+    sd_kwargs = case_supply_demand_kwargs(split, chosen, device)
+    demand_kw = residual_demand_kwargs(sd_kwargs.get("demand_p"), sd_kwargs.get("demand_q"))
     with torch.no_grad():
-        oracle = pbl_from_unknown(specified, target, types, ybus)
+        oracle = pbl_from_unknown(specified, target, types, ybus, **demand_kw)
         flat = flat_start(specified, types)
-        flat_pbl = pbl_from_unknown(specified, flat, types, ybus)
+        flat_pbl = pbl_from_unknown(specified, flat, types, ybus, **demand_kw)
         pair = pair_features(model, network)
         hop_id, edge_id = ensure_network_grpe_ids(network)
         layout = network_layout(network)
@@ -3080,15 +3307,23 @@ def collect_forward_diagnostics(
             **efla_forward_kwargs(network),
             **wire_forward_kwargs(network),
             **pair_rotary_forward_kwargs(network),
-            **case_supply_demand_kwargs(split, chosen, device),
+            **sd_kwargs,
         )
         breakdown = task_loss(prediction, target, residuals, types)
         stage_pbl = [pbl_stats(r) for r in residuals]
-        model_pbl = stage_pbl[-1] if stage_pbl else pbl_from_unknown(specified, prediction, types, ybus)
+        model_pbl = (
+            stage_pbl[-1]
+            if stage_pbl
+            else pbl_from_unknown(specified, prediction, types, ybus, **demand_kw)
+        )
         state_rmse = state_rmse_by_type(prediction, target, types)
         state_mae = state_mae_by_type(prediction, target, types)
         ybus_abs = float(torch.abs(ybus).mean())
-        final_residual = residuals[-1] if residuals else nodal_residual(specified, prediction, types, ybus)
+        final_residual = (
+            residuals[-1]
+            if residuals
+            else nodal_residual(specified, prediction, types, ybus, **demand_kw)
+        )
         bottleneck = collect_bottleneck_diagnostics(
             final_residual, list(residuals), prediction, target, types, ybus
         )
@@ -3267,11 +3502,18 @@ def audit_residual_correctness(
     types = network.types
     ybus = network.ybus
     specified, target = pack_case(
-        power_p.to(device), power_q.to(device), voltage.to(device), angle.to(device), types
+        power_p.to(device),
+        power_q.to(device),
+        voltage.to(device),
+        angle.to(device),
+        types,
+        **pack_supply_kwargs(split, chosen, device),
     )
+    sd_kwargs = case_supply_demand_kwargs(split, chosen, device)
+    demand_kw = residual_demand_kwargs(sd_kwargs.get("demand_p"), sd_kwargs.get("demand_q"))
     checks: list[CorrectnessCheck] = []
     with torch.no_grad():
-        oracle_residual = nodal_residual(specified, target, types, ybus)
+        oracle_residual = nodal_residual(specified, target, types, ybus, **demand_kw)
         oracle_per_case = torch.sqrt(oracle_residual[..., 0] ** 2 + oracle_residual[..., 1] ** 2).mean(dim=1)
         oracle_mean = float(oracle_per_case.mean())
         checks.append(
@@ -3324,9 +3566,9 @@ def audit_residual_correctness(
             **efla_forward_kwargs(network),
             **wire_forward_kwargs(network),
             **pair_rotary_forward_kwargs(network),
-            **case_supply_demand_kwargs(split, chosen, device),
+            **sd_kwargs,
         )
-        recomputed = nodal_residual(specified, prediction, types, ybus)
+        recomputed = nodal_residual(specified, prediction, types, ybus, **demand_kw)
         scale = float(residuals[-1].abs().max().clamp(min=1.0))
         drift = float((recomputed - residuals[-1]).abs().max())
         checks.append(
@@ -5526,8 +5768,8 @@ def refresh_node_feature_config() -> None:
 def apply_architecture_config() -> str:
     """Apply ``ARCH_PRESETS`` / per-dim env overrides. Same residual, packing, and loss logic."""
     global D, D_E, D_A, HEADS, DEPTH, RUN_TAG, RUN_DIR_NAME, CHECKPOINT_VERSION
-    global USE_NODE_SHUNT, USE_NODE_SUPPLY_DEMAND, ATTENTION_KIND, ATTENTION_MLP_HIDDENS
-    global GRPE_MAX_HOP, EXPHORMER_DENSE, EXPHORMER_D_EXP
+    global USE_NODE_SHUNT, USE_NODE_SUPPLY_DEMAND, GRIT_UPDATE_PAIR, ATTENTION_KIND
+    global ATTENTION_MLP_HIDDENS, GRPE_MAX_HOP, EXPHORMER_DENSE, EXPHORMER_D_EXP
     name = parse_arch_name()
     if name:
         if name not in ARCH_PRESETS:
@@ -5543,6 +5785,7 @@ def apply_architecture_config() -> str:
         CHECKPOINT_VERSION = str(preset["CHECKPOINT_VERSION"])
         USE_NODE_SHUNT = bool(preset.get("USE_NODE_SHUNT", False))
         USE_NODE_SUPPLY_DEMAND = bool(preset.get("USE_NODE_SUPPLY_DEMAND", False))
+        GRIT_UPDATE_PAIR = bool(preset.get("GRIT_UPDATE_PAIR", False))
         ATTENTION_KIND = str(preset.get("ATTENTION_KIND", "grit"))
         ATTENTION_MLP_HIDDENS = _parse_mlp_hiddens(
             preset.get("ATTENTION_MLP_HIDDENS", ATTENTION_MLP_HIDDENS)
@@ -5583,6 +5826,11 @@ def apply_architecture_config() -> str:
         USE_NODE_SUPPLY_DEMAND = True
     elif sd_override in ("0", "false", "no"):
         USE_NODE_SUPPLY_DEMAND = False
+    pair_upd_override = os.environ.get("GENCO_TPGT_GRIT_UPDATE_PAIR", "").strip().lower()
+    if pair_upd_override in ("1", "true", "yes"):
+        GRIT_UPDATE_PAIR = True
+    elif pair_upd_override in ("0", "false", "no"):
+        GRIT_UPDATE_PAIR = False
     attn_override = os.environ.get("GENCO_TPGT_ATTENTION", "").strip().lower()
     if attn_override:
         ATTENTION_KIND = attn_override
@@ -5700,7 +5948,7 @@ def architecture_summary() -> str:
             f"d={D}, h={HEADS}, da={D_A}, de={D_E}, pairs=9)"
         )
     else:
-        attn_txt = "grit"
+        attn_txt = "grit+pair_upd" if GRIT_UPDATE_PAIR else "grit"
     rpe_txt = "+".join(RPE_FEATURE_NAMES)
     return (
         f"arch {RUN_TAG}: DEPTH={DEPTH} D={D} D_E={D_E} D_A={D_A} HEADS={HEADS} "
@@ -7369,7 +7617,14 @@ def forward_cases(
         power_q = split.power_q[chosen].to(device, non_blocking=True)
         voltage = split.voltage[chosen].to(device, non_blocking=True)
         angle = split.angle[chosen].to(device, non_blocking=True)
-    specified, target = pack_case(power_p, power_q, voltage, angle, layout)
+    specified, target = pack_case(
+        power_p,
+        power_q,
+        voltage,
+        angle,
+        layout,
+        **pack_supply_kwargs(split, chosen, device),
+    )
     if shunt_b is None:
         shunt_b = network_shunt_b(network)
     if hop_id is None or edge_id is None:

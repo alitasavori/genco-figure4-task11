@@ -115,14 +115,30 @@ def per_bus_residual(t, model, split, network_id: int, index: np.ndarray, device
         pair = t.pair_features(model, net)
         for start in range(0, len(index), batch):
             chosen = torch.as_tensor(index[start : start + batch], dtype=torch.long)
+            supply_kw = {}
+            if getattr(t, "USE_NODE_SUPPLY_DEMAND", False) and hasattr(t, "pack_supply_kwargs"):
+                supply_kw = t.pack_supply_kwargs(split, chosen, device)
             specified, _target = t.pack_case(
                 split.power_p[chosen].to(device),
                 split.power_q[chosen].to(device),
                 split.voltage[chosen].to(device),
                 split.angle[chosen].to(device),
                 net.types,
+                **supply_kw,
             )
-            _prediction, residuals = model(specified, net.types, net.rpe, net.pair_type_masks, net.ybus, pair=pair)
+            sd_kw = {}
+            if hasattr(t, "case_supply_demand_kwargs"):
+                sd_kw = t.case_supply_demand_kwargs(split, chosen, device)
+            _prediction, residuals = model(
+                specified,
+                net.types,
+                net.rpe,
+                net.pair_type_masks,
+                net.ybus,
+                pair=pair,
+                shunt_b=t.network_shunt_b(net) if hasattr(t, "network_shunt_b") else None,
+                **sd_kw,
+            )
             out.append(residuals[-1].float().cpu().numpy())
     return np.concatenate(out, axis=0)
 

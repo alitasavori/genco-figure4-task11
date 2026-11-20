@@ -70,6 +70,9 @@ def stage_attn_params() -> int:
             (t.D_A, t.D_A),
         ):
             total += 9 * t.HEADS * extra[0] * extra[1]
+        if getattr(t, "GRIT_UPDATE_PAIR", False):
+            # Shared O_e: (H, D_E, D_A) + LayerNorm(D_E) affine.
+            total += t.HEADS * t.D_E * t.D_A + 2 * t.D_E
     return total
 
 
