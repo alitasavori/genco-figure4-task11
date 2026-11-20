@@ -68,16 +68,17 @@ def test_rpe_is_zeff_re_im():
 
 
 def test_v17_generator_grounded_support_rpe():
-    """Radial PV→i→j: C on PQ block; Cii/Cjj on mixed pairs; one shared 6→D_E encoder."""
+    """Radial PV→i→j: C built for ρ; RPE is Im+ρ only; shared 2→D_E encoder."""
     previous_names = tpgt.RPE_FEATURE_NAMES
     previous_dim = tpgt.RPE_DIM
     previous_d = tpgt.D
     previous_de = tpgt.D_E
     try:
-        tpgt.apply_rpe_channel_config("re_im_gen")
+        tpgt.apply_rpe_channel_config("im_rho")
         tpgt.D = 96
         tpgt.D_E = 48
-        assert tpgt.RPE_DIM == 6
+        assert tpgt.RPE_DIM == 2
+        assert tpgt.RPE_FEATURE_NAMES == ("Zeff_Im_norm", "rho_ij")
         assert tpgt.uses_generator_support_rpe()
         xg, xij = 0.2, 0.5
         # bus 0 = PV, 1 = i (PQ), 2 = j (PQ)
@@ -86,6 +87,7 @@ def test_v17_generator_grounded_support_rpe():
         built = tpgt.build_generator_grounded_support(3, branches, types)
         c = built.c_full
         assert not np.any(built.unsupported_pq)
+        assert not np.any(built.invalid_support)
         assert built.skipped_nonpositive_x == 0
         assert np.allclose(c[1:, 1:], np.array([[xg, xg], [xg, xg + xij]]), atol=1e-6)
         assert np.allclose(c[0, :], 0.0) and np.allclose(c[:, 0], 0.0)
@@ -94,27 +96,20 @@ def test_v17_generator_grounded_support_rpe():
         ):
             assert check.passed, check.detail
         ybus = np.zeros((3, 3), dtype=np.complex64)
-        features, _ = meshed_rpe(3, branches, ybus, types=types, c_scale=1.0)
-        assert features.shape == (3, 3, 6)
-        # PQ–PQ (1,2): all four gen-support channels.
-        assert np.isclose(features[1, 2, 2], xg)
-        assert np.isclose(features[1, 2, 3], xg + xij)
-        assert np.isclose(features[1, 2, 4], xg)
+        features, _, invalid = meshed_rpe(
+            3, branches, ybus, types=types, c_scale=1.0, return_invalid=True
+        )
+        assert features.shape == (3, 3, 2)
+        assert invalid is not None and not np.any(invalid)
         rho = xg / np.sqrt(xg * (xg + xij))
-        assert np.isclose(features[1, 2, 5], rho, atol=1e-5)
-        # PQ→PV (1,0): Cii only; Cjj/Cij/ρ zero.
-        assert np.isclose(features[1, 0, 2], xg)
-        assert np.allclose(features[1, 0, 3:], 0.0)
-        # PV→PQ (0,1): Cjj only.
-        assert np.isclose(features[0, 1, 3], xg)
-        assert np.isclose(features[0, 1, 2], 0.0)
-        assert np.allclose(features[0, 1, 4:], 0.0)
-        # PV–PV: all gen-support channels zero.
-        assert np.allclose(features[0, 0, 2:], 0.0)
+        # PQ–PQ: ρ present; mixed / PV pairs: ρ = 0 (Im may be nonzero).
+        assert np.isclose(features[1, 2, 1], rho, atol=1e-5)
+        assert np.isclose(features[2, 1, 1], rho, atol=1e-5)
+        assert np.allclose(features[1, 0, 1], 0.0)
+        assert np.allclose(features[0, 1, 1], 0.0)
         model = TPGT()
-        # One shared encoder 6→96→96→48 (not nine type-pair encoders).
         assert isinstance(model.pair_encoder, tpgt.MLP)
-        assert model.pair_encoder.net[0].in_features == 6
+        assert model.pair_encoder.net[0].in_features == 2
         assert model.pair_encoder.net[0].out_features == 96
         assert model.pair_encoder.net[2].out_features == 96
         assert model.pair_encoder.net[-1].out_features == 48
@@ -126,19 +121,29 @@ def test_v17_generator_grounded_support_rpe():
 
 
 def test_v17_gen_support_no_pinv_on_pq_island():
-    """PQ island without Slack/PV leaves C=0 (no silent pseudoinverse)."""
+    """PQ island without Slack/PV → invalid_support; C=0 is numerical fallback only."""
     previous_names = tpgt.RPE_FEATURE_NAMES
     previous_dim = tpgt.RPE_DIM
     try:
-        tpgt.apply_rpe_channel_config("re_im_gen")
+        tpgt.apply_rpe_channel_config("im_rho")
         # Two PQ buses linked; no generator in the component.
         branches = [(0, 1, 0.0, 0.4)]
         types = np.array([0, 0], dtype=np.int64)
         built = tpgt.build_generator_grounded_support(2, branches, types)
         assert np.allclose(built.c_full, 0.0)
         assert bool(np.all(built.unsupported_pq))
-        assert any("unsupported PQ island" in m for m in built.messages)
+        assert bool(np.all(built.invalid_support))
+        assert any("invalid_support" in m for m in built.messages)
+        assert any("not physical zero sensitivity" in m for m in built.messages)
         assert any("no pinv" in m for m in built.messages)
+        checks = {
+            c.name: c
+            for c in tpgt.validate_generator_support_matrix(
+                built.c_full, types, unsupported_pq=built.unsupported_pq
+            )
+        }
+        assert checks["gen_support_invalid_flag"].passed
+        assert checks["gen_support_invalid_flag"].value == 2.0
     finally:
         tpgt.RPE_FEATURE_NAMES = previous_names
         tpgt.RPE_DIM = previous_dim
@@ -148,7 +153,7 @@ def test_v17_gen_support_flags_nonpositive_x():
     previous_names = tpgt.RPE_FEATURE_NAMES
     previous_dim = tpgt.RPE_DIM
     try:
-        tpgt.apply_rpe_channel_config("re_im_gen")
+        tpgt.apply_rpe_channel_config("im_rho")
         # PV—PQ with negative x (excluded) plus positive spur so PQ stays gen-supported.
         branches = [(0, 1, 0.0, -0.2), (0, 1, 0.0, 0.5)]
         types = np.array([1, 0], dtype=np.int64)
@@ -162,22 +167,25 @@ def test_v17_gen_support_flags_nonpositive_x():
 
 
 def test_v17_rpe_zeros_disconnected_pairs():
-    """All six RPE channels are zero across components; Zeff mask retained."""
+    """Im+ρ are zero across components; isolated PQ is invalid_support (ρ=0)."""
     previous_names = tpgt.RPE_FEATURE_NAMES
     previous_dim = tpgt.RPE_DIM
     try:
-        tpgt.apply_rpe_channel_config("re_im_gen")
-        # Component A: PV—PQ; component B: isolated PQ (unsupported → C=0).
+        tpgt.apply_rpe_channel_config("im_rho")
+        # Component A: PV—PQ; component B: isolated PQ (invalid_support → ρ=0).
         branches = [(0, 1, 0.0, 0.3)]
         types = np.array([1, 0, 0], dtype=np.int64)
         ybus = np.zeros((3, 3), dtype=np.complex64)
-        features, component = meshed_rpe(3, branches, ybus, types=types, c_scale=1.0)
+        features, component, invalid = meshed_rpe(
+            3, branches, ybus, types=types, c_scale=1.0, return_invalid=True
+        )
         assert component[0] == component[1]
         assert component[2] != component[1]
-        # Cross-component pairs must be all-zero (including unary Cii leak).
+        assert invalid is not None and bool(invalid[2]) and not bool(invalid[1])
         assert np.allclose(features[1, 2], 0.0)
         assert np.allclose(features[2, 1], 0.0)
-        assert np.isclose(features[1, 0, 2], 0.3)
+        # Same-component PQ–PV: Im may be nonzero; ρ must be 0 (not both PQ).
+        assert np.allclose(features[1, 0, 1], 0.0)
     finally:
         tpgt.RPE_FEATURE_NAMES = previous_names
         tpgt.RPE_DIM = previous_dim
@@ -506,7 +514,8 @@ def test_contingency_diagnostics_report(capsys):
     )
     text = capsys.readouterr().out
     assert "Per-topology PBL" in text
-    assert "unchanged" in text
+    assert "Generator outages change bus types" in text
+    assert "C/ρ generally move" in text
     assert "RPE correctness on 1 topologies: OK" in text
     assert "Residual correctness on 1 topologies: OK" in text
     assert "shift 0" in text

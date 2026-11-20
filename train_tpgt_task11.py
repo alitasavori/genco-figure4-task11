@@ -61,8 +61,11 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
   ``o=Σ α (v+P^V+E^V)``. Softmax and type-pair blocks are unchanged. Angle step
   uses ``η_angle=1``.
 * **RPE**: legacy ``Zeff_Re_norm`` + ``Zeff_Im_norm`` (v7–v16 / v19/v20);
-  **v17** adds generator-set-grounded support channels (6-ch ``re_im_gen``;
-  ``Cii``/``Cjj`` for any PQ endpoint, ``Cij``/``ρ`` PQ–PQ only; one shared encoder);
+  **v17** is 2-ch ``im_rho``: ``Zeff_Im_norm`` + gen-grounded ``ρ_ij`` (from
+  ``C=L_{UU}^{-1}``; Slack∪PV grounded). Generator outages change ``G`` and thus ``C/ρ``;
+  unsupported PQ islands are flagged invalid (``C=0`` is a numerical fallback, not
+  physical zero sensitivity). Train-only
+  ``s_C=max(1,max_T max|C|)`` (and ``s_X``) — never re-fit per test topology.
   **v17im** is Im-only Zeff.
 * **Node features**: v9–v16 ``(P,Q,V,θ,busBS)`` with net ``P=Ps−Pd``; **v19/v20** keep PQ
   at 5-D ``(P,Q,V,θ,busBS)`` and give PV/Slack ``(Pd,Qd,Ps,Qs,V,θ,busBS)``.
@@ -143,7 +146,7 @@ Performance notes (Colab / large train split)
   feature shift from the training topology). Runs on the training grid every
   checkpoint epoch (every 3), including case57; Task 3.1 keeps ablation on IEEE 118.
   **Every checkpoint epoch also always zero-ablates each edge/RPE channel one-by-one**
-  (all ``RPE_FEATURE_NAMES``, including v17's 6 gen-support channels) and prints ΔPBL;
+  (all ``RPE_FEATURE_NAMES``, including v17's Im+ρ channels) and prints ΔPBL;
   this runs even if ``--no-debug`` (skip only with ``GENCO_TPGT_RPE_ABLATION=0`` /
   ``--no-rpe-ablation``). Disable the rest of debug with
   ``GENCO_TPGT_DEBUG=0`` or ``--no-debug``; bus-shunt (``busBS``) with ``GENCO_TPGT_SHUNT_ABLATION=0``.
@@ -235,18 +238,13 @@ LAMBDA_PHYS = 0.5
 PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
-CACHE_VERSION = "tpgt-cache-18"
-# Default / legacy (v7–v16): Re+Im. ``im`` = Im-only; ``re_im_gen`` = v17 gen-support (6-ch).
+CACHE_VERSION = "tpgt-cache-19"
+# Default / legacy (v7–v16): Re+Im. ``im`` = Im-only; ``im_rho`` = v17 (Im + gen-support ρ).
 RPE_FEATURE_NAMES_RE_IM = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_FEATURE_NAMES_IM = ("Zeff_Im_norm",)
-RPE_FEATURE_NAMES_RE_IM_GEN = (
-    "Zeff_Re_norm",
-    "Zeff_Im_norm",
-    "Cii_norm",
-    "Cjj_norm",
-    "Cij_norm",
-    "rho_ij",
-)
+RPE_FEATURE_NAMES_IM_RHO = ("Zeff_Im_norm", "rho_ij")
+# Legacy alias name kept for older call sites; same channels as ``IM_RHO``.
+RPE_FEATURE_NAMES_RE_IM_GEN = RPE_FEATURE_NAMES_IM_RHO
 RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM
 RPE_DIM = len(RPE_FEATURE_NAMES)
 # v15 pair-rotary electrical pair features (ablate these, not Zeff RPE).
@@ -476,10 +474,9 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "ATTENTION_KIND": "grit",
         "RPE_CHANNELS": "re_im",
     },
-    # v16 GRIT + generator-set-grounded support RPE (6-ch: Zeff Re/Im + Cii/Cjj/Cij/ρ).
-    # Cii/Cjj whenever the corresponding endpoint is PQ; Cij/ρ only for PQ–PQ.
-    # One shared pair encoder (6→96→96→48); nine type-pair GRIT params unchanged.
-    # No pair update, no supply/demand features — same packing/residual as v16.
+    # v16 GRIT + gen-grounded ρ only (2-ch: Zeff Im + ρ). Re/Cii/Cjj/Cij dropped.
+    # C=L[U,U]^{-1} still built (Slack∪PV grounded) to form ρ; invalid PQ islands flagged.
+    # Train-only s_X / s_C; one shared pair encoder (2→96→96→48).
     "v17": {
         "D": 96,
         "D_E": 48,
@@ -487,10 +484,10 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "HEADS": 4,
         "DEPTH": 12,
         "RUN_TAG": "v17",
-        "CHECKPOINT_VERSION": "meshed-rpe-6-d12-w96-h4-pqvt-busBS-gensupport-v17",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d12-w96-h4-pqvt-busBS-im-rho-v17",
         "USE_NODE_SHUNT": True,
         "ATTENTION_KIND": "grit",
-        "RPE_CHANNELS": "re_im_gen",
+        "RPE_CHANNELS": "im_rho",
     },
     # Former Im-only GRIT (v16 dims, drop Real Zeff). Kept so old runs remain selectable.
     "v17im": {
@@ -2840,8 +2837,7 @@ def collect_rpe_channel_ablation(
 ) -> tuple[dict[str, float], list[dict[str, float]]]:
     """Zero each edge/RPE channel one-by-one; compare batch metrics to the full-RPE baseline.
 
-    Covers every entry of ``RPE_FEATURE_NAMES`` (2-ch Zeff, 1-ch Im-only, or v17's 6-ch
-    gen-support RPE).
+    Covers every entry of ``RPE_FEATURE_NAMES`` (2-ch Zeff, 1-ch Im-only, or v17 Im+ρ).
     """
     model.eval()
     clear_pair_embed_cache([network])
@@ -2992,7 +2988,7 @@ def run_checkpoint_edge_feature_ablation(
     """Zero-ablate every edge/RPE channel one-by-one; print and archive on checkpoint epochs.
 
     Always runs all active pair features (``RPE_FEATURE_NAMES`` or pair-elec). Intended for
-    every ``CHECKPOINT_EVERY`` epoch so v17's six channels (and legacy 2-ch) are all scored.
+    every ``CHECKPOINT_EVERY`` epoch so v17's Im+ρ channels (and legacy 2-ch) are all scored.
     """
     weight_rows = pair_encoder_input_weight_norms(model)
     baseline, ablation_rows, feature_names = collect_pair_feature_ablation(
@@ -4525,9 +4521,9 @@ def print_contingency_diagnostics(
             )
             lines.append(f"  {feature_names[channel]:12s}{cells}")
         lines.append(
-            "  Generator outages leave pair/RPE features unchanged (shift 0): their error comes from the "
-            "bus-type change, not the pair features. For line outages, large shift plus large ΔPBL marks "
-            "the channels that move under outages and that the model depends on."
+            "  Generator outages change bus types (PV→PQ ⇒ G changes), so C/ρ generally move even when "
+            "Zeff is unchanged (Zeff shift≈0). Line outages change Ybus/Zeff and usually C/ρ. Large "
+            "shift plus large ΔPBL marks channels that move under outages and that the model depends on."
         )
         for name in present:
             ablation_payload["by_class"][name] = {
@@ -4580,9 +4576,13 @@ class Network:
     # Bus shunt susceptance from parquet ``BS`` (p.u.); device-only, not line charging.
     shunt_b: torch.Tensor | None = field(default=None, repr=False)
     # Global Zeff / gen-support normalizers used when building ``rpe`` (shared across topologies).
+    # Train-only: s_C = max(1, max_{T in T_train} max_{i,j} |C_ij^(T)|); never re-fit per test topo.
     rpe_re_scale: float | None = field(default=None, repr=False)
     rpe_im_scale: float | None = field(default=None, repr=False)
     rpe_c_scale: float | None = field(default=None, repr=False)
+    # bool[N]: PQ buses with no valid gen-grounded support (island / singular L_UU).
+    # Numerical C=0 there is a fallback, not physical zero sensitivity.
+    gen_support_invalid: torch.Tensor | None = field(default=None, repr=False)
     # GRPE topology bins (Park et al.): hop distance id and discrete edge-relation id.
     hop_id: torch.Tensor | None = field(default=None, repr=False)
     edge_id: torch.Tensor | None = field(default=None, repr=False)
@@ -4832,10 +4832,17 @@ class GeneratorSupportBuild:
     """Result of building generator-grounded ``C`` (never a silent pseudoinverse)."""
 
     c_full: np.ndarray
-    unsupported_pq: np.ndarray  # bool[N]; True ⇒ left at 0 (no gen path / singular)
+    # bool[N]: True ⇒ invalid support (no gen path / singular L_UU). C left at 0 as a
+    # numerical fallback only — not a physical claim of zero sensitivity.
+    unsupported_pq: np.ndarray
     skipped_nonpositive_x: int
     max_condition: float
     messages: list[str] = field(default_factory=list)
+
+    @property
+    def invalid_support(self) -> np.ndarray:
+        """Alias: unsupported PQ island / singular block ⇒ invalid-support flag."""
+        return self.unsupported_pq
 
 
 def build_generator_grounded_support(
@@ -4858,8 +4865,9 @@ def build_generator_grounded_support(
 
     Per connected component of the positive-weight graph: every PQ bus must share the
     component with ≥1 Slack/PV. Supported PQ blocks use ``np.linalg.inv`` (condition
-    number recorded). Singular / rejected blocks leave ``C=0`` for those PQ buses —
-    **no** ``pinv`` fallback.
+    number recorded).     Singular / rejected blocks leave ``C=0`` for those PQ buses and set
+    ``unsupported_pq`` / ``invalid_support`` — **no** ``pinv`` fallback.
+    That zero is a numerical fallback, not physical zero sensitivity.
     """
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import connected_components
@@ -4911,8 +4919,8 @@ def build_generator_grounded_support(
         if gen_local.size == 0:
             unsupported[pq_local] = True
             messages.append(
-                f"unsupported PQ island (component {int(comp)}, {int(pq_local.size)} PQ bus(es), "
-                f"no Slack/PV): leaving C=0 (no pinv)"
+                f"invalid_support PQ island (component {int(comp)}, {int(pq_local.size)} PQ bus(es), "
+                f"no Slack/PV): C=0 numerical fallback only — not physical zero sensitivity (no pinv)"
             )
             continue
         l_g = laplacian[np.ix_(pq_local, pq_local)]
@@ -4926,8 +4934,8 @@ def build_generator_grounded_support(
         if not np.isfinite(cond) or cond >= cond_reject:
             unsupported[pq_local] = True
             messages.append(
-                f"singular/ill-conditioned grounded L_g (component {int(comp)}, "
-                f"cond={cond:.3g}): leaving C=0 (no pinv)"
+                f"invalid_support singular/ill-conditioned L_g (component {int(comp)}, "
+                f"cond={cond:.3g}): C=0 numerical fallback only — not physical zero sensitivity (no pinv)"
             )
             continue
         if cond >= cond_warn:
@@ -4940,14 +4948,15 @@ def build_generator_grounded_support(
         except np.linalg.LinAlgError:
             unsupported[pq_local] = True
             messages.append(
-                f"np.linalg.inv failed for grounded L_g (component {int(comp)}): "
-                f"leaving C=0 (no pinv)"
+                f"invalid_support inv failed for L_g (component {int(comp)}): "
+                f"C=0 numerical fallback only — not physical zero sensitivity (no pinv)"
             )
             continue
         if not np.isfinite(c_uu).all():
             unsupported[pq_local] = True
             messages.append(
-                f"non-finite C after inv (component {int(comp)}): leaving C=0 (no pinv)"
+                f"invalid_support non-finite C after inv (component {int(comp)}): "
+                f"C=0 numerical fallback only — not physical zero sensitivity (no pinv)"
             )
             continue
         c_full[np.ix_(pq_local, pq_local)] = c_uu
@@ -4990,14 +4999,37 @@ def validate_generator_support_matrix(
     unsupported_pq: np.ndarray | None = None,
     atol: float = 1e-6,
 ) -> list[CorrectnessCheck]:
-    """Check ``C`` symmetry and SPD-style signs on supported PQ buses."""
+    """Check ``C`` symmetry and SPD-style signs on *valid* (supported) PQ buses.
+
+    Buses with ``unsupported_pq`` / ``invalid_support`` are excluded from physical
+    C_ii>0 / C_ij≥0 / ρ∈[0,1] claims — their C=0 is a numerical fallback only.
+    """
     type_np = np.asarray(types, dtype=np.int64).reshape(-1)
     pq = type_np == 0
     if unsupported_pq is None:
+        invalid = np.zeros(type_np.size, dtype=bool)
         supported = pq & (np.diag(c_full) > atol)
     else:
-        supported = pq & ~np.asarray(unsupported_pq, dtype=bool)
+        invalid = np.asarray(unsupported_pq, dtype=bool).reshape(-1)
+        supported = pq & ~invalid
     checks: list[CorrectnessCheck] = []
+    if unsupported_pq is not None:
+        n_inv = int(np.count_nonzero(invalid & pq))
+        zero_ok = True if n_inv == 0 else bool(np.allclose(c_full[invalid], 0.0, atol=atol))
+        checks.append(
+            CorrectnessCheck(
+                "gen_support_invalid_flag",
+                zero_ok,
+                (
+                    f"invalid_support on {n_inv} PQ (C=0 numerical fallback; not physical zero sensitivity)"
+                    if n_inv
+                    else "no invalid_support PQ buses"
+                )
+                if zero_ok
+                else f"invalid_support PQ have non-zero C (max |C|={float(np.max(np.abs(c_full[invalid]))):.3g})",
+                value=float(n_inv),
+            )
+        )
     sym_err = float(np.max(np.abs(c_full - c_full.T))) if c_full.size else 0.0
     sym_ok = sym_err <= atol
     checks.append(
@@ -5013,7 +5045,7 @@ def validate_generator_support_matrix(
             CorrectnessCheck(
                 "gen_support_supported_pq",
                 True,
-                "no supported PQ buses to validate C_ii/C_ij/ρ",
+                "no supported PQ buses to validate C_ii/C_ij/ρ (all PQ invalid_support or none)",
             )
         )
         return checks
@@ -5060,7 +5092,10 @@ def validate_generator_support_matrix(
 
 
 def fit_global_c_scale_from_networks(networks: list["Network"]) -> float:
-    """``s_C = max(1, max |C̃_ij|)`` over train topologies."""
+    """Train-only ``s_C = max(1, max_{T in T_train} max_{i,j} |C_ij^(T)|)``.
+
+    Reuse this scalar on valid/test; never recompute per contingency topology.
+    """
     peak = 0.0
     for network in networks:
         if not network.branches:
@@ -5078,7 +5113,7 @@ def fit_global_c_scale_from_specs(
     specs: list[tuple[np.ndarray, list[tuple[int, int, float, float]]]],
     bus_count: int,
 ) -> float:
-    """``s_C`` from ``(types, branches)`` representative topology specs."""
+    """Train-only ``s_C = max(1, max_T max |C|)`` from ``(types, branches)`` specs."""
     peak = 0.0
     for types, branches in specs:
         if not branches:
@@ -5432,16 +5467,17 @@ def meshed_rpe(
     im_scale: float | None = None,
     c_scale: float | None = None,
     types: np.ndarray | torch.Tensor | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_invalid: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Pair features from complex effective impedance (Method B), optional gen-support.
 
     Legacy (``RPE_CHANNELS=re_im``): normalized Re and Im (2 channels).
     Im-only (``RPE_CHANNELS=im`` / ``v17im``): Im only (1 channel).
-    Gen-support (``RPE_CHANNELS=re_im_gen`` / ``v17``): Re/Im plus ``Cii,Cjj,Cij,ρ`` (6).
-    ``Cii`` / ``Cjj`` are present whenever the corresponding endpoint is PQ (mixed
-    PQ↔PV/Slack pairs included); ``Cij`` / ``ρ`` only for PQ–PQ. Zeff Re/Im stay on
-    all same-component off-diagonal pairs. One shared ``pair_encoder`` maps the 6-ch
-    vector; type-pair GRIT specialization is unchanged.
+    Gen-support (``RPE_CHANNELS=im_rho`` / ``v17``): ``Zeff_Im_norm`` + ``ρ_ij`` (2).
+    ``ρ`` is PQ–PQ only and zero on ``invalid_support`` buses (unsupported islands /
+    singular ``L_UU``); those zeros are a numerical fallback, not physical zero
+    sensitivity — see ``Network.gen_support_invalid``. Generator outages change
+    ``G`` and thus ``C/ρ`` even when the branch graph (and Zeff) is unchanged.
 
     Branch admittance ``y_ij = 1/(r_ij + j x_ij)`` on **off-diagonals only** (parallel
     branches add); diagonal entries stay zero until the Laplacian step. This is a
@@ -5455,8 +5491,11 @@ def meshed_rpe(
     Normalization: if ``re_scale`` / ``im_scale`` are given, divide channels by
     those **global** positive scalars (same across topologies in a split). If omitted,
     use legacy per-connected-component maxima (tests only). ``re_scale`` is unused when
-    RPE is Im-only but still accepted for shared scale-file plumbing.
-    Gen-support also needs ``types`` and optional global ``c_scale`` (``s_C``).
+    RPE is Im-only / Im+ρ but still accepted for shared scale-file plumbing.
+    Train-only
+    ``s_C = max(1, max_{T∈T_train} max_{i,j} |C_ij^(T)|)`` — pass the train-fit
+    ``c_scale`` on valid/test; do not recompute per contingency topology. ``ρ`` itself
+    is scale-free; ``s_C`` is retained for C audits / cache plumbing.
 
     ``ybus`` is unused here (residual still uses full scenario Ybus; tap inference
     happens when building the branch list).
@@ -5490,16 +5529,16 @@ def meshed_rpe(
     features = np.zeros((bus_count, bus_count, RPE_DIM), dtype=np.float32)
     re = np.where(off_diagonal, z_eff.real / re_div, 0.0).astype(np.float32)
     im = np.where(off_diagonal, z_eff.imag / im_div, 0.0).astype(np.float32)
+    invalid_support: np.ndarray | None = None
     if RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_RE_IM and RPE_DIM == 2:
         features[..., 0] = re
         features[..., 1] = im
     elif RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM and RPE_DIM == 1:
         features[..., 0] = im
-    elif RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_RE_IM_GEN and RPE_DIM == 6:
+    elif RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM_RHO and RPE_DIM == 2:
         if types is None:
-            raise ValueError("meshed_rpe re_im_gen requires bus types for generator grounding")
-        features[..., 0] = re
-        features[..., 1] = im
+            raise ValueError("meshed_rpe im_rho requires bus types for generator grounding")
+        features[..., 0] = im
         type_np = np.asarray(types, dtype=np.int64).reshape(-1)
         if type_np.size != bus_count:
             raise ValueError(f"types length {type_np.size} != bus_count {bus_count}")
@@ -5512,22 +5551,14 @@ def meshed_rpe(
         ):
             if not check.passed:
                 raise RuntimeError(f"gen-support validation failed: {check.name}: {check.detail}")
-        c_full = built.c_full
-        if c_scale is None:
-            peak = float(np.max(np.abs(c_full))) if c_full.size else 0.0
-            c_div = max(1.0, peak)
-        else:
-            c_div = float(c_scale)
-        c_norm = (c_full / c_div).astype(np.float32)
-        diag = np.diag(c_norm).astype(np.float32)
-        # 1_{i∈PQ} C_ii/s_C for any sender j; 1_{j∈PQ} C_jj/s_C for any receiver i.
-        features[..., 2] = np.where(pq[:, None], diag[:, None], 0.0).astype(np.float32)
-        features[..., 3] = np.where(pq[None, :], diag[None, :], 0.0).astype(np.float32)
-        # C_ij and ρ only when both endpoints are PQ.
+        # ρ is scale-free. Train-fit s_C is stored on Network.rpe_c_scale for audits /
+        # cache plumbing; never recompute it per contingency topology.
+        _ = c_scale
         both_pq = pq[:, None] & pq[None, :]
-        features[..., 4] = np.where(both_pq, c_norm, 0.0).astype(np.float32)
-        rho = generator_support_rho(c_full).astype(np.float32)
-        features[..., 5] = np.where(both_pq, rho, 0.0).astype(np.float32)
+        invalid_support = built.invalid_support.astype(bool, copy=False)
+        valid = (~invalid_support)[:, None] & (~invalid_support)[None, :]
+        rho = generator_support_rho(built.c_full).astype(np.float32)
+        features[..., 1] = np.where(both_pq & valid, rho, 0.0).astype(np.float32)
     else:
         raise RuntimeError(
             f"meshed_rpe cannot map Zeff into RPE_FEATURE_NAMES={RPE_FEATURE_NAMES} RPE_DIM={RPE_DIM}"
@@ -5538,6 +5569,8 @@ def meshed_rpe(
 
     if not np.isfinite(features).all():
         raise RuntimeError("Meshed RPE contains non-finite values.")
+    if return_invalid:
+        return features, component, invalid_support
     return features, component
 
 
@@ -5903,7 +5936,7 @@ def unify_network_rpe(
         if network.branches is None:
             continue
         ybus = network.ybus.detach().cpu().numpy()
-        features, component = meshed_rpe(
+        features, component, invalid = meshed_rpe(
             int(ybus.shape[0]),
             list(network.branches),
             ybus,
@@ -5911,12 +5944,16 @@ def unify_network_rpe(
             im_scale=global_im,
             c_scale=global_c,
             types=network.types.detach().cpu().numpy(),
+            return_invalid=True,
         )
         network.rpe = torch.from_numpy(features)
         network.component = torch.from_numpy(component.astype(np.int64))
         network.rpe_re_scale = global_re
         network.rpe_im_scale = global_im
         network.rpe_c_scale = global_c
+        network.gen_support_invalid = (
+            None if invalid is None else torch.from_numpy(np.asarray(invalid, dtype=bool))
+        )
         network.pair_embed = None
         attach_grpe_graph_ids(network)
         if ATTENTION_KIND == "exphormer":
@@ -6088,6 +6125,19 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
                 unsupported_pq=built.unsupported_pq,
             )
         )
+        stored = getattr(network, "gen_support_invalid", None)
+        if stored is not None:
+            stored_np = stored.detach().cpu().numpy().astype(bool)
+            match = bool(np.array_equal(stored_np, built.invalid_support))
+            checks.append(
+                CorrectnessCheck(
+                    "gen_support_invalid_cached",
+                    match,
+                    "Network.gen_support_invalid matches rebuild"
+                    if match
+                    else "cached invalid_support flag mismatch vs rebuild",
+                )
+            )
 
     if getattr(network, "branches", None) is not None:
         branches = network.branches
@@ -6237,21 +6287,30 @@ def apply_rpe_channel_config(channels: str) -> None:
     """Set global ``RPE_FEATURE_NAMES`` / ``RPE_DIM`` from channel preset name."""
     global RPE_FEATURE_NAMES, RPE_DIM
     key = str(channels).strip().lower().replace("+", "_").replace("-", "_")
-    if key in ("re_im", "reim", "both", "2"):
+    if key in ("re_im", "reim", "both"):
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM
     elif key in ("im", "im_only", "zeff_im", "1"):
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_IM
-    elif key in ("re_im_gen", "reim_gen", "gen_support", "gensupport", "6"):
-        RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM_GEN
+    elif key in (
+        "im_rho",
+        "imrho",
+        "rho",
+        "re_im_gen",  # legacy alias → Im+ρ (v17 no longer 6-ch)
+        "reim_gen",
+        "gen_support",
+        "gensupport",
+        "2_im_rho",
+    ):
+        RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_IM_RHO
     else:
         raise ValueError(
-            f"unknown RPE_CHANNELS {channels!r}; use re_im, im, or re_im_gen (v17)"
+            f"unknown RPE_CHANNELS {channels!r}; use re_im, im, or im_rho (v17)"
         )
     RPE_DIM = len(RPE_FEATURE_NAMES)
 
 
 def uses_generator_support_rpe() -> bool:
-    return RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_RE_IM_GEN
+    return RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM_RHO
 
 
 def refresh_node_feature_config() -> None:
@@ -7061,18 +7120,21 @@ def _representative_networks(
                 flush=True,
             )
         else:
+            # Train-fit only. Callers for valid/test must pass the train ``rpe_c_scale``.
             global_c = fit_global_c_scale_from_specs(
                 [(types, branches) for _local, types, branches, _ybus in rep_specs],
                 bus_count,
             )
             print(
-                f"  gen-support RPE scale s_C={global_c:.6g} over {len(rep_specs)} topology(ies) ({name})",
+                f"  gen-support RPE scale s_C={global_c:.6g} over {len(rep_specs)} topology(ies) "
+                f"({name}); train-only formula s_C=max(1,max_T max|C|) "
+                f"(do not re-fit per contingency topology)",
                 flush=True,
             )
 
     networks: list[Network] = []
     for local, types, branches, ybus in rep_specs:
-        features, component = meshed_rpe(
+        features, component, invalid = meshed_rpe(
             bus_count,
             branches,
             ybus,
@@ -7080,6 +7142,7 @@ def _representative_networks(
             im_scale=global_im,
             c_scale=global_c,
             types=types,
+            return_invalid=True,
         )
         hop_id, edge_id = build_grpe_graph_ids(bus_count, branches)
         network = Network(
@@ -7092,6 +7155,9 @@ def _representative_networks(
             rpe_re_scale=global_re,
             rpe_im_scale=global_im,
             rpe_c_scale=global_c,
+            gen_support_invalid=(
+                None if invalid is None else torch.from_numpy(np.asarray(invalid, dtype=bool))
+            ),
             hop_id=torch.from_numpy(hop_id),
             edge_id=torch.from_numpy(edge_id),
         )

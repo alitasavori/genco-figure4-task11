@@ -158,7 +158,7 @@ def test_train_fit_rpe_scales_persist_c_scale(tmp_path, monkeypatch):
     previous_names = tpgt.RPE_FEATURE_NAMES
     previous_dim = tpgt.RPE_DIM
     try:
-        tpgt.apply_rpe_channel_config("re_im_gen")
+        tpgt.apply_rpe_channel_config("im_rho")
         assert tpgt.uses_generator_support_rpe()
         cache = tmp_path / "cache"
         cache.mkdir()
