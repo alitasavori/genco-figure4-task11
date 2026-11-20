@@ -67,6 +67,38 @@ def test_rpe_is_zeff_re_im():
         assert np.allclose(features[..., channel], features[..., channel].T, atol=1e-4)
 
 
+def test_v17_generator_grounded_support_rpe():
+    """Radial PV→i→j: C = [[Xg, Xg], [Xg, Xg+xij]] on the PQ block; 6-ch RPE."""
+    previous_names = tpgt.RPE_FEATURE_NAMES
+    previous_dim = tpgt.RPE_DIM
+    try:
+        tpgt.apply_rpe_channel_config("re_im_gen")
+        assert tpgt.RPE_DIM == 6
+        assert tpgt.uses_generator_support_rpe()
+        xg, xij = 0.2, 0.5
+        # bus 0 = PV, 1 = i (PQ), 2 = j (PQ)
+        branches = [(0, 1, 0.0, xg), (1, 2, 0.0, xij)]
+        types = np.array([1, 0, 0], dtype=np.int64)
+        c = tpgt.generator_grounded_support_matrix(3, branches, types)
+        assert np.allclose(c[1:, 1:], np.array([[xg, xg], [xg, xg + xij]]), atol=1e-6)
+        assert np.allclose(c[0, :], 0.0) and np.allclose(c[:, 0], 0.0)
+        ybus = np.zeros((3, 3), dtype=np.complex64)
+        features, _ = meshed_rpe(3, branches, ybus, types=types, c_scale=1.0)
+        assert features.shape == (3, 3, 6)
+        # Pair (1,2): Cii=Xg, Cjj=Xg+xij, Cij=Xg, rho=Xg/sqrt(Xg*(Xg+xij))
+        assert np.isclose(features[1, 2, 2], xg)
+        assert np.isclose(features[1, 2, 3], xg + xij)
+        assert np.isclose(features[1, 2, 4], xg)
+        rho = xg / np.sqrt(xg * (xg + xij))
+        assert np.isclose(features[1, 2, 5], rho, atol=1e-5)
+        model = TPGT()
+        assert model.pair_encoder.net[0].in_features == 6
+        assert model.pair_encoder.net[-1].out_features == tpgt.D_E
+    finally:
+        tpgt.RPE_FEATURE_NAMES = previous_names
+        tpgt.RPE_DIM = previous_dim
+
+
 def test_bus_shunt_b_row_sum_includes_charging_unlike_device_bs():
     ybus = torch.zeros(3, 3, dtype=torch.complex64)
     ybus[0, 0] = 1.5 - 0.25j

@@ -41,7 +41,7 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
 * **Correction stages** (``DEPTH``), each with its own weights; the physics
   loss sums stage residuals with GENCO weights ``0.5**(K-i)`` (last stage 1).
   Default ``DEPTH=4``; preset ``v8`` / ``v9`` / ``v10`` use ``DEPTH=8`` with wider
-  ``D/D_E/D_A/HEADS``; ``v16``/``v17`` use ``DEPTH=12`` (v17 drops Real Zeff).
+  ``D/D_E/D_A/HEADS``; ``v16``/``v17`` use ``DEPTH=12`` (v17 adds gen-support RPE).
 * **Attention**: ``grit`` (default; v7–v9) uses pair-modulated GRIT scores on
   ``pair_encoder(RPE)``;   ``v10`` uses Approach C joint MLP scores on **raw** RPE
   ``r_ij`` (no pair encoder); ``v11`` uses Park et al. GRPE (shared hop/edge
@@ -60,9 +60,9 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
   v10: ``s=MLP([q‖k‖r])``; v11: ``s=(q·k + q·(P^Q+E^Q) + k·(P^K+E^K))/√D_A`` with
   ``o=Σ α (v+P^V+E^V)``. Softmax and type-pair blocks are unchanged. Angle step
   uses ``η_angle=1``.
-* **RPE**: legacy ``Zeff_Re_norm`` + ``Zeff_Im_norm`` (v7–v16 / v19); **v17+ Im-only**
-  ``Zeff_Im_norm`` (Real Zeff dropped after ablation showed near-zero dependence),
-  except ``v19`` keeps Re+Im like v16.
+* **RPE**: legacy ``Zeff_Re_norm`` + ``Zeff_Im_norm`` (v7–v16 / v19/v20);
+  **v17** adds generator-set-grounded support channels (6-ch ``re_im_gen``);
+  **v17im** is Im-only Zeff.
 * **Node features**: v9–v16 ``(P,Q,V,θ,busBS)`` with net ``P=Ps−Pd``; **v19/v20** keep PQ
   at 5-D ``(P,Q,V,θ,busBS)`` and give PV/Slack ``(Pd,Qd,Ps,Qs,V,θ,busBS)``.
   PV/Slack pack ``Ps/Qs``; AC residual injects ``Ps−Pd``, ``Qs−Qd``.
@@ -135,15 +135,17 @@ Performance notes (Colab / large train split)
   ``GRAD_CLIP_NORM`` on every optimizer step. Early stopping uses separate val
   patience. The epoch line shows ``lr``; scheduler state is checkpointed.
 * **Debug (on by default)**: every validation pass also scores a fixed training
-  subset (``train_pbl`` and ``gap`` in the epoch line). On checkpoint epochs the
-  run prints the forward report, pair/RPE zero-ablation, RPE and residual correctness
+  subset (``train_pbl`` and ``gap`` in the epoch line).   On checkpoint epochs the
+  run prints the forward report, RPE and residual correctness
   audits on the validation topology, and contingency diagnostics on test N-1/N-2
   (per-topology PBL spread, audits and ablation on the largest outage topologies,
   feature shift from the training topology). Runs on the training grid every
   checkpoint epoch (every 3), including case57; Task 3.1 keeps ablation on IEEE 118.
-  v15 abates pair-elec channels; grit/Zeff arches abate RPE channels. Disable with
-  ``GENCO_TPGT_DEBUG=0`` or ``--no-debug``; skip pair/RPE ablation with
-  ``GENCO_TPGT_RPE_ABLATION=0``, bus-shunt (``busBS``) with ``GENCO_TPGT_SHUNT_ABLATION=0``.
+  **Every checkpoint epoch also always zero-ablates each edge/RPE channel one-by-one**
+  (all ``RPE_FEATURE_NAMES``, including v17's 6 gen-support channels) and prints ΔPBL;
+  this runs even if ``--no-debug`` (skip only with ``GENCO_TPGT_RPE_ABLATION=0`` /
+  ``--no-rpe-ablation``). Disable the rest of debug with
+  ``GENCO_TPGT_DEBUG=0`` or ``--no-debug``; bus-shunt (``busBS``) with ``GENCO_TPGT_SHUNT_ABLATION=0``.
   ``--ablate-grit`` (v9/v16) scores N/N-1/N-2 after removing GRIT pieces
   (``W_Eb``, ``W_Ev``, ``W_Ew``, Re Zeff, each head, stage cutoffs 8..DEPTH-1).
   ``--attn-sparsity`` (v16/v9 grit) dumps bus×bus attention heatmaps, attention-mass /
@@ -233,9 +235,17 @@ PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
 CACHE_VERSION = "tpgt-cache-17"
-# Default / legacy (v7–v16): Re+Im. New arches (v17+) use Im-only via ``RPE_CHANNELS=im``.
+# Default / legacy (v7–v16): Re+Im. ``im`` = Im-only; ``re_im_gen`` = v17 gen-support (6-ch).
 RPE_FEATURE_NAMES_RE_IM = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_FEATURE_NAMES_IM = ("Zeff_Im_norm",)
+RPE_FEATURE_NAMES_RE_IM_GEN = (
+    "Zeff_Re_norm",
+    "Zeff_Im_norm",
+    "Cii_norm",
+    "Cjj_norm",
+    "Cij_norm",
+    "rho_ij",
+)
 RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM
 RPE_DIM = len(RPE_FEATURE_NAMES)
 # v15 pair-rotary electrical pair features (ablate these, not Zeff RPE).
@@ -465,7 +475,8 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "ATTENTION_KIND": "grit",
         "RPE_CHANNELS": "re_im",
     },
-    # v16 GRIT + DEPTH=12, but Zeff Im-only RPE (drop Real; ablation showed Re ≈ unused).
+    # v16 GRIT + generator-set-grounded support RPE (6-ch: Zeff Re/Im + Cii/Cjj/Cij/ρ).
+    # No pair update, no supply/demand features — same packing/residual as v16.
     "v17": {
         "D": 96,
         "D_E": 48,
@@ -473,6 +484,19 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "HEADS": 4,
         "DEPTH": 12,
         "RUN_TAG": "v17",
+        "CHECKPOINT_VERSION": "meshed-rpe-6-d12-w96-h4-pqvt-busBS-gensupport-v17",
+        "USE_NODE_SHUNT": True,
+        "ATTENTION_KIND": "grit",
+        "RPE_CHANNELS": "re_im_gen",
+    },
+    # Former Im-only GRIT (v16 dims, drop Real Zeff). Kept so old runs remain selectable.
+    "v17im": {
+        "D": 96,
+        "D_E": 48,
+        "D_A": 48,
+        "HEADS": 4,
+        "DEPTH": 12,
+        "RUN_TAG": "v17im",
         "CHECKPOINT_VERSION": "meshed-rpe-1-d12-w96-h4-pqvt-busBS-v17",
         "USE_NODE_SHUNT": True,
         "ATTENTION_KIND": "grit",
@@ -2811,7 +2835,11 @@ def collect_rpe_channel_ablation(
     index: np.ndarray,
     device: torch.device,
 ) -> tuple[dict[str, float], list[dict[str, float]]]:
-    """Zero one Zeff RPE channel at a time; compare batch metrics to the full-RPE baseline."""
+    """Zero each edge/RPE channel one-by-one; compare batch metrics to the full-RPE baseline.
+
+    Covers every entry of ``RPE_FEATURE_NAMES`` (2-ch Zeff, 1-ch Im-only, or v17's 6-ch
+    gen-support RPE).
+    """
     model.eval()
     clear_pair_embed_cache([network])
     baseline_pair = pair_features(model, network)
@@ -2825,10 +2853,18 @@ def collect_rpe_channel_ablation(
         rows.append(
             {
                 "name": name,
+                "channel": int(channel),
                 "delta_pbl_mean": metrics["pbl_mean"] - baseline["pbl_mean"],
                 "delta_state_mse": metrics["state_mse"] - baseline["state_mse"],
                 "delta_total_loss": metrics["total_loss"] - baseline["total_loss"],
+                "pbl_mean": metrics["pbl_mean"],
+                "state_mse": metrics["state_mse"],
+                "total_loss": metrics["total_loss"],
             }
+        )
+    if len(rows) != RPE_DIM:
+        raise RuntimeError(
+            f"edge/RPE ablation covered {len(rows)} channels, expected RPE_DIM={RPE_DIM}"
         )
     clear_pair_embed_cache([network])
     return baseline, rows
@@ -2922,10 +2958,11 @@ def format_rpe_effectiveness_diagnostics(
             "Pair/RPE channel ablation: not run (use --diagnose, --rpe-ablation, or GENCO_TPGT_RPE_ABLATION=1)."
         )
         return "\n".join(lines)
-    kind = "Pair-elec" if ATTENTION_KIND == "pair_rotary" else "RPE"
+    kind = "Pair-elec" if ATTENTION_KIND == "pair_rotary" else "Edge/RPE"
+    n_ch = len(ablation_rows)
     lines.append(
-        f"{kind} zero-ablation on same batch (baseline PBL mean {baseline['pbl_mean']:.6g}, "
-        f"state_mse {baseline['state_mse']:.6g}):"
+        f"{kind} zero-ablation ({n_ch} channels, one-by-one) on same batch "
+        f"(baseline PBL mean {baseline['pbl_mean']:.6g}, state_mse {baseline['state_mse']:.6g}):"
     )
     lines.append(
         "  Positive ΔPBL after zeroing => channel helped; negative ΔPBL => zeroing improved metrics (hurting/noisy)."
@@ -2936,6 +2973,67 @@ def format_rpe_effectiveness_diagnostics(
             f"Δstate_mse {row['delta_state_mse']:+.4g}  Δloss {row['delta_total_loss']:+.4g}"
         )
     return "\n".join(lines)
+
+
+def run_checkpoint_edge_feature_ablation(
+    model: TPGT,
+    split: Split,
+    network: Network,
+    index: np.ndarray,
+    device: torch.device,
+    *,
+    seed_dir: Path | None = None,
+    epoch: int | None = None,
+    tag: str = "",
+) -> str:
+    """Zero-ablate every edge/RPE channel one-by-one; print and archive on checkpoint epochs.
+
+    Always runs all active pair features (``RPE_FEATURE_NAMES`` or pair-elec). Intended for
+    every ``CHECKPOINT_EVERY`` epoch so v17's six channels (and legacy 2-ch) are all scored.
+    """
+    weight_rows = pair_encoder_input_weight_norms(model)
+    baseline, ablation_rows, feature_names = collect_pair_feature_ablation(
+        model, split, network, index, device
+    )
+    header = "=== Edge/RPE channel zero-ablation (all channels, one-by-one)"
+    if tag:
+        header += f" — {tag}"
+    header += " ==="
+    body = format_rpe_effectiveness_diagnostics(weight_rows, baseline, ablation_rows)
+    text = header + "\n" + body
+    if seed_dir is None:
+        print(text, flush=True)
+    else:
+        append_seed_log(seed_dir, text)
+        if epoch is not None and saves_checkpoint_epoch(int(epoch)):
+            write_seed_report(seed_dir, int(epoch), "edge_feature_ablation.txt", text)
+            write_seed_json(
+                seed_dir,
+                int(epoch),
+                "edge_feature_ablation.json",
+                {
+                    "epoch": int(epoch),
+                    "tag": tag,
+                    "attention_kind": ATTENTION_KIND,
+                    "feature_names": list(feature_names),
+                    "n_channels": len(feature_names),
+                    "baseline": baseline,
+                    "rows": ablation_rows,
+                },
+            )
+            append_seed_metrics(
+                seed_dir,
+                {
+                    "event": "edge_feature_ablation",
+                    "epoch": int(epoch),
+                    "n_channels": len(feature_names),
+                    "baseline_pbl_mean": baseline["pbl_mean"],
+                    "delta_pbl_by_channel": {
+                        row["name"]: row["delta_pbl_mean"] for row in ablation_rows
+                    },
+                },
+            )
+    return text
 
 
 def format_bus_shunt_ablation_diagnostics(
@@ -4478,9 +4576,10 @@ class Network:
     branches: tuple[tuple[int, int, float, float], ...] | None = field(default=None, repr=False)
     # Bus shunt susceptance from parquet ``BS`` (p.u.); device-only, not line charging.
     shunt_b: torch.Tensor | None = field(default=None, repr=False)
-    # Global Zeff normalizers used when building ``rpe`` (shared across topologies in a split).
+    # Global Zeff / gen-support normalizers used when building ``rpe`` (shared across topologies).
     rpe_re_scale: float | None = field(default=None, repr=False)
     rpe_im_scale: float | None = field(default=None, repr=False)
+    rpe_c_scale: float | None = field(default=None, repr=False)
     # GRPE topology bins (Park et al.): hop distance id and discrete edge-relation id.
     hop_id: torch.Tensor | None = field(default=None, repr=False)
     edge_id: torch.Tensor | None = field(default=None, repr=False)
@@ -4716,6 +4815,92 @@ def meshed_zeff_peak_abs(
     max_re = float(np.max(np.abs(z_eff.real[off_diagonal])))
     max_im = float(np.max(np.abs(z_eff.imag[off_diagonal])))
     return max(max_re, 1e-30), max(max_im, 1e-30)
+
+
+def generator_grounded_support_matrix(
+    bus_count: int,
+    branches: list[tuple[int, int, float, float]],
+    types: np.ndarray | torch.Tensor,
+    *,
+    x_eps: float = 1e-12,
+) -> np.ndarray:
+    """N×N generator-grounded DC support ``\\widetilde C`` (zeros at Slack/PV).
+
+    Build real Laplacian ``L = diag(W 1) - W`` with ``W_ij = Σ 1/x_ℓ`` on undirected
+    in-service branches, ground Slack∪PV, and invert the PQ block ``L[U,U]``.
+    """
+    type_np = np.asarray(types, dtype=np.int64).reshape(-1)
+    if type_np.size != bus_count:
+        raise ValueError(f"types length {type_np.size} != bus_count {bus_count}")
+    weights = np.zeros((bus_count, bus_count), dtype=np.float64)
+    table = np.asarray(branches, dtype=np.float64).reshape(-1, 4) if branches else np.zeros((0, 4))
+    for origin, destination, _resistance, reactance in table:
+        x = float(reactance)
+        if abs(x) <= x_eps:
+            continue
+        w = 1.0 / x
+        if w <= 0.0:
+            continue
+        i = int(origin)
+        j = int(destination)
+        weights[i, j] += w
+        weights[j, i] += w
+    laplacian = np.diag(weights.sum(axis=1)) - weights
+    pq = (type_np == 0)
+    gen = (type_np == 1) | (type_np == 2)
+    c_full = np.zeros((bus_count, bus_count), dtype=np.float64)
+    pq_idx = np.flatnonzero(pq)
+    if pq_idx.size == 0 or not np.any(gen):
+        return c_full
+    l_g = laplacian[np.ix_(pq_idx, pq_idx)]
+    try:
+        c_uu = np.linalg.inv(l_g)
+    except np.linalg.LinAlgError:
+        c_uu = np.linalg.pinv(l_g)
+    if not np.isfinite(c_uu).all():
+        c_uu = np.nan_to_num(c_uu, nan=0.0, posinf=0.0, neginf=0.0)
+    c_full[np.ix_(pq_idx, pq_idx)] = c_uu
+    return c_full
+
+
+def generator_support_rho(c_full: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
+    """Normalized shared response ``ρ_ij = C_ij / sqrt(C_ii C_jj)`` (0 if undefined)."""
+    diag = np.diag(c_full).copy()
+    denom = np.sqrt(np.maximum(diag[:, None], 0.0) * np.maximum(diag[None, :], 0.0))
+    rho = np.zeros_like(c_full, dtype=np.float64)
+    ok = denom > eps
+    rho[ok] = c_full[ok] / denom[ok]
+    return rho
+
+
+def fit_global_c_scale_from_networks(networks: list["Network"]) -> float:
+    """``s_C = max(1, max |C̃_ij|)`` over train topologies."""
+    peak = 0.0
+    for network in networks:
+        if not network.branches:
+            continue
+        bus_count = int(network.ybus.shape[0])
+        c_full = generator_grounded_support_matrix(
+            bus_count, list(network.branches), network.types.detach().cpu().numpy()
+        )
+        if c_full.size:
+            peak = max(peak, float(np.max(np.abs(c_full))))
+    return max(1.0, peak)
+
+
+def fit_global_c_scale_from_specs(
+    specs: list[tuple[np.ndarray, list[tuple[int, int, float, float]]]],
+    bus_count: int,
+) -> float:
+    """``s_C`` from ``(types, branches)`` representative topology specs."""
+    peak = 0.0
+    for types, branches in specs:
+        if not branches:
+            continue
+        c_full = generator_grounded_support_matrix(bus_count, branches, types)
+        if c_full.size:
+            peak = max(peak, float(np.max(np.abs(c_full))))
+    return max(1.0, peak)
 
 
 def global_zeff_rpe_scales(
@@ -5059,11 +5244,14 @@ def meshed_rpe(
     *,
     re_scale: float | None = None,
     im_scale: float | None = None,
+    c_scale: float | None = None,
+    types: np.ndarray | torch.Tensor | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Pair features from complex effective impedance (Method B).
+    """Pair features from complex effective impedance (Method B), optional gen-support.
 
     Legacy (``RPE_CHANNELS=re_im``): normalized Re and Im (2 channels).
-    v17+ (``RPE_CHANNELS=im``): Im only (1 channel) — Real Zeff dropped.
+    Im-only (``RPE_CHANNELS=im`` / ``v17im``): Im only (1 channel).
+    Gen-support (``RPE_CHANNELS=re_im_gen`` / ``v17``): Re/Im plus ``Cii,Cjj,Cij,ρ`` (6).
 
     Branch admittance ``y_ij = 1/(r_ij + j x_ij)`` on **off-diagonals only** (parallel
     branches add); diagonal entries stay zero until the Laplacian step. This is a
@@ -5078,6 +5266,7 @@ def meshed_rpe(
     those **global** positive scalars (same across topologies in a split). If omitted,
     use legacy per-connected-component maxima (tests only). ``re_scale`` is unused when
     RPE is Im-only but still accepted for shared scale-file plumbing.
+    Gen-support also needs ``types`` and optional global ``c_scale`` (``s_C``).
 
     ``ybus`` is unused here (residual still uses full scenario Ybus; tap inference
     happens when building the branch list).
@@ -5116,6 +5305,23 @@ def meshed_rpe(
         features[..., 1] = im
     elif RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM and RPE_DIM == 1:
         features[..., 0] = im
+    elif RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_RE_IM_GEN and RPE_DIM == 6:
+        if types is None:
+            raise ValueError("meshed_rpe re_im_gen requires bus types for generator grounding")
+        features[..., 0] = re
+        features[..., 1] = im
+        c_full = generator_grounded_support_matrix(bus_count, branches, types)
+        if c_scale is None:
+            peak = float(np.max(np.abs(c_full))) if c_full.size else 0.0
+            c_div = max(1.0, peak)
+        else:
+            c_div = float(c_scale)
+        c_norm = (c_full / c_div).astype(np.float32)
+        diag = np.diag(c_norm).astype(np.float32)
+        features[..., 2] = diag[:, None]
+        features[..., 3] = diag[None, :]
+        features[..., 4] = c_norm
+        features[..., 5] = generator_support_rho(c_full).astype(np.float32)
     else:
         raise RuntimeError(
             f"meshed_rpe cannot map Zeff into RPE_FEATURE_NAMES={RPE_FEATURE_NAMES} RPE_DIM={RPE_DIM}"
@@ -5138,11 +5344,12 @@ def save_rpe_global_scales(
     re_scale: float,
     im_scale: float,
     *,
+    c_scale: float | None = None,
     raw_re: float | None = None,
     raw_im: float | None = None,
     source: str = "train_fit",
 ) -> None:
-    """Persist train-fit ``s_R,s_X`` for valid/test cache builds (Drive ``checkpoints/cache``)."""
+    """Persist train-fit ``s_R,s_X`` (and optional ``s_C``) for valid/test cache builds."""
     persistent.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": CACHE_VERSION,
@@ -5151,6 +5358,8 @@ def save_rpe_global_scales(
         "rpe_im_scale": im_scale,
         "source": source,
     }
+    if c_scale is not None:
+        payload["rpe_c_scale"] = float(c_scale)
     if raw_re is not None:
         payload["rpe_re_peak_raw"] = raw_re
     if raw_im is not None:
@@ -5189,6 +5398,23 @@ def load_rpe_global_scales(
     if require_cache_version and payload.get("version") != CACHE_VERSION:
         return None
     return float(payload["rpe_re_scale"]), float(payload["rpe_im_scale"])
+
+
+def load_rpe_c_scale(
+    persistent: Path,
+    *,
+    require_cache_version: bool = True,
+    require_checkpoint_version: bool = True,
+) -> float | None:
+    """Load optional train-fit ``s_C`` for gen-support RPE."""
+    payload = read_rpe_scales_payload(persistent)
+    if payload is None or "rpe_c_scale" not in payload:
+        return None
+    if require_checkpoint_version and payload.get("checkpoint_version") != CHECKPOINT_VERSION:
+        return None
+    if require_cache_version and payload.get("version") != CACHE_VERSION:
+        return None
+    return float(payload["rpe_c_scale"])
 
 
 def log_rpe_scales_provenance(cache_dir: Path, *, context: str) -> None:
@@ -5448,6 +5674,16 @@ def unify_network_rpe(
             print("  unify_network_rpe: no branches; using s_R=s_X=1.0", flush=True)
             return 1.0, 1.0
         global_re, global_im, _raw_r, _raw_x = fit_global_zeff_rpe_scales_from_networks(networks)
+    global_c: float | None = None
+    if uses_generator_support_rpe():
+        # Prefer scale already on networks (eval copy), else fit from topology.
+        existing = [
+            float(s)
+            for s in (getattr(n, "rpe_c_scale", None) for n in networks)
+            if s is not None
+        ]
+        global_c = max(existing) if existing else fit_global_c_scale_from_networks(networks)
+        print(f"  gen-support RPE scale s_C={global_c:.6g}", flush=True)
     for network in networks:
         if network.branches is None:
             continue
@@ -5458,11 +5694,14 @@ def unify_network_rpe(
             ybus,
             re_scale=global_re,
             im_scale=global_im,
+            c_scale=global_c,
+            types=network.types.detach().cpu().numpy(),
         )
         network.rpe = torch.from_numpy(features)
         network.component = torch.from_numpy(component.astype(np.int64))
         network.rpe_re_scale = global_re
         network.rpe_im_scale = global_im
+        network.rpe_c_scale = global_c
         network.pair_embed = None
         attach_grpe_graph_ids(network)
         if ATTENTION_KIND == "exphormer":
@@ -5579,39 +5818,55 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
     diagonal = np.arange(bus_count)
     for channel, name in enumerate(RPE_FEATURE_NAMES):
         short = "re" if "Re" in name else "im" if "Im" in name else f"c{channel}"
-        diag_ok = bool(np.allclose(rpe[diagonal, diagonal, channel], 0.0))
-        checks.append(
-            CorrectnessCheck(
-                f"diag_zeff_{short}_zero",
-                diag_ok,
-                f"diagonal {name} is 0" if diag_ok else f"diagonal {name} must be 0",
+        # Zeff channels are zero on the diagonal and symmetric. Gen-support Cii/Cjj
+        # are node-wise (asymmetric as pair tensors); Cij/ρ are symmetric with nonzero diag.
+        if name.startswith("Zeff_"):
+            diag_ok = bool(np.allclose(rpe[diagonal, diagonal, channel], 0.0))
+            checks.append(
+                CorrectnessCheck(
+                    f"diag_zeff_{short}_zero",
+                    diag_ok,
+                    f"diagonal {name} is 0" if diag_ok else f"diagonal {name} must be 0",
+                )
             )
-        )
-        sym_ok = bool(np.allclose(rpe[:, :, channel], rpe[:, :, channel].T, atol=1e-4))
-        checks.append(
-            CorrectnessCheck(
-                f"zeff_{short}_symmetric",
-                sym_ok,
-                f"normalized {name} symmetric" if sym_ok else f"{name} channel not symmetric",
+            sym_ok = bool(np.allclose(rpe[:, :, channel], rpe[:, :, channel].T, atol=1e-4))
+            checks.append(
+                CorrectnessCheck(
+                    f"zeff_{short}_symmetric",
+                    sym_ok,
+                    f"normalized {name} symmetric" if sym_ok else f"{name} channel not symmetric",
+                )
             )
-        )
+        elif name in ("Cij_norm", "rho_ij"):
+            sym_ok = bool(np.allclose(rpe[:, :, channel], rpe[:, :, channel].T, atol=1e-4))
+            checks.append(
+                CorrectnessCheck(
+                    f"{short}_symmetric",
+                    sym_ok,
+                    f"{name} symmetric" if sym_ok else f"{name} channel not symmetric",
+                )
+            )
 
     if getattr(network, "branches", None) is not None:
         branches = network.branches
         assert branches is not None
         re_s = getattr(network, "rpe_re_scale", None)
         im_s = getattr(network, "rpe_im_scale", None)
+        c_s = getattr(network, "rpe_c_scale", None)
         expected, expected_component = meshed_rpe(
             bus_count,
             list(branches),
             ybus,
             re_scale=re_s,
             im_scale=im_s,
+            c_scale=c_s,
+            types=network.types.detach().cpu().numpy(),
         )
         max_diff = float(np.max(np.abs(expected - rpe)))
         recompute_ok = max_diff <= recompute_atol and np.array_equal(expected_component, component)
         scale_note = (
             f"s_R={re_s} s_X={im_s}"
+            + (f" s_C={c_s}" if c_s is not None else "")
             if re_s is not None and im_s is not None
             else "scales missing (per-component fallback; check move_to preserves rpe_*_scale)"
         )
@@ -5737,18 +5992,24 @@ def _parse_mlp_hiddens(raw: object, default: tuple[int, ...] = (128, 64)) -> tup
 
 
 def apply_rpe_channel_config(channels: str) -> None:
-    """Set global ``RPE_FEATURE_NAMES`` / ``RPE_DIM`` from ``re_im`` or ``im``."""
+    """Set global ``RPE_FEATURE_NAMES`` / ``RPE_DIM`` from channel preset name."""
     global RPE_FEATURE_NAMES, RPE_DIM
     key = str(channels).strip().lower().replace("+", "_").replace("-", "_")
     if key in ("re_im", "reim", "both", "2"):
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM
     elif key in ("im", "im_only", "zeff_im", "1"):
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_IM
+    elif key in ("re_im_gen", "reim_gen", "gen_support", "gensupport", "6"):
+        RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM_GEN
     else:
         raise ValueError(
-            f"unknown RPE_CHANNELS {channels!r}; use re_im (legacy) or im (v17+)"
+            f"unknown RPE_CHANNELS {channels!r}; use re_im, im, or re_im_gen (v17)"
         )
     RPE_DIM = len(RPE_FEATURE_NAMES)
+
+
+def uses_generator_support_rpe() -> bool:
+    return RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_RE_IM_GEN
 
 
 def refresh_node_feature_config() -> None:
@@ -6301,6 +6562,7 @@ def read_split(
     prefix_end: int | None = None,
     prefix_start: int = 0,
     rpe_scales: tuple[float, float] | None = None,
+    rpe_c_scale: float | None = None,
 ) -> Split:
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
@@ -6448,6 +6710,7 @@ def read_split(
             branch_count,
             shunt_b,
             rpe_scales=rpe_scales,
+            rpe_c_scale=rpe_c_scale,
             bus_count=bus_count,
             tap=tap,
             shift=shift,
@@ -6491,6 +6754,7 @@ def _representative_networks(
     branch_count: int,
     shunt_b: np.ndarray,
     rpe_scales: tuple[float, float] | None = None,
+    rpe_c_scale: float | None = None,
     bus_count: int = 118,
     tap: np.ndarray | None = None,
     shift: np.ndarray | None = None,
@@ -6545,10 +6809,36 @@ def _representative_networks(
             f"over {len(rep_specs)} topology(ies) ({name}); meshed_rpe once per topology (not per scenario)",
             flush=True,
         )
+    global_c: float | None = None
+    if uses_generator_support_rpe():
+        if rpe_c_scale is not None:
+            global_c = float(rpe_c_scale)
+            print(
+                f"  gen-support RPE uses train scale s_C={global_c:.6g} "
+                f"({len(rep_specs)} topology(ies) in {name})",
+                flush=True,
+            )
+        else:
+            global_c = fit_global_c_scale_from_specs(
+                [(types, branches) for _local, types, branches, _ybus in rep_specs],
+                bus_count,
+            )
+            print(
+                f"  gen-support RPE scale s_C={global_c:.6g} over {len(rep_specs)} topology(ies) ({name})",
+                flush=True,
+            )
 
     networks: list[Network] = []
     for local, types, branches, ybus in rep_specs:
-        features, component = meshed_rpe(bus_count, branches, ybus, re_scale=global_re, im_scale=global_im)
+        features, component = meshed_rpe(
+            bus_count,
+            branches,
+            ybus,
+            re_scale=global_re,
+            im_scale=global_im,
+            c_scale=global_c,
+            types=types,
+        )
         hop_id, edge_id = build_grpe_graph_ids(bus_count, branches)
         network = Network(
             ybus=torch.from_numpy(ybus),
@@ -6559,6 +6849,7 @@ def _representative_networks(
             shunt_b=torch.from_numpy(np.asarray(shunt_b[local], dtype=np.float32)),
             rpe_re_scale=global_re,
             rpe_im_scale=global_im,
+            rpe_c_scale=global_c,
             hop_id=torch.from_numpy(hop_id),
             edge_id=torch.from_numpy(edge_id),
         )
@@ -6850,21 +7141,35 @@ def purge_split_caches(active: Path, persistent: Path, reason: str) -> int:
     return removed
 
 
+def split_rpe_c_scale(split: Split) -> float | None:
+    for network in split.networks:
+        if getattr(network, "rpe_c_scale", None) is not None:
+            return float(network.rpe_c_scale)
+    return None
+
+
 def refresh_split_rpe(
     split: Split,
     persistent: Path,
     *,
     is_train: bool,
     rpe_scales: tuple[float, float] | None,
+    rpe_c_scale: float | None = None,
 ) -> None:
     """Ensure cached ``network.rpe`` matches ``meshed_rpe`` for stored branch lists and scales."""
     if is_train:
         re_scale, im_scale = unify_rpe_normalization(split)
-        save_rpe_global_scales(persistent, re_scale, im_scale)
+        c_scale = split_rpe_c_scale(split) if uses_generator_support_rpe() else None
+        save_rpe_global_scales(persistent, re_scale, im_scale, c_scale=c_scale)
         return
     scales = rpe_scales if rpe_scales is not None else load_rpe_global_scales(persistent)
     if scales is None:
         return
+    if uses_generator_support_rpe():
+        c_use = rpe_c_scale if rpe_c_scale is not None else load_rpe_c_scale(persistent)
+        if c_use is not None:
+            for network in split.networks:
+                network.rpe_c_scale = float(c_use)
     unify_rpe_normalization(split, scales)
 
 
@@ -6974,6 +7279,7 @@ def cached_split(
     *,
     compact: bool = False,
     rpe_scales: tuple[float, float] | None = None,
+    rpe_c_scale: float | None = None,
 ) -> Split:
     """Load ``name`` from the split cache or build it from parquet.
 
@@ -7027,7 +7333,13 @@ def cached_split(
             payload = torch.load(tensor_path, map_location="cpu", weights_only=False)
             elapsed = time.perf_counter() - load_started
             print(f"  loaded {name} split in {elapsed:.1f}s ({tensor_path})", flush=True)
-            refresh_split_rpe(payload, persistent, is_train=is_train, rpe_scales=rpe_scales)
+            refresh_split_rpe(
+                payload,
+                persistent,
+                is_train=is_train,
+                rpe_scales=rpe_scales,
+                rpe_c_scale=rpe_c_scale,
+            )
             sync_split_cache_to_drive(active, persistent)
             return _compact_if(payload, name, compact)
         if version_ok and limit == old_limit and stamp_reason is not None:
@@ -7061,6 +7373,7 @@ def cached_split(
     build_started = time.perf_counter()
     if is_train:
         scales_for_read: tuple[float, float] | None = None
+        c_for_read: float | None = None
     else:
         scales_for_read = rpe_scales if rpe_scales is not None else load_rpe_global_scales(persistent)
         if scales_for_read is None:
@@ -7068,13 +7381,34 @@ def cached_split(
                 f"Missing train RPE scales for {name}; build the train split cache first "
                 f"(expected {rpe_scales_path(persistent)})."
             )
-    split = read_split(raw, name, prefix_end=limit, rpe_scales=scales_for_read)
+        c_for_read = (
+            rpe_c_scale
+            if rpe_c_scale is not None
+            else load_rpe_c_scale(persistent)
+        )
+        if uses_generator_support_rpe() and c_for_read is None:
+            raise RuntimeError(
+                f"Missing train gen-support scale s_C for {name}; rebuild the train split cache "
+                f"(expected rpe_c_scale in {rpe_scales_path(persistent)})."
+            )
+    split = read_split(
+        raw,
+        name,
+        prefix_end=limit,
+        rpe_scales=scales_for_read,
+        rpe_c_scale=c_for_read,
+    )
     print(f"  built {name} split from parquet in {time.perf_counter() - build_started:.1f}s", flush=True)
     _compact_if(split, name, compact)
     save_started = time.perf_counter()
     re_scale, im_scale = split_rpe_scales(split)
     stamp["rpe_re_scale"] = re_scale
     stamp["rpe_im_scale"] = im_scale
+    c_scale = split_rpe_c_scale(split)
+    if c_scale is not None:
+        stamp["rpe_c_scale"] = c_scale
+    if is_train:
+        save_rpe_global_scales(persistent, re_scale, im_scale, c_scale=c_scale)
     torch.save(split, tensor_path)
     stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
     print(f"  saved {name} cache in {time.perf_counter() - save_started:.1f}s", flush=True)
@@ -7086,13 +7420,15 @@ def load_task_split(data_root: Path, split_name: str, active: Path, persistent: 
     """Union of every ``split_name`` folder of the task (each cached on its own, DATA_FRACTION per folder).
 
     A task with a single folder (Task 1.1) returns that folder's split unchanged.
-   Train splits fit ``s_R,s_X`` and write ``rpe_global_scales.json``; valid/test reuse those scales.
+   Train splits fit ``s_R,s_X`` (and ``s_C`` for v17) and write ``rpe_global_scales.json``;
+   valid/test reuse those scales.
     """
     folders = task_folders(data_root, split_name)
     if not folders:
         raise FileNotFoundError(f"No {split_name} folders under {data_root / 'case118' / split_name}")
     multi = len(folders) > 1
     train_scales = load_rpe_global_scales(persistent) if split_name != "train" else None
+    train_c = load_rpe_c_scale(persistent) if split_name != "train" else None
     parts = [
         cached_split(
             active,
@@ -7101,6 +7437,7 @@ def load_task_split(data_root: Path, split_name: str, active: Path, persistent: 
             f"{split_name}_{topology}_{condition}",
             compact=multi,
             rpe_scales=train_scales,
+            rpe_c_scale=train_c,
         )
         for topology, condition in folders
     ]
@@ -7456,6 +7793,7 @@ def move_to(network: Network, device: torch.device) -> Network:
         # dropping them falls back to per-component norms and falsely fails recompute_from_branches.
         rpe_re_scale=getattr(network, "rpe_re_scale", None),
         rpe_im_scale=getattr(network, "rpe_im_scale", None),
+        rpe_c_scale=getattr(network, "rpe_c_scale", None),
         hop_id=host_to_device(hop_id, device),
         edge_id=host_to_device(edge_id, device),
         **exph_kw,
@@ -9087,6 +9425,24 @@ def train_seed(
             if saves_checkpoint_epoch(epoch + 1):
                 write_seed_report(model_dir, epoch + 1, "epoch_line.txt", epoch_line)
                 write_seed_json(model_dir, epoch + 1, "epoch_metrics.json", epoch_metrics)
+                # Always zero-ablate every edge/RPE channel one-by-one on checkpoint epochs
+                # (every CHECKPOINT_EVERY), even when --no-debug; skip only via --no-rpe-ablation.
+                if wants_rpe_ablation(default=True):
+                    val_net_ablate = dominant_network_id(val_split)
+                    sample_ablate = debug_sample_index(val_split, network_id=val_net_ablate)
+                    run_checkpoint_edge_feature_ablation(
+                        model,
+                        val_split,
+                        val_networks[val_net_ablate],
+                        sample_ablate,
+                        device,
+                        seed_dir=model_dir,
+                        epoch=epoch + 1,
+                        tag=(
+                            f"seed {seed} epoch {epoch + 1} "
+                            f"({len(sample_ablate)} valid cases, network {val_net_ablate})"
+                        ),
+                    )
             if debug_diagnostics and saves_checkpoint_epoch(epoch + 1):
                 val_net = dominant_network_id(val_split)
                 sample = debug_sample_index(val_split, network_id=val_net)
@@ -9097,7 +9453,8 @@ def train_seed(
                     sample,
                     device,
                     tag=f"seed {seed} epoch {epoch + 1} ({len(sample)} valid cases, network {val_net})",
-                    rpe_ablation=wants_rpe_ablation(default=True),
+                    # Dedicated checkpoint ablation already covered all edge/RPE channels.
+                    rpe_ablation=False,
                     shunt_ablation=wants_shunt_ablation(default=True),
                     seed_dir=model_dir,
                     epoch=epoch + 1,
@@ -9588,10 +9945,21 @@ def main() -> None:
         gc.collect()
         torch.cuda.empty_cache()
     debug_diagnostics = wants_debug_diagnostics()
+    edge_ablate = wants_rpe_ablation(default=True)
     print(
         "Debug diagnostics ON at checkpoint epochs (disable with GENCO_TPGT_DEBUG=0 or --no-debug)."
         if debug_diagnostics
         else "Debug diagnostics OFF.",
+        flush=True,
+    )
+    print(
+        f"Edge/RPE zero-ablation (all {RPE_DIM} channels, one-by-one) "
+        f"{'ON' if edge_ablate else 'OFF'} every {CHECKPOINT_EVERY} epochs"
+        + (
+            ""
+            if edge_ablate
+            else " (enable with --rpe-ablation / GENCO_TPGT_RPE_ABLATION=1)."
+        ),
         flush=True,
     )
     reference_network = train_split.networks[dominant_network_id(train_split)]
