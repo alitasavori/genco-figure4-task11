@@ -58,8 +58,11 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
   v10: ``s=MLP([q‖k‖r])``; v11: ``s=(q·k + q·(P^Q+E^Q) + k·(P^K+E^K))/√D_A`` with
   ``o=Σ α (v+P^V+E^V)``. Softmax and type-pair blocks are unchanged. Angle step
   uses ``η_angle=1``.
-* **RPE**: legacy ``Zeff_Re_norm`` + ``Zeff_Im_norm`` (v7–v16); **v17+ Im-only**
-  ``Zeff_Im_norm`` (Real Zeff dropped after ablation showed near-zero dependence).
+* **RPE**: legacy ``Zeff_Re_norm`` + ``Zeff_Im_norm`` (v7–v16 / v19); **v17+ Im-only**
+  ``Zeff_Im_norm`` (Real Zeff dropped after ablation showed near-zero dependence),
+  except ``v19`` keeps Re+Im like v16.
+* **Node features**: v9–v16 ``(P,Q,V,θ,busBS)`` with net ``P=Ps−Pd``; **v19** splits
+  demand/supply as ``(Pd,Qd,Ps,Qs,V,θ,busBS)`` (packing + AC residual still use net ``P,Q``).
 * **RPE channel dropout**: during training each channel is zeroed with
   probability ``RPE_CHANNEL_DROPOUT`` per optimizer step; never at eval.
 * **Versioned run folder**: checkpoints go to ``Foundation Model/tpgt_task11_<RUN_TAG>``
@@ -224,7 +227,7 @@ LAMBDA_PHYS = 0.5
 PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
-CACHE_VERSION = "tpgt-cache-15"
+CACHE_VERSION = "tpgt-cache-16"
 # Default / legacy (v7–v16): Re+Im. New arches (v17+) use Im-only via ``RPE_CHANNELS=im``.
 RPE_FEATURE_NAMES_RE_IM = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_FEATURE_NAMES_IM = ("Zeff_Im_norm",)
@@ -243,14 +246,18 @@ CHECKPOINT_VERSION = "meshed-rpe-2-d4-v7"
 RUN_TAG = "v7"
 CASE_NAME = "case118"
 RUN_DIR_NAME = f"tpgt_task11_{RUN_TAG}"
-# Residual/state packing stays 2 known slots per type. v9 node encoders see all four PF
-# quantities (P, Q, V, θ) with unknowns zeroed, plus bus-shunt B from parquet ``BS`` (device only).
+# Residual/state packing stays 2 known slots per type (net P=Ps−Pd, Q=Qs−Qd).
+# v9 node encoders: (P, Q, V, θ, Bs). v19: split injections into demand/supply
+# (Pd, Qd, Ps, Qs, V, θ, Bs). Physics residual still uses net P/Q.
 NODE_SPECIFIED_DIM = 2
 NODE_PQVT_DIM = 4
+NODE_SUPPLY_DEMAND_DIM = 4  # Pd, Qd, Ps, Qs
 NODE_SHUNT_B_DIM = 1
-NODE_FEATURE_DIM = NODE_PQVT_DIM + NODE_SHUNT_B_DIM  # 5 = (P,Q,V,θ,Bs)
+NODE_FEATURE_DIM = NODE_PQVT_DIM + NODE_SHUNT_B_DIM  # 5 = (P,Q,V,θ,Bs) unless supply/demand
 NODE_ENCODER_FEATURE_NAMES = ("P", "Q", "V", "theta", "busBS")
 USE_NODE_SHUNT = False
+# When True (v19): node encoders see (Pd,Qd,Ps,Qs,V,θ,busBS); packing/residual unchanged.
+USE_NODE_SUPPLY_DEMAND = False
 # ``grit``: ReLU(ρ(W_Q^{t_i←t_j} h_i + W_K^{t_i←t_j} h_j) ⊙ W_Ew e_ij + W_Eb e_ij) then linear score.
 # ``joint_mlp``: q_{i|t_j}=W_Q^{t_i←t_j} h_i, k_{j|t_i}=W_K^{t_i←t_j} h_j;
 #   s_ij = MLP_{t_i←t_j}^{ℓ,h}([q_{i|t_j} ‖ k_{j|t_i} ‖ r_ij]) on raw RPE (Approach C; v10).
@@ -475,10 +482,25 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "ATTENTION_KIND": "jsgc",
         "RPE_CHANNELS": "im",
     },
+    # v16 GRIT/capacity/RPE, but node encoders see demand/supply separately (Pd,Qd,Ps,Qs).
+    # Packing + AC residual still use net P=Ps−Pd, Q=Qs−Qd. Folder ``tpgt_task11_*_v19``.
+    "v19": {
+        "D": 96,
+        "D_E": 48,
+        "D_A": 48,
+        "HEADS": 4,
+        "DEPTH": 12,
+        "RUN_TAG": "v19",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d12-w96-h4-pdqdpsqs-busBS-v19",
+        "USE_NODE_SHUNT": True,
+        "USE_NODE_SUPPLY_DEMAND": True,
+        "ATTENTION_KIND": "grit",
+        "RPE_CHANNELS": "re_im",
+    },
 }
 # Legacy arches keep Re+Im; any new preset without ``RPE_CHANNELS`` defaults to Im-only.
 _LEGACY_RPE_RE_IM = frozenset(
-    {"v7", "v8", "v9", "v9d4", "v10", "v11", "v11e", "v12", "v13", "v14", "v15", "v16"}
+    {"v7", "v8", "v9", "v9d4", "v10", "v11", "v11e", "v12", "v13", "v14", "v15", "v16", "v19"}
 )
 for _arch_name, _preset in ARCH_PRESETS.items():
     if "RPE_CHANNELS" not in _preset:
@@ -1863,18 +1885,75 @@ def node_encoder_features(
     specified: torch.Tensor,
     layout: TypeLayout,
     shunt_b: torch.Tensor,
+    *,
+    demand_p: torch.Tensor | None = None,
+    demand_q: torch.Tensor | None = None,
+    supply_p: torch.Tensor | None = None,
+    supply_q: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``(P, Q, V, θ, B_s)`` per bus for type encoders.
+    """Node features for type encoders.
 
-    Unknown slots use the same ``flat_start`` as the physics iterate (PQ ``V=1`` pu, other
-  free variables 0) so attention does not see ``V=0`` on PQ while ``nodal_residual`` starts at 1 pu.
-    ``B_s`` is bus shunt device only (parquet ``BS``).
+    Default (v9–v16): ``(P, Q, V, θ, B_s)`` with net injections from ``assemble``.
+    Supply/demand (v19): ``(Pd, Qd, Ps, Qs, V, θ, B_s)`` from parquet channels; ``V,θ`` still
+    from ``assemble`` + ``flat_start`` (PQ ``V=1`` pu, other free slots 0).
+
+    ``B_s`` is bus shunt device only (parquet ``BS``). Packing / AC residual stay on net ``P,Q``.
     """
     power_p, power_q, voltage, angle = assemble(specified, flat_start(specified, layout), layout)
     bs = shunt_b.to(device=specified.device, dtype=specified.dtype)
     if bs.dim() == 1:
         bs = bs.unsqueeze(0).expand(specified.shape[0], -1)
+    if USE_NODE_SUPPLY_DEMAND:
+        if demand_p is None or demand_q is None or supply_p is None or supply_q is None:
+            raise ValueError("supply/demand node features require demand_p/q and supply_p/q")
+        pd_ = demand_p.to(device=specified.device, dtype=specified.dtype)
+        qd_ = demand_q.to(device=specified.device, dtype=specified.dtype)
+        ps_ = supply_p.to(device=specified.device, dtype=specified.dtype)
+        qs_ = supply_q.to(device=specified.device, dtype=specified.dtype)
+        if pd_.dim() == 1:
+            pd_ = pd_.unsqueeze(0).expand(specified.shape[0], -1)
+            qd_ = qd_.unsqueeze(0).expand(specified.shape[0], -1)
+            ps_ = ps_.unsqueeze(0).expand(specified.shape[0], -1)
+            qs_ = qs_.unsqueeze(0).expand(specified.shape[0], -1)
+        return torch.stack((pd_, qd_, ps_, qs_, voltage, angle, bs), dim=-1)
     return torch.stack((power_p, power_q, voltage, angle, bs), dim=-1)
+
+
+def case_supply_demand_kwargs(
+    split: Split,
+    chosen: torch.Tensor | np.ndarray,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Batch Pd/Qd/Ps/Qs from ``split`` for v19 encoders; empty dict when unused."""
+    if not USE_NODE_SUPPLY_DEMAND:
+        return {}
+    if split.demand_p is None or split.demand_q is None or split.supply_p is None or split.supply_q is None:
+        raise RuntimeError(
+            "USE_NODE_SUPPLY_DEMAND requires split.demand_*/supply_* tensors; rebuild split cache "
+            f"(CACHE_VERSION={CACHE_VERSION})."
+        )
+    index = torch.as_tensor(chosen, dtype=torch.long)
+    if device.type == "cuda":
+        rows = torch.stack(
+            (
+                split.demand_p[index],
+                split.demand_q[index],
+                split.supply_p[index],
+                split.supply_q[index],
+            )
+        )
+        demand_p, demand_q, supply_p, supply_q = host_to_device(rows, device).unbind(0)
+    else:
+        demand_p = split.demand_p[index].to(device, non_blocking=True)
+        demand_q = split.demand_q[index].to(device, non_blocking=True)
+        supply_p = split.supply_p[index].to(device, non_blocking=True)
+        supply_q = split.supply_q[index].to(device, non_blocking=True)
+    return {
+        "demand_p": demand_p,
+        "demand_q": demand_q,
+        "supply_p": supply_p,
+        "supply_q": supply_q,
+    }
 
 
 class TPGT(nn.Module):
@@ -1882,10 +1961,12 @@ class TPGT(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        node_in = NODE_FEATURE_DIM if USE_NODE_SHUNT else NODE_SPECIFIED_DIM
-        # v9: (P,Q,V,θ,Bs) for all types. Else: packed specified (2). No ground node.
+        use_rich_nodes = USE_NODE_SHUNT or USE_NODE_SUPPLY_DEMAND
+        node_in = NODE_FEATURE_DIM if use_rich_nodes else NODE_SPECIFIED_DIM
+        # v9: (P,Q,V,θ,Bs). v19: (Pd,Qd,Ps,Qs,V,θ,Bs). Else: packed specified (2).
         self.encoders = nn.ModuleList(MLP(node_in, D) for _ in range(3))
         self.use_node_shunt = USE_NODE_SHUNT
+        self.use_node_supply_demand = USE_NODE_SUPPLY_DEMAND
         self.attention_kind = ATTENTION_KIND
         # v10/v11/v11e/v12 consume raw RPE path; GRIT still uses a learned pair encoder.
         self.use_raw_rpe = ATTENTION_KIND in RAW_RPE_ATTENTION_KINDS
@@ -1948,11 +2029,16 @@ class TPGT(nn.Module):
         component: torch.Tensor | None = None,
         wire_rho: torch.Tensor | None = None,
         pair_elec: torch.Tensor | None = None,
+        demand_p: torch.Tensor | None = None,
+        demand_q: torch.Tensor | None = None,
+        supply_p: torch.Tensor | None = None,
+        supply_q: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """``types`` (N,) with ``pair_type_masks`` (9, N, N), or per case (B, N) with (B, 9, N, N).
 
         ``layout`` (precomputed by ``move_to`` / ``PassBatch``) replaces ``types`` and the masks.
         ``shunt_b`` is bus-shunt ``BS`` (N,) or (B, N); required for v9 node features.
+        ``demand_p/q``, ``supply_p/q`` (B, N) required when ``use_node_supply_demand`` (v19).
         ``hop_id`` / ``edge_id`` (or precomputed ``grpe``) required for ``grpe`` / ``grpe_elec``.
         Exphormer needs ``exph_allow`` / ``exph_tau`` / ``exph_n_virt``.
         EFLA needs ``elec_a`` and ``component``.
@@ -1983,10 +2069,18 @@ class TPGT(nn.Module):
             dtype=act_dtype,
         )
         unknown = flat_start(specified, layout)
-        if self.use_node_shunt:
+        if self.use_node_shunt or self.use_node_supply_demand:
             if shunt_b is None:
                 shunt_b = specified.new_zeros(specified.shape[:2])
-            node_feats = node_encoder_features(specified, layout, shunt_b).to(dtype=act_dtype)
+            node_feats = node_encoder_features(
+                specified,
+                layout,
+                shunt_b,
+                demand_p=demand_p,
+                demand_q=demand_q,
+                supply_p=supply_p,
+                supply_q=supply_q,
+            ).to(dtype=act_dtype)
         else:
             node_feats = specified
         for type_id, encoder in enumerate(self.encoders):
@@ -2391,6 +2485,7 @@ def eval_batch_with_pair(
     rotary_kwargs = pair_rotary_forward_kwargs(network)
     if pair_elec is not None:
         rotary_kwargs = {**rotary_kwargs, "pair_elec": pair_elec}
+    sd_kwargs = case_supply_demand_kwargs(split, chosen, device)
     with torch.no_grad():
         prediction, residuals = model(
             specified,
@@ -2406,6 +2501,7 @@ def eval_batch_with_pair(
             **efla_forward_kwargs(network),
             **wire_forward_kwargs(network),
             **rotary_kwargs,
+            **sd_kwargs,
         )
         breakdown = task_loss(prediction, target, residuals, network.types)
         final_pbl = pbl_stats(residuals[-1])
@@ -2418,7 +2514,7 @@ def eval_batch_with_pair(
 
 def type_encoder_input_weight_norms(model: TPGT) -> list[dict[str, float]]:
     """L2 norm of each node-feature column on the first Linear layer (PQ/PV/slack encoders)."""
-    if not model.use_node_shunt:
+    if not (model.use_node_shunt or model.use_node_supply_demand):
         return []
     names = NODE_ENCODER_FEATURE_NAMES
     rows: list[dict[str, float]] = []
@@ -2961,6 +3057,7 @@ def collect_forward_diagnostics(
             **efla_forward_kwargs(network),
             **wire_forward_kwargs(network),
             **pair_rotary_forward_kwargs(network),
+            **case_supply_demand_kwargs(split, chosen, device),
         )
         breakdown = task_loss(prediction, target, residuals, types)
         stage_pbl = [pbl_stats(r) for r in residuals]
@@ -3204,6 +3301,7 @@ def audit_residual_correctness(
             **efla_forward_kwargs(network),
             **wire_forward_kwargs(network),
             **pair_rotary_forward_kwargs(network),
+            **case_supply_demand_kwargs(split, chosen, device),
         )
         recomputed = nodal_residual(specified, prediction, types, ybus)
         scale = float(residuals[-1].abs().max().clamp(min=1.0))
@@ -3876,6 +3974,11 @@ def debug_sample_index(split: Split, network_id: int = 0, count: int = 32) -> np
 def subset_split(split: Split, index: np.ndarray, name: str) -> Split:
     """Rows ``index`` of ``split``; keeps the full network list so network ids stay valid."""
     chosen = torch.as_tensor(np.asarray(index, dtype=np.int64))
+
+    def _take(attr: str) -> torch.Tensor | None:
+        value = getattr(split, attr)
+        return None if value is None else value[chosen]
+
     return Split(
         name=name,
         count=int(chosen.numel()),
@@ -3885,6 +3988,10 @@ def subset_split(split: Split, index: np.ndarray, name: str) -> Split:
         angle=split.angle[chosen],
         network_index=split.network_index[chosen],
         networks=split.networks,
+        demand_p=_take("demand_p"),
+        demand_q=_take("demand_q"),
+        supply_p=_take("supply_p"),
+        supply_q=_take("supply_q"),
     )
 
 
@@ -4165,6 +4272,11 @@ class Split:
     angle: torch.Tensor
     network_index: torch.Tensor
     networks: list[Network]
+    # Parquet demand/supply in p.u. (always filled from cache v16+; used by v19 encoders).
+    demand_p: torch.Tensor | None = None
+    demand_q: torch.Tensor | None = None
+    supply_p: torch.Tensor | None = None
+    supply_q: torch.Tensor | None = None
 
 
 def _effective_impedance_matrix(laplacian: np.ndarray) -> np.ndarray:
@@ -5264,10 +5376,25 @@ def apply_rpe_channel_config(channels: str) -> None:
     RPE_DIM = len(RPE_FEATURE_NAMES)
 
 
+def refresh_node_feature_config() -> None:
+    """Set ``NODE_FEATURE_DIM`` / ``NODE_ENCODER_FEATURE_NAMES`` from shunt + supply/demand flags."""
+    global NODE_FEATURE_DIM, NODE_ENCODER_FEATURE_NAMES
+    if USE_NODE_SUPPLY_DEMAND:
+        NODE_ENCODER_FEATURE_NAMES = ("Pd", "Qd", "Ps", "Qs", "V", "theta", "busBS")
+        NODE_FEATURE_DIM = NODE_SUPPLY_DEMAND_DIM + 2 + NODE_SHUNT_B_DIM  # 7
+    elif USE_NODE_SHUNT:
+        NODE_ENCODER_FEATURE_NAMES = ("P", "Q", "V", "theta", "busBS")
+        NODE_FEATURE_DIM = NODE_PQVT_DIM + NODE_SHUNT_B_DIM  # 5
+    else:
+        NODE_ENCODER_FEATURE_NAMES = ("spec0", "spec1")
+        NODE_FEATURE_DIM = NODE_SPECIFIED_DIM
+
+
 def apply_architecture_config() -> str:
     """Apply ``ARCH_PRESETS`` / per-dim env overrides. Same residual, packing, and loss logic."""
     global D, D_E, D_A, HEADS, DEPTH, RUN_TAG, RUN_DIR_NAME, CHECKPOINT_VERSION
-    global USE_NODE_SHUNT, ATTENTION_KIND, ATTENTION_MLP_HIDDENS, GRPE_MAX_HOP, EXPHORMER_DENSE, EXPHORMER_D_EXP
+    global USE_NODE_SHUNT, USE_NODE_SUPPLY_DEMAND, ATTENTION_KIND, ATTENTION_MLP_HIDDENS
+    global GRPE_MAX_HOP, EXPHORMER_DENSE, EXPHORMER_D_EXP
     name = parse_arch_name()
     if name:
         if name not in ARCH_PRESETS:
@@ -5282,6 +5409,7 @@ def apply_architecture_config() -> str:
         RUN_TAG = str(preset["RUN_TAG"])
         CHECKPOINT_VERSION = str(preset["CHECKPOINT_VERSION"])
         USE_NODE_SHUNT = bool(preset.get("USE_NODE_SHUNT", False))
+        USE_NODE_SUPPLY_DEMAND = bool(preset.get("USE_NODE_SUPPLY_DEMAND", False))
         ATTENTION_KIND = str(preset.get("ATTENTION_KIND", "grit"))
         ATTENTION_MLP_HIDDENS = _parse_mlp_hiddens(
             preset.get("ATTENTION_MLP_HIDDENS", ATTENTION_MLP_HIDDENS)
@@ -5317,6 +5445,11 @@ def apply_architecture_config() -> str:
         USE_NODE_SHUNT = True
     elif shunt_override in ("0", "false", "no"):
         USE_NODE_SHUNT = False
+    sd_override = os.environ.get("GENCO_TPGT_NODE_SUPPLY_DEMAND", "").strip().lower()
+    if sd_override in ("1", "true", "yes"):
+        USE_NODE_SUPPLY_DEMAND = True
+    elif sd_override in ("0", "false", "no"):
+        USE_NODE_SUPPLY_DEMAND = False
     attn_override = os.environ.get("GENCO_TPGT_ATTENTION", "").strip().lower()
     if attn_override:
         ATTENTION_KIND = attn_override
@@ -5373,13 +5506,22 @@ def apply_architecture_config() -> str:
             f"invalid architecture dims D={D} D_E={D_E} D_A={D_A} HEADS={HEADS} "
             f"DEPTH={DEPTH} ATTENTION_MLP_HIDDENS={ATTENTION_MLP_HIDDENS}"
         )
+    if USE_NODE_SUPPLY_DEMAND and not USE_NODE_SHUNT:
+        # Supply/demand features include busBS; keep shunt channel enabled.
+        USE_NODE_SHUNT = True
+    refresh_node_feature_config()
     apply_case_config()
     return name
 
 
 def architecture_summary() -> str:
-    node_in = NODE_FEATURE_DIM if USE_NODE_SHUNT else NODE_SPECIFIED_DIM
-    node_txt = "P,Q,V,θ,busBS" if USE_NODE_SHUNT else "spec"
+    node_in = NODE_FEATURE_DIM if (USE_NODE_SHUNT or USE_NODE_SUPPLY_DEMAND) else NODE_SPECIFIED_DIM
+    if USE_NODE_SUPPLY_DEMAND:
+        node_txt = "Pd,Qd,Ps,Qs,V,θ,busBS"
+    elif USE_NODE_SHUNT:
+        node_txt = "P,Q,V,θ,busBS"
+    else:
+        node_txt = "spec"
     case_txt = f" case={CASE_NAME}" if CASE_NAME != "case118" else ""
     h1, h2 = ATTENTION_MLP_HIDDENS
     score_in = 2 * D_A + RPE_DIM
@@ -5638,6 +5780,12 @@ def merge_many(
     for position, split in enumerate(splits):
         network_map = np.array([place(network, position > 0) for network in split.networks], dtype=np.int64)
         mapped_index.append(torch.from_numpy(network_map[split.network_index.numpy()]))
+    def _cat_optional(attr: str) -> torch.Tensor | None:
+        parts = [getattr(split, attr) for split in splits]
+        if any(part is None for part in parts):
+            return None
+        return torch.cat(parts)  # type: ignore[arg-type]
+
     return Split(
         name=splits[0].name if name is None else name,
         count=sum(split.count for split in splits),
@@ -5647,6 +5795,10 @@ def merge_many(
         angle=torch.cat([split.angle for split in splits]),
         network_index=torch.cat(mapped_index),
         networks=merged_networks,
+        demand_p=_cat_optional("demand_p"),
+        demand_q=_cat_optional("demand_q"),
+        supply_p=_cat_optional("supply_p"),
+        supply_q=_cat_optional("supply_q"),
     )
 
 
@@ -5800,8 +5952,16 @@ def read_split(
     type_code[ref_flag > 0.5] = 2
     if np.any((pq_flag > 0.5) & (pv_flag > 0.5)) or np.any((type_code == 0) & (pq_flag <= 0.5)):
         raise RuntimeError(f"{name} has a bus that is not exactly one of PQ, PV, or slack.")
-    power_p = (_blocks(bus.column("Pg").to_numpy(), bus_count) - _blocks(bus.column("Pd").to_numpy(), bus_count)) / BASE_MVA
-    power_q = (_blocks(bus.column("Qg").to_numpy(), bus_count) - _blocks(bus.column("Qd").to_numpy(), bus_count)) / BASE_MVA
+    pd_mw = _blocks(bus.column("Pd").to_numpy(), bus_count)
+    qd_mw = _blocks(bus.column("Qd").to_numpy(), bus_count)
+    pg_mw = _blocks(bus.column("Pg").to_numpy(), bus_count)
+    qg_mw = _blocks(bus.column("Qg").to_numpy(), bus_count)
+    demand_p = pd_mw / BASE_MVA
+    demand_q = qd_mw / BASE_MVA
+    supply_p = pg_mw / BASE_MVA
+    supply_q = qg_mw / BASE_MVA
+    power_p = (pg_mw - pd_mw) / BASE_MVA
+    power_q = (qg_mw - qd_mw) / BASE_MVA
     voltage = _blocks(bus.column("Vm").to_numpy(), bus_count)
     angle = np.deg2rad(_blocks(bus.column("Va").to_numpy(), bus_count))
     # Parquet ``BS`` is already p.u. bus-shunt susceptance (device only).
@@ -5896,6 +6056,10 @@ def read_split(
         angle=torch.from_numpy(angle.astype(np.float32)),
         network_index=torch.from_numpy(network_ids.astype(np.int64)),
         networks=networks,
+        demand_p=torch.from_numpy(demand_p.astype(np.float32)),
+        demand_q=torch.from_numpy(demand_q.astype(np.float32)),
+        supply_p=torch.from_numpy(supply_p.astype(np.float32)),
+        supply_q=torch.from_numpy(supply_q.astype(np.float32)),
     )
 
 
@@ -7038,6 +7202,7 @@ def forward_cases(
         shunt_b = network_shunt_b(network)
     if hop_id is None or edge_id is None:
         hop_id, edge_id = ensure_network_grpe_ids(network)
+    sd_kwargs = case_supply_demand_kwargs(split, chosen, device)
     prediction, residuals = model(
         specified,
         layout.types,
@@ -7053,6 +7218,7 @@ def forward_cases(
         **efla_forward_kwargs(network),
         **wire_forward_kwargs(network),
         **pair_rotary_forward_kwargs(network),
+        **sd_kwargs,
     )
     return prediction, target, residuals
 

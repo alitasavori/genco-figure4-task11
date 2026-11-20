@@ -81,8 +81,11 @@ def test_bus_shunt_b_row_sum_includes_charging_unlike_device_bs():
 
 def test_v9_node_features_are_pqvt_plus_device_bs():
     previous = tpgt.USE_NODE_SHUNT
+    previous_sd = tpgt.USE_NODE_SUPPLY_DEMAND
     try:
+        tpgt.USE_NODE_SUPPLY_DEMAND = False
         tpgt.USE_NODE_SHUNT = True
+        tpgt.refresh_node_feature_config()
         model = TPGT()
         assert model.encoders[0].net[0].in_features == 5
         assert model.encoders[1].net[0].in_features == 5
@@ -99,6 +102,51 @@ def test_v9_node_features_are_pqvt_plus_device_bs():
         assert torch.allclose(feats[0, 2], torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0]))
     finally:
         tpgt.USE_NODE_SHUNT = previous
+        tpgt.USE_NODE_SUPPLY_DEMAND = previous_sd
+        tpgt.refresh_node_feature_config()
+
+
+def test_v19_node_features_are_supply_demand_plus_v_theta_bs():
+    previous = tpgt.USE_NODE_SHUNT
+    previous_sd = tpgt.USE_NODE_SUPPLY_DEMAND
+    try:
+        tpgt.USE_NODE_SHUNT = True
+        tpgt.USE_NODE_SUPPLY_DEMAND = True
+        tpgt.refresh_node_feature_config()
+        assert tpgt.NODE_FEATURE_DIM == 7
+        assert tpgt.NODE_ENCODER_FEATURE_NAMES == ("Pd", "Qd", "Ps", "Qs", "V", "theta", "busBS")
+        model = TPGT()
+        assert model.use_node_supply_demand is True
+        assert model.encoders[0].net[0].in_features == 7
+        types = torch.tensor([0, 1, 2])
+        # PQ specified (P,Q)=(0.1,0.2); PV (P,V)=(0.3,1.0); Slack (V,θ)=(1.05,0.0)
+        specified = torch.tensor([[[0.1, 0.2], [0.3, 1.0], [1.05, 0.0]]])
+        device_bs = torch.tensor([-0.4, 0.14, 0.0])
+        demand_p = torch.tensor([[0.5, 0.0, 0.2]])
+        demand_q = torch.tensor([[0.1, 0.0, 0.05]])
+        supply_p = torch.tensor([[0.0, 0.3, 1.1]])
+        supply_q = torch.tensor([[0.0, 0.0, 0.4]])
+        layout = tpgt.shared_layout(types, tpgt.type_pair_masks(types, torch.zeros(3, dtype=torch.long)))
+        feats = node_encoder_features(
+            specified,
+            layout,
+            device_bs,
+            demand_p=demand_p,
+            demand_q=demand_q,
+            supply_p=supply_p,
+            supply_q=supply_q,
+        )
+        assert feats.shape == (1, 3, 7)
+        # PQ: Pd,Qd,Ps,Qs,V=1 (flat),θ=0,Bs
+        assert torch.allclose(feats[0, 0], torch.tensor([0.5, 0.1, 0.0, 0.0, 1.0, 0.0, -0.4]))
+        # PV: V from specified slot1
+        assert torch.allclose(feats[0, 1], torch.tensor([0.0, 0.0, 0.3, 0.0, 1.0, 0.0, 0.14]))
+        # Slack: V,θ from specified
+        assert torch.allclose(feats[0, 2], torch.tensor([0.2, 0.05, 1.1, 0.4, 1.05, 0.0, 0.0]))
+    finally:
+        tpgt.USE_NODE_SHUNT = previous
+        tpgt.USE_NODE_SUPPLY_DEMAND = previous_sd
+        tpgt.refresh_node_feature_config()
 
 
 def test_pair_encoder_weight_norms():

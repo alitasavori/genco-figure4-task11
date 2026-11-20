@@ -80,7 +80,11 @@ def main() -> None:
     ln = 2 * t.D
     per_stage = attn + update + decode + ln
 
-    node_in = t.NODE_FEATURE_DIM if t.USE_NODE_SHUNT else t.NODE_SPECIFIED_DIM
+    node_in = (
+        t.NODE_FEATURE_DIM
+        if (t.USE_NODE_SHUNT or getattr(t, "USE_NODE_SUPPLY_DEMAND", False))
+        else t.NODE_SPECIFIED_DIM
+    )
     enc_one = mlp_params(node_in, t.D)
     pe_one = 0 if t.ATTENTION_KIND in t.RAW_RPE_ATTENTION_KINDS else mlp_params(t.RPE_DIM, t.D_E)
     grpe_shared = shared_grpe_params() if t.ATTENTION_KIND in t.GRPE_ATTENTION_KINDS else 0
