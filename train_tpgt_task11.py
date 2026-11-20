@@ -61,7 +61,8 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
   ``o=Σ α (v+P^V+E^V)``. Softmax and type-pair blocks are unchanged. Angle step
   uses ``η_angle=1``.
 * **RPE**: legacy ``Zeff_Re_norm`` + ``Zeff_Im_norm`` (v7–v16 / v19/v20);
-  **v17** adds generator-set-grounded support channels (6-ch ``re_im_gen``);
+  **v17** adds generator-set-grounded support channels (6-ch ``re_im_gen``;
+  ``Cii``/``Cjj`` for any PQ endpoint, ``Cij``/``ρ`` PQ–PQ only; one shared encoder);
   **v17im** is Im-only Zeff.
 * **Node features**: v9–v16 ``(P,Q,V,θ,busBS)`` with net ``P=Ps−Pd``; **v19/v20** keep PQ
   at 5-D ``(P,Q,V,θ,busBS)`` and give PV/Slack ``(Pd,Qd,Ps,Qs,V,θ,busBS)``.
@@ -107,7 +108,7 @@ Performance notes (Colab / large train split)
   formulation restricted to those buses).
   Optional ``GENCO_TPGT_COMPILE=1`` or ``--compile`` wraps the model in
   ``torch.compile`` (may differ slightly in numerics).
-* **Batch / micro-batch**: Optimizer steps use ``BATCH_SIZE`` cases (default 32).
+* **Batch / micro-batch**: Optimizer steps use ``BATCH_SIZE`` cases (default 128).
   Default **micro-batch** matches that (one forward/backward per step when memory
   allows). Override with ``GENCO_TPGT_BATCH`` / ``--batch`` and
   ``GENCO_TPGT_MICRO_BATCH`` / ``--micro-batch`` (e.g. both 64 on an L4).
@@ -210,7 +211,7 @@ D_A = 24
 HEADS = 2
 DEPTH = 4
 ETA = 1.0
-BATCH_SIZE = 32
+BATCH_SIZE = 128
 # Adam start LR (override with GENCO_TPGT_LR / --lr). Lowered from GENCO's 5e-4 for
 # deeper TPGT stacks (DEPTH 8–12) where 5e-4 caused mid-run val_pbl cliffs.
 # Grad clip caps single-batch explosions. Early stop still on val PBL.
@@ -476,6 +477,8 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "RPE_CHANNELS": "re_im",
     },
     # v16 GRIT + generator-set-grounded support RPE (6-ch: Zeff Re/Im + Cii/Cjj/Cij/ρ).
+    # Cii/Cjj whenever the corresponding endpoint is PQ; Cij/ρ only for PQ–PQ.
+    # One shared pair encoder (6→96→96→48); nine type-pair GRIT params unchanged.
     # No pair update, no supply/demand features — same packing/residual as v16.
     "v17": {
         "D": 96,
@@ -630,7 +633,7 @@ EXPECTED_COUNTS = {
 # Fraction of each split folder to load (first scenarios). 1.0 = full PFΔ split.
 DATA_FRACTION = 1.0
 # Forward/backward chunk size during training (gradient accumulation to BATCH_SIZE).
-MICRO_BATCH_SIZE = 32
+MICRO_BATCH_SIZE = 128
 # Validation/test forward-only batches (no backward); can exceed BATCH_SIZE when memory allows.
 EVAL_BATCH_SIZE = 64
 # Run validation PBL every N epochs (1 = each epoch, used for best checkpoint).
@@ -5252,6 +5255,10 @@ def meshed_rpe(
     Legacy (``RPE_CHANNELS=re_im``): normalized Re and Im (2 channels).
     Im-only (``RPE_CHANNELS=im`` / ``v17im``): Im only (1 channel).
     Gen-support (``RPE_CHANNELS=re_im_gen`` / ``v17``): Re/Im plus ``Cii,Cjj,Cij,ρ`` (6).
+    ``Cii`` / ``Cjj`` are present whenever the corresponding endpoint is PQ (mixed
+    PQ↔PV/Slack pairs included); ``Cij`` / ``ρ`` only for PQ–PQ. Zeff Re/Im stay on
+    all same-component off-diagonal pairs. One shared ``pair_encoder`` maps the 6-ch
+    vector; type-pair GRIT specialization is unchanged.
 
     Branch admittance ``y_ij = 1/(r_ij + j x_ij)`` on **off-diagonals only** (parallel
     branches add); diagonal entries stay zero until the Laplacian step. This is a
@@ -5310,7 +5317,11 @@ def meshed_rpe(
             raise ValueError("meshed_rpe re_im_gen requires bus types for generator grounding")
         features[..., 0] = re
         features[..., 1] = im
-        c_full = generator_grounded_support_matrix(bus_count, branches, types)
+        type_np = np.asarray(types, dtype=np.int64).reshape(-1)
+        if type_np.size != bus_count:
+            raise ValueError(f"types length {type_np.size} != bus_count {bus_count}")
+        pq = type_np == 0
+        c_full = generator_grounded_support_matrix(bus_count, branches, type_np)
         if c_scale is None:
             peak = float(np.max(np.abs(c_full))) if c_full.size else 0.0
             c_div = max(1.0, peak)
@@ -5318,10 +5329,14 @@ def meshed_rpe(
             c_div = float(c_scale)
         c_norm = (c_full / c_div).astype(np.float32)
         diag = np.diag(c_norm).astype(np.float32)
-        features[..., 2] = diag[:, None]
-        features[..., 3] = diag[None, :]
-        features[..., 4] = c_norm
-        features[..., 5] = generator_support_rho(c_full).astype(np.float32)
+        # 1_{i∈PQ} C_ii/s_C for any sender j; 1_{j∈PQ} C_jj/s_C for any receiver i.
+        features[..., 2] = np.where(pq[:, None], diag[:, None], 0.0).astype(np.float32)
+        features[..., 3] = np.where(pq[None, :], diag[None, :], 0.0).astype(np.float32)
+        # C_ij and ρ only when both endpoints are PQ.
+        both_pq = pq[:, None] & pq[None, :]
+        features[..., 4] = np.where(both_pq, c_norm, 0.0).astype(np.float32)
+        rho = generator_support_rho(c_full).astype(np.float32)
+        features[..., 5] = np.where(both_pq, rho, 0.0).astype(np.float32)
     else:
         raise RuntimeError(
             f"meshed_rpe cannot map Zeff into RPE_FEATURE_NAMES={RPE_FEATURE_NAMES} RPE_DIM={RPE_DIM}"

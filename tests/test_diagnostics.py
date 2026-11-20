@@ -68,11 +68,15 @@ def test_rpe_is_zeff_re_im():
 
 
 def test_v17_generator_grounded_support_rpe():
-    """Radial PV→i→j: C = [[Xg, Xg], [Xg, Xg+xij]] on the PQ block; 6-ch RPE."""
+    """Radial PV→i→j: C on PQ block; Cii/Cjj on mixed pairs; one shared 6→D_E encoder."""
     previous_names = tpgt.RPE_FEATURE_NAMES
     previous_dim = tpgt.RPE_DIM
+    previous_d = tpgt.D
+    previous_de = tpgt.D_E
     try:
         tpgt.apply_rpe_channel_config("re_im_gen")
+        tpgt.D = 96
+        tpgt.D_E = 48
         assert tpgt.RPE_DIM == 6
         assert tpgt.uses_generator_support_rpe()
         xg, xij = 0.2, 0.5
@@ -85,18 +89,33 @@ def test_v17_generator_grounded_support_rpe():
         ybus = np.zeros((3, 3), dtype=np.complex64)
         features, _ = meshed_rpe(3, branches, ybus, types=types, c_scale=1.0)
         assert features.shape == (3, 3, 6)
-        # Pair (1,2): Cii=Xg, Cjj=Xg+xij, Cij=Xg, rho=Xg/sqrt(Xg*(Xg+xij))
+        # PQ–PQ (1,2): all four gen-support channels.
         assert np.isclose(features[1, 2, 2], xg)
         assert np.isclose(features[1, 2, 3], xg + xij)
         assert np.isclose(features[1, 2, 4], xg)
         rho = xg / np.sqrt(xg * (xg + xij))
         assert np.isclose(features[1, 2, 5], rho, atol=1e-5)
+        # PQ→PV (1,0): Cii only; Cjj/Cij/ρ zero.
+        assert np.isclose(features[1, 0, 2], xg)
+        assert np.allclose(features[1, 0, 3:], 0.0)
+        # PV→PQ (0,1): Cjj only.
+        assert np.isclose(features[0, 1, 3], xg)
+        assert np.isclose(features[0, 1, 2], 0.0)
+        assert np.allclose(features[0, 1, 4:], 0.0)
+        # PV–PV: all gen-support channels zero.
+        assert np.allclose(features[0, 0, 2:], 0.0)
         model = TPGT()
+        # One shared encoder 6→96→96→48 (not nine type-pair encoders).
+        assert isinstance(model.pair_encoder, tpgt.MLP)
         assert model.pair_encoder.net[0].in_features == 6
-        assert model.pair_encoder.net[-1].out_features == tpgt.D_E
+        assert model.pair_encoder.net[0].out_features == 96
+        assert model.pair_encoder.net[2].out_features == 96
+        assert model.pair_encoder.net[-1].out_features == 48
     finally:
         tpgt.RPE_FEATURE_NAMES = previous_names
         tpgt.RPE_DIM = previous_dim
+        tpgt.D = previous_d
+        tpgt.D_E = previous_de
 
 
 def test_bus_shunt_b_row_sum_includes_charging_unlike_device_bs():
