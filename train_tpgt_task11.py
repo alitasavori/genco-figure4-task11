@@ -33,6 +33,8 @@ choices so a Colab GPU can finish a run. They are not paper hyperparameters.
 
 IEEE 118 is meshed, so pair features use the full in-service topology:
 complex effective impedance (legacy Re/Im, or Im-only from v17). See `meshed_rpe`.
+Branch ``(r,x)`` fed to Zeff are **tap-aware** (PowerModels π off-diagonal match);
+raw nameplate ``r,x`` are scaled by tap/shift when present, else inferred from Ybus.
 
 Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
 ------------------------------------------------------------------------
@@ -61,8 +63,9 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
 * **RPE**: legacy ``Zeff_Re_norm`` + ``Zeff_Im_norm`` (v7–v16 / v19); **v17+ Im-only**
   ``Zeff_Im_norm`` (Real Zeff dropped after ablation showed near-zero dependence),
   except ``v19`` keeps Re+Im like v16.
-* **Node features**: v9–v16 ``(P,Q,V,θ,busBS)`` with net ``P=Ps−Pd``; **v19** splits
-  demand/supply as ``(Pd,Qd,Ps,Qs,V,θ,busBS)`` (packing + AC residual still use net ``P,Q``).
+* **Node features**: v9–v16 ``(P,Q,V,θ,busBS)`` with net ``P=Ps−Pd``; **v19** keeps PQ
+  at 5-D ``(P,Q,V,θ,busBS)`` and gives PV/Slack ``(Pd,Qd,Ps,Qs,V,θ,busBS)``
+  (packing + AC residual still use net ``P,Q``).
 * **RPE channel dropout**: during training each channel is zeroed with
   probability ``RPE_CHANNEL_DROPOUT`` per optimizer step; never at eval.
 * **Versioned run folder**: checkpoints go to ``Foundation Model/tpgt_task11_<RUN_TAG>``
@@ -227,7 +230,7 @@ LAMBDA_PHYS = 0.5
 PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
-CACHE_VERSION = "tpgt-cache-16"
+CACHE_VERSION = "tpgt-cache-17"
 # Default / legacy (v7–v16): Re+Im. New arches (v17+) use Im-only via ``RPE_CHANNELS=im``.
 RPE_FEATURE_NAMES_RE_IM = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_FEATURE_NAMES_IM = ("Zeff_Im_norm",)
@@ -247,16 +250,18 @@ RUN_TAG = "v7"
 CASE_NAME = "case118"
 RUN_DIR_NAME = f"tpgt_task11_{RUN_TAG}"
 # Residual/state packing stays 2 known slots per type (net P=Ps−Pd, Q=Qs−Qd).
-# v9 node encoders: (P, Q, V, θ, Bs). v19: split injections into demand/supply
-# (Pd, Qd, Ps, Qs, V, θ, Bs). Physics residual still uses net P/Q.
+# v9 node encoders: (P, Q, V, θ, Bs) for all types.
+# v19: PQ stays (P,Q,V,θ,Bs); PV/Slack use (Pd,Qd,Ps,Qs,V,θ,Bs). Physics still net P/Q.
 NODE_SPECIFIED_DIM = 2
 NODE_PQVT_DIM = 4
 NODE_SUPPLY_DEMAND_DIM = 4  # Pd, Qd, Ps, Qs
 NODE_SHUNT_B_DIM = 1
-NODE_FEATURE_DIM = NODE_PQVT_DIM + NODE_SHUNT_B_DIM  # 5 = (P,Q,V,θ,Bs) unless supply/demand
+NODE_FEATURE_DIM = NODE_PQVT_DIM + NODE_SHUNT_B_DIM  # 5 = (P,Q,V,θ,Bs) for PQ / legacy
+NODE_FEATURE_DIM_PV_SLACK = NODE_SUPPLY_DEMAND_DIM + 2 + NODE_SHUNT_B_DIM  # 7
 NODE_ENCODER_FEATURE_NAMES = ("P", "Q", "V", "theta", "busBS")
+NODE_ENCODER_FEATURE_NAMES_PV_SLACK = ("Pd", "Qd", "Ps", "Qs", "V", "theta", "busBS")
 USE_NODE_SHUNT = False
-# When True (v19): node encoders see (Pd,Qd,Ps,Qs,V,θ,busBS); packing/residual unchanged.
+# When True (v19): PV/Slack encoders get supply/demand channels; PQ stays 5-D.
 USE_NODE_SUPPLY_DEMAND = False
 # ``grit``: ReLU(ρ(W_Q^{t_i←t_j} h_i + W_K^{t_i←t_j} h_j) ⊙ W_Ew e_ij + W_Eb e_ij) then linear score.
 # ``joint_mlp``: q_{i|t_j}=W_Q^{t_i←t_j} h_i, k_{j|t_i}=W_K^{t_i←t_j} h_j;
@@ -482,7 +487,7 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "ATTENTION_KIND": "jsgc",
         "RPE_CHANNELS": "im",
     },
-    # v16 GRIT/capacity/RPE, but node encoders see demand/supply separately (Pd,Qd,Ps,Qs).
+    # v16 GRIT/capacity/RPE; PQ stays (P,Q,V,θ,Bs); PV/Slack get (Pd,Qd,Ps,Qs,V,θ,Bs).
     # Packing + AC residual still use net P=Ps−Pd, Q=Qs−Qd. Folder ``tpgt_task11_*_v19``.
     "v19": {
         "D": 96,
@@ -491,7 +496,7 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "HEADS": 4,
         "DEPTH": 12,
         "RUN_TAG": "v19",
-        "CHECKPOINT_VERSION": "meshed-rpe-2-d12-w96-h4-pdqdpsqs-busBS-v19",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d12-w96-h4-pq5-pvslack7-busBS-v19",
         "USE_NODE_SHUNT": True,
         "USE_NODE_SUPPLY_DEMAND": True,
         "ATTENTION_KIND": "grit",
@@ -1881,6 +1886,13 @@ def network_shunt_b(network: Network) -> torch.Tensor:
     return shunt
 
 
+def _expand_bus_channel(values: torch.Tensor, batch: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    out = values.to(device=device, dtype=dtype)
+    if out.dim() == 1:
+        out = out.unsqueeze(0).expand(batch, -1)
+    return out
+
+
 def node_encoder_features(
     specified: torch.Tensor,
     layout: TypeLayout,
@@ -1890,31 +1902,27 @@ def node_encoder_features(
     demand_q: torch.Tensor | None = None,
     supply_p: torch.Tensor | None = None,
     supply_q: torch.Tensor | None = None,
+    type_id: int | None = None,
 ) -> torch.Tensor:
-    """Node features for type encoders.
+    """Node features for type encoders (full bus tensor ``(B, N, F)``).
 
     Default (v9–v16): ``(P, Q, V, θ, B_s)`` with net injections from ``assemble``.
-    Supply/demand (v19): ``(Pd, Qd, Ps, Qs, V, θ, B_s)`` from parquet channels; ``V,θ`` still
-    from ``assemble`` + ``flat_start`` (PQ ``V=1`` pu, other free slots 0).
+    v19 supply/demand: PQ (``type_id=0`` or ``None`` with flag off) stays 5-D net
+    ``(P,Q,V,θ,Bs)``; PV/Slack (``type_id`` 1 or 2) use
+    ``(Pd,Qd,Ps,Qs,V,θ,Bs)``. ``V,θ`` from ``assemble`` + ``flat_start``.
 
     ``B_s`` is bus shunt device only (parquet ``BS``). Packing / AC residual stay on net ``P,Q``.
     """
     power_p, power_q, voltage, angle = assemble(specified, flat_start(specified, layout), layout)
-    bs = shunt_b.to(device=specified.device, dtype=specified.dtype)
-    if bs.dim() == 1:
-        bs = bs.unsqueeze(0).expand(specified.shape[0], -1)
-    if USE_NODE_SUPPLY_DEMAND:
+    bs = _expand_bus_channel(shunt_b, specified.shape[0], specified.device, specified.dtype)
+    use_sd = bool(USE_NODE_SUPPLY_DEMAND and type_id in (1, 2))
+    if use_sd:
         if demand_p is None or demand_q is None or supply_p is None or supply_q is None:
             raise ValueError("supply/demand node features require demand_p/q and supply_p/q")
-        pd_ = demand_p.to(device=specified.device, dtype=specified.dtype)
-        qd_ = demand_q.to(device=specified.device, dtype=specified.dtype)
-        ps_ = supply_p.to(device=specified.device, dtype=specified.dtype)
-        qs_ = supply_q.to(device=specified.device, dtype=specified.dtype)
-        if pd_.dim() == 1:
-            pd_ = pd_.unsqueeze(0).expand(specified.shape[0], -1)
-            qd_ = qd_.unsqueeze(0).expand(specified.shape[0], -1)
-            ps_ = ps_.unsqueeze(0).expand(specified.shape[0], -1)
-            qs_ = qs_.unsqueeze(0).expand(specified.shape[0], -1)
+        pd_ = _expand_bus_channel(demand_p, specified.shape[0], specified.device, specified.dtype)
+        qd_ = _expand_bus_channel(demand_q, specified.shape[0], specified.device, specified.dtype)
+        ps_ = _expand_bus_channel(supply_p, specified.shape[0], specified.device, specified.dtype)
+        qs_ = _expand_bus_channel(supply_q, specified.shape[0], specified.device, specified.dtype)
         return torch.stack((pd_, qd_, ps_, qs_, voltage, angle, bs), dim=-1)
     return torch.stack((power_p, power_q, voltage, angle, bs), dim=-1)
 
@@ -1961,10 +1969,19 @@ class TPGT(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        use_rich_nodes = USE_NODE_SHUNT or USE_NODE_SUPPLY_DEMAND
-        node_in = NODE_FEATURE_DIM if use_rich_nodes else NODE_SPECIFIED_DIM
-        # v9: (P,Q,V,θ,Bs). v19: (Pd,Qd,Ps,Qs,V,θ,Bs). Else: packed specified (2).
-        self.encoders = nn.ModuleList(MLP(node_in, D) for _ in range(3))
+        # v9: all types (P,Q,V,θ,Bs). v19: PQ 5-D; PV/Slack 7-D supply/demand. Else: specified (2).
+        if USE_NODE_SUPPLY_DEMAND:
+            self.encoders = nn.ModuleList(
+                (
+                    MLP(NODE_FEATURE_DIM, D),  # PQ: (P,Q,V,θ,Bs)
+                    MLP(NODE_FEATURE_DIM_PV_SLACK, D),  # PV
+                    MLP(NODE_FEATURE_DIM_PV_SLACK, D),  # Slack
+                )
+            )
+        elif USE_NODE_SHUNT:
+            self.encoders = nn.ModuleList(MLP(NODE_FEATURE_DIM, D) for _ in range(3))
+        else:
+            self.encoders = nn.ModuleList(MLP(NODE_SPECIFIED_DIM, D) for _ in range(3))
         self.use_node_shunt = USE_NODE_SHUNT
         self.use_node_supply_demand = USE_NODE_SUPPLY_DEMAND
         self.attention_kind = ATTENTION_KIND
@@ -2069,23 +2086,25 @@ class TPGT(nn.Module):
             dtype=act_dtype,
         )
         unknown = flat_start(specified, layout)
-        if self.use_node_shunt or self.use_node_supply_demand:
-            if shunt_b is None:
-                shunt_b = specified.new_zeros(specified.shape[:2])
-            node_feats = node_encoder_features(
-                specified,
-                layout,
-                shunt_b,
-                demand_p=demand_p,
-                demand_q=demand_q,
-                supply_p=supply_p,
-                supply_q=supply_q,
-            ).to(dtype=act_dtype)
-        else:
-            node_feats = specified
+        if shunt_b is None and (self.use_node_shunt or self.use_node_supply_demand):
+            shunt_b = specified.new_zeros(specified.shape[:2])
         for type_id, encoder in enumerate(self.encoders):
             if not layout.present[type_id]:
                 continue
+            if self.use_node_shunt or self.use_node_supply_demand:
+                assert shunt_b is not None
+                node_feats = node_encoder_features(
+                    specified,
+                    layout,
+                    shunt_b,
+                    demand_p=demand_p,
+                    demand_q=demand_q,
+                    supply_p=supply_p,
+                    supply_q=supply_q,
+                    type_id=type_id,
+                ).to(dtype=act_dtype)
+            else:
+                node_feats = specified
             hidden = write_type(hidden, layout, type_id, encoder(gather_type(node_feats, layout, type_id)))
         z_virt: torch.Tensor | None = None
         if self.attention_kind == "exphormer":
@@ -2516,12 +2535,16 @@ def type_encoder_input_weight_norms(model: TPGT) -> list[dict[str, float]]:
     """L2 norm of each node-feature column on the first Linear layer (PQ/PV/slack encoders)."""
     if not (model.use_node_shunt or model.use_node_supply_demand):
         return []
-    names = NODE_ENCODER_FEATURE_NAMES
     rows: list[dict[str, float]] = []
     for type_id, encoder in enumerate(model.encoders):
         first = encoder.net[0]
         if not isinstance(first, nn.Linear):
             raise TypeError("type encoder first layer must be Linear")
+        names = (
+            NODE_ENCODER_FEATURE_NAMES_PV_SLACK
+            if model.use_node_supply_demand and type_id in (1, 2)
+            else NODE_ENCODER_FEATURE_NAMES
+        )
         norms = torch.linalg.vector_norm(first.weight.detach(), dim=0)
         type_name = TYPE_NAMES[type_id] if type_id < len(TYPE_NAMES) else str(type_id)
         for channel in range(min(int(norms.numel()), len(names))):
@@ -4286,6 +4309,112 @@ def _effective_impedance_matrix(laplacian: np.ndarray) -> np.ndarray:
     return (diagonal[:, None] + diagonal[None, :]) - 2.0 * pseudoinverse
 
 
+def series_rx_for_zeff(
+    resistance: float,
+    reactance: float,
+    tap: float = 1.0,
+    shift: float = 0.0,
+) -> tuple[float, float]:
+    """Undirected series ``(r, x)`` for Zeff so ``y=1/z`` matches ``-0.5*(Y_ft+Y_tf)``.
+
+    PowerModels/MATPOWER π-model (charging stays on the diagonal):
+    ``Y_ft = -y * conj(t_c)/|t|^2``, ``Y_tf = -y * t_c/|t|^2`` with
+    ``t_c = tap * exp(j*shift)``. Hermitian series coupling is
+    ``y * Re(t_c)/|t|^2``, so ``z_eff = z * |t|^2 / Re(t_c)``. For real tap and
+    zero shift this is ``z_eff = z * tap``. Degenerate taps/shifts fall back to
+    the nameplate ``(r, x)``.
+    """
+    z = complex(float(resistance), float(reactance))
+    if abs(z) <= 0.0:
+        return float(resistance), float(reactance)
+    tap_mag = float(tap) if tap else 1.0
+    if tap_mag <= 0.0:
+        tap_mag = 1.0
+    tr = tap_mag * math.cos(float(shift))
+    tt = tap_mag * tap_mag
+    if abs(tr) <= 1e-18:
+        return float(resistance), float(reactance)
+    z_eff = z * (tt / tr)
+    return float(z_eff.real), float(z_eff.imag)
+
+
+def _infer_corridor_taps_from_ybus(
+    branches: list[tuple[int, int, float, float]],
+    ybus: np.ndarray,
+) -> list[float]:
+    """Per-branch tap estimate when parquet has no ``tap`` column (e.g. case57).
+
+    For each undirected corridor, ``tap ≈ Re(sum 1/z_k / Y_sym)`` with
+    ``Y_sym = -0.5*(Y_ij+Y_ji)``. Parallel circuits on the same corridor share one
+    estimate so their tap-scaled admittances sum to ``Y_sym``.
+    """
+    from collections import defaultdict
+
+    groups: dict[frozenset[int], list[int]] = defaultdict(list)
+    y_sum: dict[frozenset[int], complex] = defaultdict(complex)
+    for idx, (origin, destination, resistance, reactance) in enumerate(branches):
+        key = frozenset((int(origin), int(destination)))
+        groups[key].append(idx)
+        z = complex(float(resistance), float(reactance))
+        if abs(z) > 0.0:
+            y_sum[key] += 1.0 / z
+
+    taps = [1.0] * len(branches)
+    for key, indices in groups.items():
+        if len(key) != 2:
+            continue
+        i, j = tuple(key)
+        y_sym = -0.5 * (complex(ybus[i, j]) + complex(ybus[j, i]))
+        total = y_sum[key]
+        if abs(y_sym) <= 1e-18 or abs(total) <= 1e-18:
+            tap_hat = 1.0
+        else:
+            tap_hat = float(np.real(total / y_sym))
+            if not (0.5 <= tap_hat <= 1.5):
+                tap_hat = 1.0
+        for idx in indices:
+            taps[idx] = tap_hat
+    return taps
+
+
+def tap_aware_zeff_branches(
+    branches: list[tuple[int, int, float, float]],
+    *,
+    taps: list[float] | np.ndarray | None = None,
+    shifts: list[float] | np.ndarray | None = None,
+    ybus: np.ndarray | None = None,
+) -> list[tuple[int, int, float, float]]:
+    """Scale nameplate branch ``(r,x)`` by tap/shift for the Zeff Laplacian.
+
+    If ``taps`` is omitted and ``ybus`` is given, infer corridor taps from the
+    Hermitian off-diagonals (legacy case57 parquet without a ``tap`` column).
+    """
+    if not branches:
+        return []
+    if taps is None:
+        if ybus is None:
+            tap_list = [1.0] * len(branches)
+        else:
+            tap_list = _infer_corridor_taps_from_ybus(branches, ybus)
+    else:
+        tap_list = [float(t) if t else 1.0 for t in taps]
+        if len(tap_list) != len(branches):
+            raise ValueError("taps length must match branches")
+    if shifts is None:
+        shift_list = [0.0] * len(branches)
+    else:
+        shift_list = [float(s) for s in shifts]
+        if len(shift_list) != len(branches):
+            raise ValueError("shifts length must match branches")
+    out: list[tuple[int, int, float, float]] = []
+    for (origin, destination, resistance, reactance), tap, shift in zip(
+        branches, tap_list, shift_list, strict=True
+    ):
+        r_eff, x_eff = series_rx_for_zeff(resistance, reactance, tap, shift)
+        out.append((int(origin), int(destination), r_eff, x_eff))
+    return out
+
+
 def _meshed_zeff_and_component(
     bus_count: int,
     branches: list[tuple[int, int, float, float]],
@@ -4700,12 +4829,16 @@ def meshed_rpe(
     Complex Laplacian ``L = diag(W 1) - W``. Then
     ``Z_eff(i,j) = L^†_ii + L^†_jj - 2 L^†_ij``.
 
+    Callers should pass **tap-aware** series ``(r,x)`` from ``tap_aware_zeff_branches``
+    so ``y_ij`` matches the Hermitian π-model off-diagonals (fixed transformer taps).
+
     Normalization: if ``re_scale`` / ``im_scale`` are given, divide channels by
     those **global** positive scalars (same across topologies in a split). If omitted,
     use legacy per-connected-component maxima (tests only). ``re_scale`` is unused when
     RPE is Im-only but still accepted for shared scale-file plumbing.
 
-    ``ybus`` is unused (residual still uses full scenario Ybus).
+    ``ybus`` is unused here (residual still uses full scenario Ybus; tap inference
+    happens when building the branch list).
     """
     del ybus
     z_eff, component = _meshed_zeff_and_component(bus_count, branches)
@@ -5377,17 +5510,17 @@ def apply_rpe_channel_config(channels: str) -> None:
 
 
 def refresh_node_feature_config() -> None:
-    """Set ``NODE_FEATURE_DIM`` / ``NODE_ENCODER_FEATURE_NAMES`` from shunt + supply/demand flags."""
-    global NODE_FEATURE_DIM, NODE_ENCODER_FEATURE_NAMES
-    if USE_NODE_SUPPLY_DEMAND:
-        NODE_ENCODER_FEATURE_NAMES = ("Pd", "Qd", "Ps", "Qs", "V", "theta", "busBS")
-        NODE_FEATURE_DIM = NODE_SUPPLY_DEMAND_DIM + 2 + NODE_SHUNT_B_DIM  # 7
-    elif USE_NODE_SHUNT:
+    """Set ``NODE_FEATURE_DIM`` / feature-name tuples from shunt + supply/demand flags."""
+    global NODE_FEATURE_DIM, NODE_FEATURE_DIM_PV_SLACK, NODE_ENCODER_FEATURE_NAMES
+    global NODE_ENCODER_FEATURE_NAMES_PV_SLACK
+    if USE_NODE_SHUNT or USE_NODE_SUPPLY_DEMAND:
         NODE_ENCODER_FEATURE_NAMES = ("P", "Q", "V", "theta", "busBS")
-        NODE_FEATURE_DIM = NODE_PQVT_DIM + NODE_SHUNT_B_DIM  # 5
+        NODE_FEATURE_DIM = NODE_PQVT_DIM + NODE_SHUNT_B_DIM  # 5 (PQ / legacy all-types)
     else:
         NODE_ENCODER_FEATURE_NAMES = ("spec0", "spec1")
         NODE_FEATURE_DIM = NODE_SPECIFIED_DIM
+    NODE_ENCODER_FEATURE_NAMES_PV_SLACK = ("Pd", "Qd", "Ps", "Qs", "V", "theta", "busBS")
+    NODE_FEATURE_DIM_PV_SLACK = NODE_SUPPLY_DEMAND_DIM + 2 + NODE_SHUNT_B_DIM  # 7
 
 
 def apply_architecture_config() -> str:
@@ -5515,12 +5648,14 @@ def apply_architecture_config() -> str:
 
 
 def architecture_summary() -> str:
-    node_in = NODE_FEATURE_DIM if (USE_NODE_SHUNT or USE_NODE_SUPPLY_DEMAND) else NODE_SPECIFIED_DIM
     if USE_NODE_SUPPLY_DEMAND:
-        node_txt = "Pd,Qd,Ps,Qs,V,θ,busBS"
+        node_in = NODE_FEATURE_DIM_PV_SLACK
+        node_txt = "PQ:P,Q,V,θ,busBS; PV/Slack:Pd,Qd,Ps,Qs,V,θ,busBS"
     elif USE_NODE_SHUNT:
+        node_in = NODE_FEATURE_DIM
         node_txt = "P,Q,V,θ,busBS"
     else:
+        node_in = NODE_SPECIFIED_DIM
         node_txt = "spec"
     case_txt = f" case={CASE_NAME}" if CASE_NAME != "case118" else ""
     h1, h2 = ATTENTION_MLP_HIDDENS
@@ -5967,9 +6102,17 @@ def read_split(
     # Parquet ``BS`` is already p.u. bus-shunt susceptance (device only).
     shunt_b = _blocks(bus.column("BS").to_numpy(), bus_count).astype(np.float32)
 
+    branch_schema = set(pq.ParquetFile(raw / "branch_data.parquet").schema_arrow.names)
+    branch_cols = ["scenario", "idx", "from_bus", "to_bus", "r", "x", "br_status"]
+    has_tap = "tap" in branch_schema
+    has_shift = "shift" in branch_schema
+    if has_tap:
+        branch_cols.append("tap")
+    if has_shift:
+        branch_cols.append("shift")
     branch = pq.read_table(
         raw / "branch_data.parquet",
-        columns=["scenario", "idx", "from_bus", "to_bus", "r", "x", "br_status"],
+        columns=branch_cols,
     ).slice(start * branch_count, count * branch_count)
     branch_scenario = _blocks(branch.column("scenario").to_numpy(), branch_count)
     bus_scenario = _blocks(bus.column("scenario").to_numpy(), bus_count)
@@ -5980,10 +6123,22 @@ def read_split(
     reactance = _blocks(branch.column("x").to_numpy(), branch_count)
     origin = _blocks(branch.column("from_bus").to_numpy(), branch_count)
     destination = _blocks(branch.column("to_bus").to_numpy(), branch_count)
-    signature = np.concatenate(
-        [status, np.round(resistance, 6), np.round(reactance, 6), type_code],
-        axis=1,
-    ).astype(np.float32)
+    tap = (
+        _blocks(branch.column("tap").to_numpy(), branch_count)
+        if has_tap
+        else None
+    )
+    shift = (
+        _blocks(branch.column("shift").to_numpy(), branch_count)
+        if has_shift
+        else None
+    )
+    signature_parts = [status, np.round(resistance, 6), np.round(reactance, 6), type_code]
+    if tap is not None:
+        signature_parts.append(np.round(np.where(tap == 0.0, 1.0, tap), 6))
+    if shift is not None:
+        signature_parts.append(np.round(shift, 6))
+    signature = np.concatenate(signature_parts, axis=1).astype(np.float32)
 
     wanted = bus_scenario[:, 0].astype(np.int64)
     scenario_ids = [int(wanted[local]) for local in range(count)]
@@ -6046,6 +6201,8 @@ def read_split(
             shunt_b,
             rpe_scales=rpe_scales,
             bus_count=bus_count,
+            tap=tap,
+            shift=shift,
         )
     return Split(
         name=name,
@@ -6087,6 +6244,8 @@ def _representative_networks(
     shunt_b: np.ndarray,
     rpe_scales: tuple[float, float] | None = None,
     bus_count: int = 118,
+    tap: np.ndarray | None = None,
+    shift: np.ndarray | None = None,
 ) -> list[Network]:
     rep_specs: list[tuple[int, np.ndarray, list[tuple[int, int, float, float]], np.ndarray]] = []
     for local in representatives:
@@ -6095,13 +6254,15 @@ def _representative_networks(
             raise RuntimeError(f"{name} scenario {scenario_ids[local]} has {int(np.sum(types == 2))} slack buses.")
         scenario_id = scenario_ids[local]
         ybus = ybus_from_entries(y_by_scenario[scenario_id], bus_count)
-        branches = []
+        raw_branches: list[tuple[int, int, float, float]] = []
+        raw_taps: list[float] | None = [] if tap is not None else None
+        raw_shifts: list[float] | None = [] if shift is not None else None
         for branch_id in range(branch_count):
             if status[local, branch_id] < 0.5:
                 continue
             first = int(origin[local, branch_id])
             second = int(destination[local, branch_id])
-            branches.append(
+            raw_branches.append(
                 (
                     first,
                     second,
@@ -6109,6 +6270,17 @@ def _representative_networks(
                     float(reactance[local, branch_id]),
                 )
             )
+            if raw_taps is not None:
+                t = float(tap[local, branch_id])
+                raw_taps.append(1.0 if t == 0.0 else t)
+            if raw_shifts is not None:
+                raw_shifts.append(float(shift[local, branch_id]))
+        branches = tap_aware_zeff_branches(
+            raw_branches,
+            taps=raw_taps,
+            shifts=raw_shifts,
+            ybus=ybus if raw_taps is None else None,
+        )
         rep_specs.append((local, types, branches, ybus))
 
     if rpe_scales is not None:

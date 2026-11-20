@@ -80,12 +80,22 @@ def main() -> None:
     ln = 2 * t.D
     per_stage = attn + update + decode + ln
 
-    node_in = (
-        t.NODE_FEATURE_DIM
-        if (t.USE_NODE_SHUNT or getattr(t, "USE_NODE_SUPPLY_DEMAND", False))
-        else t.NODE_SPECIFIED_DIM
-    )
-    enc_one = mlp_params(node_in, t.D)
+    if getattr(t, "USE_NODE_SUPPLY_DEMAND", False):
+        node_in_pq = t.NODE_FEATURE_DIM
+        node_in_pv_slack = getattr(t, "NODE_FEATURE_DIM_PV_SLACK", 7)
+        enc_pq = mlp_params(node_in_pq, t.D)
+        enc_pv_slack = mlp_params(node_in_pv_slack, t.D)
+        node_txt = f"PQ={node_in_pq} PV/Slack={node_in_pv_slack}"
+    elif t.USE_NODE_SHUNT:
+        node_in_pq = t.NODE_FEATURE_DIM
+        enc_pq = mlp_params(node_in_pq, t.D)
+        enc_pv_slack = enc_pq
+        node_txt = f"{node_in_pq}"
+    else:
+        node_in_pq = t.NODE_SPECIFIED_DIM
+        enc_pq = mlp_params(node_in_pq, t.D)
+        enc_pv_slack = enc_pq
+        node_txt = f"{node_in_pq}"
     pe_one = 0 if t.ATTENTION_KIND in t.RAW_RPE_ATTENTION_KINDS else mlp_params(t.RPE_DIM, t.D_E)
     grpe_shared = shared_grpe_params() if t.ATTENTION_KIND in t.GRPE_ATTENTION_KINDS else 0
     exph_shared = shared_exphormer_params() if t.ATTENTION_KIND == "exphormer" else 0
@@ -96,11 +106,13 @@ def main() -> None:
     print(
         f"ARCH={os.environ.get('GENCO_TPGT_ARCH', 'v9')}: "
         f"D={t.D} D_E={t.D_E} D_A={t.D_A} HEADS={t.HEADS} DEPTH={t.DEPTH} "
-        f"node_in={node_in} RPE_DIM={t.RPE_DIM} ATTENTION_KIND={t.ATTENTION_KIND}\n"
+        f"node_in={node_txt} RPE_DIM={t.RPE_DIM} ATTENTION_KIND={t.ATTENTION_KIND}\n"
     )
 
     rows: list[tuple[str, int, int]] = [
-        ("Type encoder MLP (per bus type)", enc_one, 3),
+        ("PQ type encoder MLP", enc_pq, 1),
+        ("PV type encoder MLP", enc_pv_slack, 1),
+        ("Slack type encoder MLP", enc_pv_slack, 1),
         (
             "Pair encoder MLP (RPE -> D_E)" if pe_one else "Pair encoder (Identity / raw RPE)",
             pe_one,

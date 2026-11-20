@@ -106,18 +106,22 @@ def test_v9_node_features_are_pqvt_plus_device_bs():
         tpgt.refresh_node_feature_config()
 
 
-def test_v19_node_features_are_supply_demand_plus_v_theta_bs():
+def test_v19_node_features_pq5_pv_slack7():
     previous = tpgt.USE_NODE_SHUNT
     previous_sd = tpgt.USE_NODE_SUPPLY_DEMAND
     try:
         tpgt.USE_NODE_SHUNT = True
         tpgt.USE_NODE_SUPPLY_DEMAND = True
         tpgt.refresh_node_feature_config()
-        assert tpgt.NODE_FEATURE_DIM == 7
-        assert tpgt.NODE_ENCODER_FEATURE_NAMES == ("Pd", "Qd", "Ps", "Qs", "V", "theta", "busBS")
+        assert tpgt.NODE_FEATURE_DIM == 5
+        assert tpgt.NODE_FEATURE_DIM_PV_SLACK == 7
+        assert tpgt.NODE_ENCODER_FEATURE_NAMES == ("P", "Q", "V", "theta", "busBS")
+        assert tpgt.NODE_ENCODER_FEATURE_NAMES_PV_SLACK == ("Pd", "Qd", "Ps", "Qs", "V", "theta", "busBS")
         model = TPGT()
         assert model.use_node_supply_demand is True
-        assert model.encoders[0].net[0].in_features == 7
+        assert model.encoders[0].net[0].in_features == 5  # PQ
+        assert model.encoders[1].net[0].in_features == 7  # PV
+        assert model.encoders[2].net[0].in_features == 7  # Slack
         types = torch.tensor([0, 1, 2])
         # PQ specified (P,Q)=(0.1,0.2); PV (P,V)=(0.3,1.0); Slack (V,θ)=(1.05,0.0)
         specified = torch.tensor([[[0.1, 0.2], [0.3, 1.0], [1.05, 0.0]]])
@@ -127,7 +131,10 @@ def test_v19_node_features_are_supply_demand_plus_v_theta_bs():
         supply_p = torch.tensor([[0.0, 0.3, 1.1]])
         supply_q = torch.tensor([[0.0, 0.0, 0.4]])
         layout = tpgt.shared_layout(types, tpgt.type_pair_masks(types, torch.zeros(3, dtype=torch.long)))
-        feats = node_encoder_features(
+        pq_feats = node_encoder_features(specified, layout, device_bs, type_id=0)
+        assert pq_feats.shape == (1, 3, 5)
+        assert torch.allclose(pq_feats[0, 0], torch.tensor([0.1, 0.2, 1.0, 0.0, -0.4]))
+        pv_feats = node_encoder_features(
             specified,
             layout,
             device_bs,
@@ -135,14 +142,22 @@ def test_v19_node_features_are_supply_demand_plus_v_theta_bs():
             demand_q=demand_q,
             supply_p=supply_p,
             supply_q=supply_q,
+            type_id=1,
         )
-        assert feats.shape == (1, 3, 7)
-        # PQ: Pd,Qd,Ps,Qs,V=1 (flat),θ=0,Bs
-        assert torch.allclose(feats[0, 0], torch.tensor([0.5, 0.1, 0.0, 0.0, 1.0, 0.0, -0.4]))
-        # PV: V from specified slot1
-        assert torch.allclose(feats[0, 1], torch.tensor([0.0, 0.0, 0.3, 0.0, 1.0, 0.0, 0.14]))
-        # Slack: V,θ from specified
-        assert torch.allclose(feats[0, 2], torch.tensor([0.2, 0.05, 1.1, 0.4, 1.05, 0.0, 0.0]))
+        assert pv_feats.shape == (1, 3, 7)
+        assert torch.allclose(pv_feats[0, 1], torch.tensor([0.0, 0.0, 0.3, 0.0, 1.0, 0.0, 0.14]))
+        slack_feats = node_encoder_features(
+            specified,
+            layout,
+            device_bs,
+            demand_p=demand_p,
+            demand_q=demand_q,
+            supply_p=supply_p,
+            supply_q=supply_q,
+            type_id=2,
+        )
+        assert slack_feats.shape == (1, 3, 7)
+        assert torch.allclose(slack_feats[0, 2], torch.tensor([0.2, 0.05, 1.1, 0.4, 1.05, 0.0, 0.0]))
     finally:
         tpgt.USE_NODE_SHUNT = previous
         tpgt.USE_NODE_SUPPLY_DEMAND = previous_sd
