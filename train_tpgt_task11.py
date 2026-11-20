@@ -235,7 +235,7 @@ LAMBDA_PHYS = 0.5
 PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
-CACHE_VERSION = "tpgt-cache-17"
+CACHE_VERSION = "tpgt-cache-18"
 # Default / legacy (v7–v16): Re+Im. ``im`` = Im-only; ``re_im_gen`` = v17 gen-support (6-ch).
 RPE_FEATURE_NAMES_RE_IM = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_FEATURE_NAMES_IM = ("Zeff_Im_norm",)
@@ -4820,50 +4820,157 @@ def meshed_zeff_peak_abs(
     return max(max_re, 1e-30), max(max_im, 1e-30)
 
 
-def generator_grounded_support_matrix(
+# DC support Laplacian uses W_ij = 1/x only for strictly positive reactance.
+# Branches with x <= 0 are excluded (approximation); they still enter complex Zeff.
+GEN_SUPPORT_X_EPS = 1e-12
+GEN_SUPPORT_COND_WARN = 1e12
+GEN_SUPPORT_COND_REJECT = 1e16
+
+
+@dataclass
+class GeneratorSupportBuild:
+    """Result of building generator-grounded ``C`` (never a silent pseudoinverse)."""
+
+    c_full: np.ndarray
+    unsupported_pq: np.ndarray  # bool[N]; True ⇒ left at 0 (no gen path / singular)
+    skipped_nonpositive_x: int
+    max_condition: float
+    messages: list[str] = field(default_factory=list)
+
+
+def build_generator_grounded_support(
     bus_count: int,
     branches: list[tuple[int, int, float, float]],
     types: np.ndarray | torch.Tensor,
     *,
-    x_eps: float = 1e-12,
-) -> np.ndarray:
-    """N×N generator-grounded DC support ``\\widetilde C`` (zeros at Slack/PV).
+    x_eps: float = GEN_SUPPORT_X_EPS,
+    cond_warn: float = GEN_SUPPORT_COND_WARN,
+    cond_reject: float = GEN_SUPPORT_COND_REJECT,
+) -> GeneratorSupportBuild:
+    """N×N generator-grounded DC support ``C`` (zeros at Slack/PV and unsupported PQ).
 
-    Build real Laplacian ``L = diag(W 1) - W`` with ``W_ij = Σ 1/x_ℓ`` on undirected
-    in-service branches, ground Slack∪PV, and invert the PQ block ``L[U,U]``.
+    Approximation (not an exact AC voltage-sensitivity matrix):
+    ``L = diag(W 1) - W`` with ``W_ij = Σ 1/x`` on undirected in-service branches that
+    have **positive** reactance. Branches with ``x <= 0`` are flagged and omitted from
+    ``W`` (they still affect complex ``Z_eff``). Tap-aware ``(r,x)`` from
+    ``tap_aware_zeff_branches`` are used as-is; off-nominal taps make this a referred
+    series-x DC proxy, not a full π-model Jacobian inverse.
+
+    Per connected component of the positive-weight graph: every PQ bus must share the
+    component with ≥1 Slack/PV. Supported PQ blocks use ``np.linalg.inv`` (condition
+    number recorded). Singular / rejected blocks leave ``C=0`` for those PQ buses —
+    **no** ``pinv`` fallback.
     """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+
     type_np = np.asarray(types, dtype=np.int64).reshape(-1)
     if type_np.size != bus_count:
         raise ValueError(f"types length {type_np.size} != bus_count {bus_count}")
+    # Approximation note lives in the docstring: C is a positive-x DC support proxy,
+    # not an exact AC voltage-sensitivity matrix (tap-aware series x when provided).
+    messages: list[str] = []
     weights = np.zeros((bus_count, bus_count), dtype=np.float64)
+    skipped = 0
     table = np.asarray(branches, dtype=np.float64).reshape(-1, 4) if branches else np.zeros((0, 4))
     for origin, destination, _resistance, reactance in table:
         x = float(reactance)
-        if abs(x) <= x_eps:
+        if not np.isfinite(x) or x <= x_eps:
+            skipped += 1
             continue
         w = 1.0 / x
-        if w <= 0.0:
+        if not np.isfinite(w) or w <= 0.0:
+            skipped += 1
             continue
         i = int(origin)
         j = int(destination)
         weights[i, j] += w
         weights[j, i] += w
+    if skipped:
+        messages.append(
+            f"excluded {skipped} branch(es) with non-positive/non-finite x from DC support "
+            f"Laplacian (W=1/x requires x>{x_eps:g}); Zeff still uses the complex branch model"
+        )
+
+    adjacency = weights > 0.0
+    graph = csr_matrix(adjacency.astype(np.float64))
+    _n_comp, labels = connected_components(graph, directed=False)
     laplacian = np.diag(weights.sum(axis=1)) - weights
-    pq = (type_np == 0)
+    pq = type_np == 0
     gen = (type_np == 1) | (type_np == 2)
     c_full = np.zeros((bus_count, bus_count), dtype=np.float64)
-    pq_idx = np.flatnonzero(pq)
-    if pq_idx.size == 0 or not np.any(gen):
-        return c_full
-    l_g = laplacian[np.ix_(pq_idx, pq_idx)]
-    try:
-        c_uu = np.linalg.inv(l_g)
-    except np.linalg.LinAlgError:
-        c_uu = np.linalg.pinv(l_g)
-    if not np.isfinite(c_uu).all():
-        c_uu = np.nan_to_num(c_uu, nan=0.0, posinf=0.0, neginf=0.0)
-    c_full[np.ix_(pq_idx, pq_idx)] = c_uu
-    return c_full
+    unsupported = np.zeros(bus_count, dtype=bool)
+    max_cond = 0.0
+
+    for comp in np.unique(labels):
+        buses = np.flatnonzero(labels == comp)
+        pq_local = buses[pq[buses]]
+        if pq_local.size == 0:
+            continue
+        gen_local = buses[gen[buses]]
+        if gen_local.size == 0:
+            unsupported[pq_local] = True
+            messages.append(
+                f"unsupported PQ island (component {int(comp)}, {int(pq_local.size)} PQ bus(es), "
+                f"no Slack/PV): leaving C=0 (no pinv)"
+            )
+            continue
+        l_g = laplacian[np.ix_(pq_local, pq_local)]
+        try:
+            cond = float(np.linalg.cond(l_g))
+        except np.linalg.LinAlgError:
+            cond = float("inf")
+        if not np.isfinite(cond):
+            cond = float("inf")
+        max_cond = max(max_cond, cond if np.isfinite(cond) else max_cond)
+        if not np.isfinite(cond) or cond >= cond_reject:
+            unsupported[pq_local] = True
+            messages.append(
+                f"singular/ill-conditioned grounded L_g (component {int(comp)}, "
+                f"cond={cond:.3g}): leaving C=0 (no pinv)"
+            )
+            continue
+        if cond >= cond_warn:
+            messages.append(
+                f"ill-conditioned grounded L_g (component {int(comp)}, cond={cond:.3g}): "
+                f"using np.linalg.inv (documented; no pinv)"
+            )
+        try:
+            c_uu = np.linalg.inv(l_g)
+        except np.linalg.LinAlgError:
+            unsupported[pq_local] = True
+            messages.append(
+                f"np.linalg.inv failed for grounded L_g (component {int(comp)}): "
+                f"leaving C=0 (no pinv)"
+            )
+            continue
+        if not np.isfinite(c_uu).all():
+            unsupported[pq_local] = True
+            messages.append(
+                f"non-finite C after inv (component {int(comp)}): leaving C=0 (no pinv)"
+            )
+            continue
+        c_full[np.ix_(pq_local, pq_local)] = c_uu
+        max_cond = max(max_cond, cond)
+
+    return GeneratorSupportBuild(
+        c_full=c_full,
+        unsupported_pq=unsupported,
+        skipped_nonpositive_x=int(skipped),
+        max_condition=float(max_cond),
+        messages=messages,
+    )
+
+
+def generator_grounded_support_matrix(
+    bus_count: int,
+    branches: list[tuple[int, int, float, float]],
+    types: np.ndarray | torch.Tensor,
+    *,
+    x_eps: float = GEN_SUPPORT_X_EPS,
+) -> np.ndarray:
+    """N×N generator-grounded DC support ``C`` (see ``build_generator_grounded_support``)."""
+    return build_generator_grounded_support(bus_count, branches, types, x_eps=x_eps).c_full
 
 
 def generator_support_rho(c_full: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
@@ -4874,6 +4981,82 @@ def generator_support_rho(c_full: np.ndarray, *, eps: float = 1e-12) -> np.ndarr
     ok = denom > eps
     rho[ok] = c_full[ok] / denom[ok]
     return rho
+
+
+def validate_generator_support_matrix(
+    c_full: np.ndarray,
+    types: np.ndarray | torch.Tensor,
+    *,
+    unsupported_pq: np.ndarray | None = None,
+    atol: float = 1e-6,
+) -> list[CorrectnessCheck]:
+    """Check ``C`` symmetry and SPD-style signs on supported PQ buses."""
+    type_np = np.asarray(types, dtype=np.int64).reshape(-1)
+    pq = type_np == 0
+    if unsupported_pq is None:
+        supported = pq & (np.diag(c_full) > atol)
+    else:
+        supported = pq & ~np.asarray(unsupported_pq, dtype=bool)
+    checks: list[CorrectnessCheck] = []
+    sym_err = float(np.max(np.abs(c_full - c_full.T))) if c_full.size else 0.0
+    sym_ok = sym_err <= atol
+    checks.append(
+        CorrectnessCheck(
+            "gen_support_C_symmetric",
+            sym_ok,
+            f"max |C-Cᵀ|={sym_err:.3g}" if sym_ok else f"C not symmetric (max |C-Cᵀ|={sym_err:.3g})",
+            value=sym_err,
+        )
+    )
+    if not np.any(supported):
+        checks.append(
+            CorrectnessCheck(
+                "gen_support_supported_pq",
+                True,
+                "no supported PQ buses to validate C_ii/C_ij/ρ",
+            )
+        )
+        return checks
+    diag = np.diag(c_full)
+    diag_ok = bool(np.all(diag[supported] > atol))
+    checks.append(
+        CorrectnessCheck(
+            "gen_support_Cii_positive",
+            diag_ok,
+            f"C_ii>0 on {int(np.count_nonzero(supported))} supported PQ"
+            if diag_ok
+            else f"non-positive C_ii on supported PQ (min={float(np.min(diag[supported])):.3g})",
+            value=float(np.min(diag[supported])) if np.any(supported) else None,
+        )
+    )
+    block = c_full[np.ix_(supported, supported)]
+    off = block.copy()
+    np.fill_diagonal(off, 0.0)
+    off_ok = bool(np.min(off) >= -atol)
+    checks.append(
+        CorrectnessCheck(
+            "gen_support_Cij_nonnegative",
+            off_ok,
+            "C_ij≥0 on supported PQ×PQ"
+            if off_ok
+            else f"negative C_ij on supported PQ (min={float(np.min(off)):.3g})",
+            value=float(np.min(off)) if off.size else None,
+        )
+    )
+    rho = generator_support_rho(c_full)
+    rho_block = rho[np.ix_(supported, supported)]
+    rho_ok = bool(np.all(rho_block >= -atol) and np.all(rho_block <= 1.0 + atol))
+    checks.append(
+        CorrectnessCheck(
+            "gen_support_rho_unit_interval",
+            rho_ok,
+            "0≤ρ≤1 on supported PQ×PQ"
+            if rho_ok
+            else f"ρ outside [0,1] (min={float(np.min(rho_block)):.3g}, max={float(np.max(rho_block)):.3g})",
+            value=float(np.max(np.abs(rho_block))) if rho_block.size else None,
+        )
+    )
+    return checks
 
 
 def fit_global_c_scale_from_networks(networks: list["Network"]) -> float:
@@ -5321,7 +5504,15 @@ def meshed_rpe(
         if type_np.size != bus_count:
             raise ValueError(f"types length {type_np.size} != bus_count {bus_count}")
         pq = type_np == 0
-        c_full = generator_grounded_support_matrix(bus_count, branches, type_np)
+        built = build_generator_grounded_support(bus_count, branches, type_np)
+        for message in built.messages:
+            print(f"  gen-support: {message}", flush=True)
+        for check in validate_generator_support_matrix(
+            built.c_full, type_np, unsupported_pq=built.unsupported_pq
+        ):
+            if not check.passed:
+                raise RuntimeError(f"gen-support validation failed: {check.name}: {check.detail}")
+        c_full = built.c_full
         if c_scale is None:
             peak = float(np.max(np.abs(c_full))) if c_full.size else 0.0
             c_div = max(1.0, peak)
@@ -5341,6 +5532,9 @@ def meshed_rpe(
         raise RuntimeError(
             f"meshed_rpe cannot map Zeff into RPE_FEATURE_NAMES={RPE_FEATURE_NAMES} RPE_DIM={RPE_DIM}"
         )
+
+    # Disconnected pairs: zero all RPE channels (attention mask still applied separately).
+    features *= same.astype(np.float32)[:, :, None]
 
     if not np.isfinite(features).all():
         raise RuntimeError("Meshed RPE contains non-finite values.")
@@ -5867,6 +6061,33 @@ def audit_rpe_correctness(network: Network, *, recompute_atol: float = 1e-4) -> 
                     f"{name} symmetric" if sym_ok else f"{name} channel not symmetric",
                 )
             )
+
+    # Disconnected pairs must be all-zero in every RPE channel (mask is separate).
+    same = component[:, None] == component[None, :]
+    cross = ~same
+    if np.any(cross):
+        cross_ok = bool(np.allclose(rpe[cross], 0.0, atol=1e-6))
+        checks.append(
+            CorrectnessCheck(
+                "rpe_cross_component_zero",
+                cross_ok,
+                "all RPE channels zero on disconnected pairs"
+                if cross_ok
+                else "non-zero RPE on disconnected bus pairs",
+            )
+        )
+
+    if uses_generator_support_rpe() and getattr(network, "branches", None) is not None:
+        built = build_generator_grounded_support(
+            bus_count, list(network.branches), network.types.detach().cpu().numpy()
+        )
+        checks.extend(
+            validate_generator_support_matrix(
+                built.c_full,
+                network.types.detach().cpu().numpy(),
+                unsupported_pq=built.unsupported_pq,
+            )
+        )
 
     if getattr(network, "branches", None) is not None:
         branches = network.branches

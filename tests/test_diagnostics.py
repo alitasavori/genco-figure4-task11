@@ -83,9 +83,16 @@ def test_v17_generator_grounded_support_rpe():
         # bus 0 = PV, 1 = i (PQ), 2 = j (PQ)
         branches = [(0, 1, 0.0, xg), (1, 2, 0.0, xij)]
         types = np.array([1, 0, 0], dtype=np.int64)
-        c = tpgt.generator_grounded_support_matrix(3, branches, types)
+        built = tpgt.build_generator_grounded_support(3, branches, types)
+        c = built.c_full
+        assert not np.any(built.unsupported_pq)
+        assert built.skipped_nonpositive_x == 0
         assert np.allclose(c[1:, 1:], np.array([[xg, xg], [xg, xg + xij]]), atol=1e-6)
         assert np.allclose(c[0, :], 0.0) and np.allclose(c[:, 0], 0.0)
+        for check in tpgt.validate_generator_support_matrix(
+            c, types, unsupported_pq=built.unsupported_pq
+        ):
+            assert check.passed, check.detail
         ybus = np.zeros((3, 3), dtype=np.complex64)
         features, _ = meshed_rpe(3, branches, ybus, types=types, c_scale=1.0)
         assert features.shape == (3, 3, 6)
@@ -116,6 +123,64 @@ def test_v17_generator_grounded_support_rpe():
         tpgt.RPE_DIM = previous_dim
         tpgt.D = previous_d
         tpgt.D_E = previous_de
+
+
+def test_v17_gen_support_no_pinv_on_pq_island():
+    """PQ island without Slack/PV leaves C=0 (no silent pseudoinverse)."""
+    previous_names = tpgt.RPE_FEATURE_NAMES
+    previous_dim = tpgt.RPE_DIM
+    try:
+        tpgt.apply_rpe_channel_config("re_im_gen")
+        # Two PQ buses linked; no generator in the component.
+        branches = [(0, 1, 0.0, 0.4)]
+        types = np.array([0, 0], dtype=np.int64)
+        built = tpgt.build_generator_grounded_support(2, branches, types)
+        assert np.allclose(built.c_full, 0.0)
+        assert bool(np.all(built.unsupported_pq))
+        assert any("unsupported PQ island" in m for m in built.messages)
+        assert any("no pinv" in m for m in built.messages)
+    finally:
+        tpgt.RPE_FEATURE_NAMES = previous_names
+        tpgt.RPE_DIM = previous_dim
+
+
+def test_v17_gen_support_flags_nonpositive_x():
+    previous_names = tpgt.RPE_FEATURE_NAMES
+    previous_dim = tpgt.RPE_DIM
+    try:
+        tpgt.apply_rpe_channel_config("re_im_gen")
+        # PV—PQ with negative x (excluded) plus positive spur so PQ stays gen-supported.
+        branches = [(0, 1, 0.0, -0.2), (0, 1, 0.0, 0.5)]
+        types = np.array([1, 0], dtype=np.int64)
+        built = tpgt.build_generator_grounded_support(2, branches, types)
+        assert built.skipped_nonpositive_x >= 1
+        assert any("non-positive" in m for m in built.messages)
+        assert np.isclose(built.c_full[1, 1], 0.5, atol=1e-6)
+    finally:
+        tpgt.RPE_FEATURE_NAMES = previous_names
+        tpgt.RPE_DIM = previous_dim
+
+
+def test_v17_rpe_zeros_disconnected_pairs():
+    """All six RPE channels are zero across components; Zeff mask retained."""
+    previous_names = tpgt.RPE_FEATURE_NAMES
+    previous_dim = tpgt.RPE_DIM
+    try:
+        tpgt.apply_rpe_channel_config("re_im_gen")
+        # Component A: PV—PQ; component B: isolated PQ (unsupported → C=0).
+        branches = [(0, 1, 0.0, 0.3)]
+        types = np.array([1, 0, 0], dtype=np.int64)
+        ybus = np.zeros((3, 3), dtype=np.complex64)
+        features, component = meshed_rpe(3, branches, ybus, types=types, c_scale=1.0)
+        assert component[0] == component[1]
+        assert component[2] != component[1]
+        # Cross-component pairs must be all-zero (including unary Cii leak).
+        assert np.allclose(features[1, 2], 0.0)
+        assert np.allclose(features[2, 1], 0.0)
+        assert np.isclose(features[1, 0, 2], 0.3)
+    finally:
+        tpgt.RPE_FEATURE_NAMES = previous_names
+        tpgt.RPE_DIM = previous_dim
 
 
 def test_bus_shunt_b_row_sum_includes_charging_unlike_device_bs():
