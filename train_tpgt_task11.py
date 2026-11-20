@@ -61,21 +61,24 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
   ``o=Σ α (v+P^V+E^V)``. Softmax and type-pair blocks are unchanged. Angle step
   uses ``η_angle=1``.
 * **RPE**: legacy ``Zeff_Re_norm`` + ``Zeff_Im_norm`` (v7–v16 / v19/v20);
-  **v17** is 2-ch ``im_rho``: ``Zeff_Im_norm`` + gen-grounded ``ρ_ij`` (from
-  ``C=L_{UU}^{-1}``; Slack∪PV grounded). Generator outages change ``G`` and thus ``C/ρ``;
-  unsupported PQ islands are flagged invalid (``C=0`` is a numerical fallback, not
-  physical zero sensitivity). Train-only
-  ``s_C=max(1,max_T max|C|)`` (and ``s_X``) — never re-fit per test topology.
+  **v17** RPE is selectable via preset / ``GENCO_TPGT_RPE_CHANNELS`` / notebook
+  ``RPE_CHANNELS``: ``rho`` (default: gen-grounded ``ρ_ij`` only), ``im_rho``
+  (Im+ρ), ``im``, or ``re_im``. ``ρ`` comes from ``C=L_{UU}^{-1}`` (Slack∪PV
+  grounded). Generator outages change ``G`` and thus ``C/ρ``; unsupported PQ
+  islands are flagged invalid (``C=0`` is a numerical fallback, not physical
+  zero sensitivity). Train-only ``s_C`` / ``s_X`` — never re-fit per test topology.
   **v17im** is Im-only Zeff.
 * **Node features**: v9–v16 ``(P,Q,V,θ,busBS)`` with net ``P=Ps−Pd``; **v19/v20** keep PQ
   at 5-D ``(P,Q,V,θ,busBS)`` and give PV/Slack ``(Pd,Qd,Ps,Qs,V,θ,busBS)``.
   PV/Slack pack ``Ps/Qs``; AC residual injects ``Ps−Pd``, ``Qs−Qd``.
 * **RPE channel dropout**: during training each channel is zeroed with
   probability ``RPE_CHANNEL_DROPOUT`` per optimizer step; never at eval.
-* **Versioned run folder**: checkpoints go to ``Foundation Model/tpgt_task11_<RUN_TAG>``
+  * **Versioned run folder**: checkpoints go to ``Foundation Model/tpgt_task11_<RUN_TAG>``
   and tables/plot to ``Foundation Model/results/tpgt_task11_<RUN_TAG>``, so runs
   of older architectures (``tpgt_task11/``, ``tpgt_task11_v7/``) are left untouched.
-  Select with ``GENCO_TPGT_ARCH=v8`` / ``--arch v8`` (same packing, residual, loss).
+  Within the same ``RUN_TAG`` (e.g. v17 6-ch → Im+ρ), seed-metric CSV rows are keyed by
+  ``checkpoint_version``; summary / bar plots use only the current version (foreign rows stay
+  in the CSV but are ignored). Select with ``GENCO_TPGT_ARCH=v8`` / ``--arch v8``.
 
 Performance notes (Colab / large train split)
 ---------------------------------------------
@@ -239,14 +242,22 @@ PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
 CACHE_VERSION = "tpgt-cache-19"
-# Default / legacy (v7–v16): Re+Im. ``im`` = Im-only; ``im_rho`` = v17 (Im + gen-support ρ).
+# Default / legacy (v7–v16): Re+Im. ``im`` = Im-only; ``im_rho`` = Im+ρ; ``rho`` = ρ only.
 RPE_FEATURE_NAMES_RE_IM = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_FEATURE_NAMES_IM = ("Zeff_Im_norm",)
 RPE_FEATURE_NAMES_IM_RHO = ("Zeff_Im_norm", "rho_ij")
+RPE_FEATURE_NAMES_RHO = ("rho_ij",)
 # Legacy alias name kept for older call sites; same channels as ``IM_RHO``.
 RPE_FEATURE_NAMES_RE_IM_GEN = RPE_FEATURE_NAMES_IM_RHO
 RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM
 RPE_DIM = len(RPE_FEATURE_NAMES)
+# Short tags used in checkpoint_version / notebook banners.
+RPE_CHANNEL_SLUGS = {
+    RPE_FEATURE_NAMES_RE_IM: "re-im",
+    RPE_FEATURE_NAMES_IM: "im",
+    RPE_FEATURE_NAMES_IM_RHO: "im-rho",
+    RPE_FEATURE_NAMES_RHO: "rho",
+}
 # v15 pair-rotary electrical pair features (ablate these, not Zeff RPE).
 PAIR_ELEC_FEATURE_NAMES = ("elec_dist", "edge_on", "edge_weight")
 # Per optimizer step, each RPE channel is zeroed (whole 118x118 plane, no rescaling) with this
@@ -474,9 +485,10 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "ATTENTION_KIND": "grit",
         "RPE_CHANNELS": "re_im",
     },
-    # v16 GRIT + gen-grounded ρ only (2-ch: Zeff Im + ρ). Re/Cii/Cjj/Cij dropped.
-    # C=L[U,U]^{-1} still built (Slack∪PV grounded) to form ρ; invalid PQ islands flagged.
-    # Train-only s_X / s_C; one shared pair encoder (2→96→96→48).
+    # v16 GRIT + selectable gen-support RPE (default ρ-only). Override with
+    # GENCO_TPGT_RPE_CHANNELS=im_rho|im|re_im|rho (notebook RPE_CHANNELS).
+    # C=L[U,U]^{-1} still built when ρ is selected; invalid PQ islands flagged.
+    # Train-only s_X / s_C; pair encoder in_features = RPE_DIM.
     "v17": {
         "D": 96,
         "D_E": 48,
@@ -484,10 +496,10 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "HEADS": 4,
         "DEPTH": 12,
         "RUN_TAG": "v17",
-        "CHECKPOINT_VERSION": "meshed-rpe-2-d12-w96-h4-pqvt-busBS-im-rho-v17",
+        "CHECKPOINT_VERSION": "meshed-rpe-1-d12-w96-h4-pqvt-busBS-rho-v17",
         "USE_NODE_SHUNT": True,
         "ATTENTION_KIND": "grit",
-        "RPE_CHANNELS": "im_rho",
+        "RPE_CHANNELS": "rho",
     },
     # Former Im-only GRIT (v16 dims, drop Real Zeff). Kept so old runs remain selectable.
     "v17im": {
@@ -5473,7 +5485,8 @@ def meshed_rpe(
 
     Legacy (``RPE_CHANNELS=re_im``): normalized Re and Im (2 channels).
     Im-only (``RPE_CHANNELS=im`` / ``v17im``): Im only (1 channel).
-    Gen-support (``RPE_CHANNELS=im_rho`` / ``v17``): ``Zeff_Im_norm`` + ``ρ_ij`` (2).
+    Im+ρ (``RPE_CHANNELS=im_rho``): ``Zeff_Im_norm`` + ``ρ_ij`` (2).
+    ρ-only (``RPE_CHANNELS=rho`` / default ``v17``): ``ρ_ij`` (1).
     ``ρ`` is PQ–PQ only and zero on ``invalid_support`` buses (unsupported islands /
     singular ``L_UU``); those zeros are a numerical fallback, not physical zero
     sensitivity — see ``Network.gen_support_invalid``. Generator outages change
@@ -5535,10 +5548,9 @@ def meshed_rpe(
         features[..., 1] = im
     elif RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM and RPE_DIM == 1:
         features[..., 0] = im
-    elif RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM_RHO and RPE_DIM == 2:
+    elif RPE_FEATURE_NAMES in (RPE_FEATURE_NAMES_IM_RHO, RPE_FEATURE_NAMES_RHO):
         if types is None:
-            raise ValueError("meshed_rpe im_rho requires bus types for generator grounding")
-        features[..., 0] = im
+            raise ValueError("meshed_rpe rho channels require bus types for generator grounding")
         type_np = np.asarray(types, dtype=np.int64).reshape(-1)
         if type_np.size != bus_count:
             raise ValueError(f"types length {type_np.size} != bus_count {bus_count}")
@@ -5558,7 +5570,16 @@ def meshed_rpe(
         invalid_support = built.invalid_support.astype(bool, copy=False)
         valid = (~invalid_support)[:, None] & (~invalid_support)[None, :]
         rho = generator_support_rho(built.c_full).astype(np.float32)
-        features[..., 1] = np.where(both_pq & valid, rho, 0.0).astype(np.float32)
+        rho_masked = np.where(both_pq & valid, rho, 0.0).astype(np.float32)
+        if RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM_RHO and RPE_DIM == 2:
+            features[..., 0] = im
+            features[..., 1] = rho_masked
+        elif RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_RHO and RPE_DIM == 1:
+            features[..., 0] = rho_masked
+        else:
+            raise RuntimeError(
+                f"meshed_rpe rho layout mismatch RPE_FEATURE_NAMES={RPE_FEATURE_NAMES} RPE_DIM={RPE_DIM}"
+            )
     else:
         raise RuntimeError(
             f"meshed_rpe cannot map Zeff into RPE_FEATURE_NAMES={RPE_FEATURE_NAMES} RPE_DIM={RPE_DIM}"
@@ -6283,34 +6304,71 @@ def _parse_mlp_hiddens(raw: object, default: tuple[int, ...] = (128, 64)) -> tup
     return widths
 
 
+def rpe_channels_slug() -> str:
+    """Short tag for the active RPE layout (``rho``, ``im-rho``, ``im``, ``re-im``)."""
+    return RPE_CHANNEL_SLUGS.get(RPE_FEATURE_NAMES, f"{RPE_DIM}ch")
+
+
 def apply_rpe_channel_config(channels: str) -> None:
-    """Set global ``RPE_FEATURE_NAMES`` / ``RPE_DIM`` from channel preset name."""
+    """Set global ``RPE_FEATURE_NAMES`` / ``RPE_DIM`` from channel preset name.
+
+    Notebook / env: ``GENCO_TPGT_RPE_CHANNELS`` ∈ ``{re_im, im, im_rho, rho}``.
+    """
     global RPE_FEATURE_NAMES, RPE_DIM
     key = str(channels).strip().lower().replace("+", "_").replace("-", "_")
     if key in ("re_im", "reim", "both"):
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM
-    elif key in ("im", "im_only", "zeff_im", "1"):
+    elif key in ("im", "im_only", "zeff_im"):
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_IM
     elif key in (
         "im_rho",
         "imrho",
-        "rho",
-        "re_im_gen",  # legacy alias → Im+ρ (v17 no longer 6-ch)
+        "re_im_gen",  # legacy alias → Im+ρ
         "reim_gen",
-        "gen_support",
-        "gensupport",
         "2_im_rho",
     ):
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_IM_RHO
+    elif key in ("rho", "rho_only", "rho_ij", "gen_support", "gensupport"):
+        RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RHO
     else:
         raise ValueError(
-            f"unknown RPE_CHANNELS {channels!r}; use re_im, im, or im_rho (v17)"
+            f"unknown RPE_CHANNELS {channels!r}; use re_im, im, im_rho, or rho"
         )
     RPE_DIM = len(RPE_FEATURE_NAMES)
 
 
 def uses_generator_support_rpe() -> bool:
-    return RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM_RHO
+    """True when the active RPE includes gen-grounded ``ρ_ij`` (needs bus types / C)."""
+    return "rho_ij" in RPE_FEATURE_NAMES
+
+
+def retag_checkpoint_version_for_rpe(*, force_slug: bool = False) -> None:
+    """Keep ``CHECKPOINT_VERSION`` aligned with ``RPE_DIM`` + channel slug.
+
+    Avoids silently resuming an Im+ρ checkpoint / cache under a ρ-only (or other)
+    override in the same ``RUN_TAG`` folder. Does not invent a channel slug for
+    unrelated arches (v16 etc.) unless ``force_slug`` / ``RUN_TAG==v17``.
+    """
+    import re
+
+    global CHECKPOINT_VERSION
+    slug = rpe_channels_slug()
+    cv = re.sub(r"meshed-rpe-\d+", f"meshed-rpe-{RPE_DIM}", str(CHECKPOINT_VERSION), count=1)
+    has_slug = re.search(r"-(?:im-rho|re-im|gensupport|rho|im)-v\d+$", cv) is not None
+    if has_slug:
+        # Replace existing channel tag (no-op when it already matches).
+        CHECKPOINT_VERSION = re.sub(
+            r"-(?:im-rho|re-im|gensupport|rho|im)(?=-v\d+$)",
+            f"-{slug}",
+            cv,
+            count=1,
+        )
+        return
+    if force_slug or RUN_TAG == "v17":
+        # e.g. ``...-busBS-v17`` → ``...-busBS-rho-v17`` when selectable RPE is active.
+        CHECKPOINT_VERSION = re.sub(r"(-v\d+)$", rf"-{slug}\1", cv, count=1)
+    else:
+        CHECKPOINT_VERSION = cv
 
 
 def refresh_node_feature_config() -> None:
@@ -6399,6 +6457,9 @@ def apply_architecture_config() -> str:
     rpe_ch_env = os.environ.get("GENCO_TPGT_RPE_CHANNELS", "").strip()
     if rpe_ch_env:
         apply_rpe_channel_config(rpe_ch_env)
+    # Sync checkpoint_version channel count/slug after preset + optional env override.
+    if "meshed-rpe-" in str(CHECKPOINT_VERSION):
+        retag_checkpoint_version_for_rpe(force_slug=bool(rpe_ch_env))
     hop_env = os.environ.get("GENCO_TPGT_GRPE_MAX_HOP", "").strip()
     if hop_env:
         GRPE_MAX_HOP = int(hop_env)
@@ -9797,6 +9858,23 @@ def train_seed(
     return model
 
 
+def seed_metrics_path(results: Path, spec: TaskSpec | None = None) -> Path:
+    spec = spec or TASKS["1.1"]
+    return results / f"task{spec.file_tag}_tpgt_seed_metrics.csv"
+
+
+def seed_metrics_columns() -> list[str]:
+    return [*SEED_COLUMNS, "epoch", "checkpoint_version"]
+
+
+def seed_metrics_key_fields() -> list[str]:
+    return ["model", "task", "test_category", "seed", "epoch", "checkpoint_version"]
+
+
+def row_checkpoint_version(row: dict) -> str:
+    return str(row.get("checkpoint_version") or "").strip()
+
+
 def record_seed(
     results: Path,
     seed: int,
@@ -9810,7 +9888,7 @@ def record_seed(
 ) -> None:
     spec = spec or TASKS["1.1"]
     scores = attach_c2i(scores, counts, spec)
-    columns = [*SEED_COLUMNS, "epoch"]
+    columns = seed_metrics_columns()
     rows = []
     for category in categories_for(spec.task_id):
         rows.append(
@@ -9823,21 +9901,30 @@ def record_seed(
                 "checkpoint_path": str(checkpoint),
                 "source": source,
                 "epoch": str(epoch),
+                "checkpoint_version": CHECKPOINT_VERSION,
             }
         )
     upsert_csv(
-        results / f"task{spec.file_tag}_tpgt_seed_metrics.csv",
+        seed_metrics_path(results, spec),
         columns,
         rows,
-        ["model", "task", "test_category", "seed", "epoch"],
+        seed_metrics_key_fields(),
     )
 
 
 def write_summary(results: Path, spec: TaskSpec | None = None) -> list[dict]:
+    """Aggregate latest per-seed PBL for the *current* ``CHECKPOINT_VERSION`` only.
+
+    Same ``RUN_TAG`` folders can hold rows from an older arch (e.g. v17 6-ch vs Im+ρ).
+    Foreign / missing ``checkpoint_version`` rows stay in the seed CSV but never enter the
+    summary or bar plot — otherwise a higher epoch from a previous arch contaminates the figure.
+    """
     spec = spec or TASKS["1.1"]
     latest: dict[tuple[str, str], tuple[int, float]] = {}
-    for row in read_csv(results / f"task{spec.file_tag}_tpgt_seed_metrics.csv"):
+    for row in read_csv(seed_metrics_path(results, spec)):
         if row.get("model") != MODEL_NAME:
+            continue
+        if row_checkpoint_version(row) != CHECKPOINT_VERSION:
             continue
         raw_epoch = (row.get("epoch") or "").strip()
         try:
@@ -9869,7 +9956,36 @@ def write_summary(results: Path, spec: TaskSpec | None = None) -> list[dict]:
     path = results / f"task{spec.file_tag}_tpgt_summary.csv"
     if summary:
         upsert_csv(path, SUMMARY_COLUMNS, summary, ["model", "test_category"])
+    elif path.is_file():
+        # Stale summary from another arch would otherwise keep driving the bar plot.
+        path.unlink()
     return summary
+
+
+def reconcile_results_metrics(results: Path, spec: TaskSpec | None = None) -> list[dict]:
+    """Rewrite summary/plot inputs so only the current ``CHECKPOINT_VERSION`` is visible.
+
+    Keeps foreign-arch rows in ``*_tpgt_seed_metrics.csv`` for history; prints how many
+    were ignored when the shared ``RUN_TAG`` results folder still holds an older arch.
+    """
+    spec = spec or TASKS["1.1"]
+    rows = read_csv(seed_metrics_path(results, spec))
+    if rows:
+        foreign_versions: dict[str, int] = {}
+        for row in rows:
+            if row.get("model") != MODEL_NAME:
+                continue
+            version = row_checkpoint_version(row) or "<missing>"
+            if version != CHECKPOINT_VERSION:
+                foreign_versions[version] = foreign_versions.get(version, 0) + 1
+        if foreign_versions:
+            parts = ", ".join(f"{ver!r}×{count}" for ver, count in sorted(foreign_versions.items()))
+            print(
+                f"Results CSV: ignoring seed-metric rows from other checkpoint_version(s) "
+                f"({parts}); summary/plot use only {CHECKPOINT_VERSION!r}.",
+                flush=True,
+            )
+    return write_summary(results, spec)
 
 
 def format_comparison(summary: list[dict], spec: TaskSpec | None = None) -> str:
@@ -10243,6 +10359,7 @@ def main() -> None:
     print(f"Physics stage weights (GENCO-style): {stage_weight_text}", flush=True)
     print(f"Checkpoints: {checkpoints}", flush=True)
     print(f"Results directory: {results}", flush=True)
+    reconcile_results_metrics(results, spec)
     for split_name in ("train", "valid"):
         found = tuple(task_folders(data, split_name))
         if found != spec.folders:
@@ -10495,7 +10612,7 @@ def cli_eval_only() -> None:
         any_seed = True
     if not any_seed:
         raise RuntimeError(f"No seeds evaluated under {ckpt_root}.")
-    summary = write_summary(results, spec)
+    summary = reconcile_results_metrics(results, spec)
     print_comparison(summary, spec)
     plot_comparison(results, summary, spec)
     partial = task31_partial_eval_path(results, spec)

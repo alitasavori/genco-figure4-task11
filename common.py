@@ -208,7 +208,9 @@ def upsert_csv(path: Path, columns: list[str], rows: list[dict], key_fields: lis
     for row in rows:
         complete = {column: row.get(column, "") for column in columns}
         index[tuple(str(complete.get(field, "")) for field in key_fields)] = complete
-    ordered = list(index.values())
+    # Normalize every kept row to ``columns`` so schema bumps (e.g. checkpoint_version)
+    # do not leave DictWriter missing-field holes or drop new fields on old rows.
+    ordered = [{column: str(row.get(column, "")) for column in columns} for row in index.values()]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()

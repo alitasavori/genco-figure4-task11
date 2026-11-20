@@ -824,8 +824,53 @@ def test_seed_metrics_and_summary_per_task(tmp_path):
     assert (tmp_path / "task4_1_tpgt_summary.csv").is_file()
     assert {row["test_category"]: float(row["mean_across_seeds"]) for row in summary}["C2I"] == pytest.approx(2.0)
     assert "4.1" in (tmp_path / "task4_1_tpgt_seed_metrics.csv").read_text(encoding="utf-8")
+    assert "checkpoint_version" in (tmp_path / "task4_1_tpgt_seed_metrics.csv").read_text(encoding="utf-8")
     tpgt.record_seed(tmp_path, 0, scores, counts, tmp_path / "epoch_3.pt", 3)
     assert (tmp_path / "task1_1_tpgt_seed_metrics.csv").is_file()
+
+
+def test_summary_scopes_to_current_checkpoint_version(tmp_path, monkeypatch):
+    """Same RUN_TAG results folder must not plot a higher epoch from an older arch."""
+    counts = {"N": 4, "N-1": 4, "N-2": 4, "C2I-N": 2, "C2I-N-1": 2, "C2I-N-2": 2}
+    old_scores = {"N": 0.02971, "N-1": 0.04136, "N-2": 0.04631, "C2I-N": 0.05, "C2I-N-1": 0.06, "C2I-N-2": 0.07}
+    new_scores = {"N": 0.155667, "N-1": 0.176666, "N-2": 0.184549, "C2I-N": 0.19, "C2I-N-1": 0.20, "C2I-N-2": 0.21}
+    monkeypatch.setattr(tpgt, "CHECKPOINT_VERSION", "meshed-rpe-6-d12-gensupport-v17")
+    tpgt.record_seed(tmp_path, 0, old_scores, counts, tmp_path / "old.pt", 30)
+    # Pre-fix CSV row with blank checkpoint_version must also be ignored.
+    path = tmp_path / "task1_1_tpgt_seed_metrics.csv"
+    text = path.read_text(encoding="utf-8").rstrip("\n")
+    path.write_text(
+        text
+        + "\n"
+        + ",".join(
+            [
+                tpgt.MODEL_NAME,
+                "1.1",
+                "N",
+                "0",
+                "0.01",
+                str(tmp_path / "legacy.pt"),
+                "independent_training",
+                "99",
+                "",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tpgt, "CHECKPOINT_VERSION", "meshed-rpe-2-d12-im-rho-v17")
+    tpgt.record_seed(tmp_path, 0, new_scores, counts, tmp_path / "new.pt", 3)
+    summary = tpgt.reconcile_results_metrics(tmp_path)
+    by_cat = {row["test_category"]: float(row["mean_across_seeds"]) for row in summary}
+    assert by_cat["N"] == pytest.approx(0.155667)
+    assert by_cat["N-1"] == pytest.approx(0.176666)
+    kept = path.read_text(encoding="utf-8")
+    assert "meshed-rpe-6-d12-gensupport-v17" in kept
+    assert "meshed-rpe-2-d12-im-rho-v17" in kept
+    # Empty summary from a foreign-only folder deletes the stale summary file.
+    monkeypatch.setattr(tpgt, "CHECKPOINT_VERSION", "never-trained-version")
+    assert tpgt.write_summary(tmp_path) == []
+    assert not (tmp_path / "task1_1_tpgt_summary.csv").is_file()
 
 
 def test_split_cache_stamp_flags_data_fraction_and_rpe(tmp_path, monkeypatch):

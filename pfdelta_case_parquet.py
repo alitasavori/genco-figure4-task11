@@ -189,6 +189,8 @@ def scenario_rows(pm_case: dict[str, Any], scenario: int) -> dict[str, list]:
         "to_bus": [],
         "r": [],
         "x": [],
+        "tap": [],
+        "shift": [],
         "br_status": [],
     }
     index = {bus_id: i for i, bus_id in enumerate(bus_ids)}
@@ -199,6 +201,9 @@ def scenario_rows(pm_case: dict[str, Any], scenario: int) -> dict[str, list]:
         branch_rows["to_bus"].append(index[int(branch["t_bus"])])
         branch_rows["r"].append(float(branch.get("br_r", 0.0)))
         branch_rows["x"].append(float(branch.get("br_x", 0.0)))
+        tap = float(branch.get("tap", 1.0) or 1.0)
+        branch_rows["tap"].append(tap)
+        branch_rows["shift"].append(float(branch.get("shift", 0.0)))
         branch_rows["br_status"].append(float(branch.get("br_status", 1)))
 
     gen_rows: dict[str, list] = {"scenario": [], "idx": [], "gen_bus": [], "Pg": [], "Qg": []}
