@@ -142,12 +142,45 @@ def test_copy_training_rpe_scales_from_checkpoint_cache(tmp_path):
     ckpt_cache.mkdir(parents=True)
     dest = tmp_path / "tpgt_task3.1_v9" / "cache"
     dest.mkdir(parents=True)
-    tpgt.save_rpe_global_scales(ckpt_cache, 1.25, 0.75, raw_re=0.8, raw_im=0.75, source="train_fit")
+    tpgt.save_rpe_global_scales(
+        ckpt_cache, 1.25, 0.75, c_scale=1.0, raw_re=0.8, raw_im=0.75, source="train_fit"
+    )
     tpgt.copy_training_rpe_scales(dest, ckpt)
     assert tpgt.load_rpe_global_scales(dest) == (1.25, 0.75)
+    assert tpgt.load_rpe_c_scale(dest) == 1.0
     payload = tpgt.read_rpe_scales_payload(dest)
     assert payload is not None
     assert payload.get("rpe_re_peak_raw") == 0.8
+
+
+def test_train_fit_rpe_scales_persist_c_scale(tmp_path, monkeypatch):
+    """load_task_split train re-save must keep s_C (valid/test read it from the JSON)."""
+    previous_names = tpgt.RPE_FEATURE_NAMES
+    previous_dim = tpgt.RPE_DIM
+    try:
+        tpgt.apply_rpe_channel_config("re_im_gen")
+        assert tpgt.uses_generator_support_rpe()
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        # First write as cached_split would (with s_C), then the train_fit re-save.
+        tpgt.save_rpe_global_scales(cache, 1.0, 1.4, c_scale=1.0, source="cached_split")
+        assert tpgt.load_rpe_c_scale(cache) == 1.0
+        tpgt.save_rpe_global_scales(
+            cache,
+            1.0,
+            1.42761,
+            c_scale=1.0,
+            raw_re=0.532841,
+            raw_im=1.42761,
+            source="train_fit_train",
+        )
+        assert tpgt.load_rpe_global_scales(cache) == (1.0, 1.42761)
+        assert tpgt.load_rpe_c_scale(cache) == 1.0
+        payload = tpgt.read_rpe_scales_payload(cache)
+        assert payload is not None and "rpe_c_scale" in payload
+    finally:
+        tpgt.RPE_FEATURE_NAMES = previous_names
+        tpgt.RPE_DIM = previous_dim
 
 
 def test_copy_training_rpe_scales_rewrites_stale_cache_version(tmp_path, monkeypatch):

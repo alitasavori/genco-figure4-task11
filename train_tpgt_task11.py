@@ -5443,8 +5443,12 @@ def log_rpe_scales_provenance(cache_dir: Path, *, context: str) -> None:
     im_scale = float(payload["rpe_im_scale"])
     raw_re = payload.get("rpe_re_peak_raw")
     raw_im = payload.get("rpe_im_peak_raw")
+    c_scale = payload.get("rpe_c_scale")
     source = payload.get("source", "unknown")
-    note = f"s_R={re_scale:.6g} s_X={im_scale:.6g} source={source} file={path}"
+    note = f"s_R={re_scale:.6g} s_X={im_scale:.6g}"
+    if c_scale is not None:
+        note += f" s_C={float(c_scale):.6g}"
+    note += f" source={source} file={path}"
     if raw_re is not None and raw_im is not None:
         note += f" (train peaks raw={float(raw_re):.6g}, {float(raw_im):.6g}"
         if re_scale == 1.0 and im_scale == 1.0 and (float(raw_re) < 1.0 or float(raw_im) < 1.0):
@@ -5469,6 +5473,7 @@ def _adopt_rpe_scales(persistent: Path, folder: Path, scales: tuple[float, float
     payload = read_rpe_scales_payload(folder)
     raw_re = None if payload is None else payload.get("rpe_re_peak_raw")
     raw_im = None if payload is None else payload.get("rpe_im_peak_raw")
+    c_scale = None if payload is None else payload.get("rpe_c_scale")
     old_ver = None if payload is None else payload.get("version")
     source = "copied_from_" + folder.name
     if old_ver and old_ver != CACHE_VERSION:
@@ -5482,6 +5487,7 @@ def _adopt_rpe_scales(persistent: Path, folder: Path, scales: tuple[float, float
         persistent,
         scales[0],
         scales[1],
+        c_scale=float(c_scale) if c_scale is not None else None,
         raw_re=float(raw_re) if raw_re is not None else None,
         raw_im=float(raw_im) if raw_im is not None else None,
         source=source,
@@ -7356,9 +7362,12 @@ def cached_split(
                 if name.startswith("train"):
                     unify_rpe_normalization(split)
                     re_scale, im_scale = split_rpe_scales(split)
-                    save_rpe_global_scales(persistent, re_scale, im_scale)
+                    c_scale = split_rpe_c_scale(split)
+                    save_rpe_global_scales(persistent, re_scale, im_scale, c_scale=c_scale)
                     stamp["rpe_re_scale"] = re_scale
                     stamp["rpe_im_scale"] = im_scale
+                    if c_scale is not None:
+                        stamp["rpe_c_scale"] = c_scale
                 _compact_if(split, name, compact)
                 torch.save(split, tensor_path)
                 stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
@@ -7462,24 +7471,29 @@ def load_task_split(data_root: Path, split_name: str, active: Path, persistent: 
     if split_name == "train":
         re_scale, im_scale, raw_re, raw_im = fit_global_zeff_rpe_scales_from_networks(split.networks)
         unify_rpe_normalization(split, (re_scale, im_scale))
+        c_scale = split_rpe_c_scale(split) if uses_generator_support_rpe() else None
         save_rpe_global_scales(
             persistent,
             re_scale,
             im_scale,
+            c_scale=c_scale,
             raw_re=raw_re,
             raw_im=raw_im,
             source=f"train_fit_{split_name}",
         )
         log_rpe_scales_provenance(persistent, context=f"saved {split_name}")
+        c_note = f" s_C={c_scale:.6g}" if c_scale is not None else ""
         print(
-            f"{split_name}: saved RPE scales s_R={re_scale:.6g} s_X={im_scale:.6g} "
+            f"{split_name}: saved RPE scales s_R={re_scale:.6g} s_X={im_scale:.6g}{c_note} "
             f"(raw peaks {raw_re:.6g}, {raw_im:.6g}) -> {rpe_scales_path(persistent)}",
             flush=True,
         )
     elif train_scales is not None:
         re_scale, im_scale = train_scales
+        c_note = f" s_C={train_c:.6g}" if train_c is not None else ""
         print(
-            f"{split_name}: RPE normalization uses train scales s_R={re_scale:.6g} s_X={im_scale:.6g}",
+            f"{split_name}: RPE normalization uses train scales "
+            f"s_R={re_scale:.6g} s_X={im_scale:.6g}{c_note}",
             flush=True,
         )
     return split
