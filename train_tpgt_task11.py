@@ -62,12 +62,12 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
   uses ``η_angle=1``.
 * **RPE**: legacy ``Zeff_Re_norm`` + ``Zeff_Im_norm`` (v7–v16 / v19/v20);
   **v17** RPE is selectable via preset / ``GENCO_TPGT_RPE_CHANNELS`` / notebook
-  ``RPE_CHANNELS``: ``rho`` (default: gen-grounded ``ρ_ij`` only), ``im_rho``
-  (Im+ρ), ``im``, or ``re_im``. ``ρ`` comes from ``C=L_{UU}^{-1}`` (Slack∪PV
-  grounded). Generator outages change ``G`` and thus ``C/ρ``; unsupported PQ
-  islands are flagged invalid (``C=0`` is a numerical fallback, not physical
-  zero sensitivity). Train-only ``s_C`` / ``s_X`` — never re-fit per test topology.
-  **v17im** is Im-only Zeff.
+  ``RPE_CHANNELS``: ``rho`` (default: gen-grounded ``ρ_ij`` only), ``cij``
+  (``Cij_norm=C/s_C``), ``im_rho`` (Im+ρ), ``im``, or ``re_im``. ``C``/``ρ`` come
+  from ``C=L_{UU}^{-1}`` (Slack∪PV grounded). Generator outages change ``G`` and
+  thus ``C/ρ``; unsupported PQ islands are flagged invalid (``C=0`` is a numerical
+  fallback, not physical zero sensitivity). Train-only ``s_C`` / ``s_X`` — never
+  re-fit per test topology. **v17im** is Im-only Zeff.
 * **Node features**: v9–v16 ``(P,Q,V,θ,busBS)`` with net ``P=Ps−Pd``; **v19/v20** keep PQ
   at 5-D ``(P,Q,V,θ,busBS)`` and give PV/Slack ``(Pd,Qd,Ps,Qs,V,θ,busBS)``.
   PV/Slack pack ``Ps/Qs``; AC residual injects ``Ps−Pd``, ``Qs−Qd``.
@@ -242,11 +242,13 @@ PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
 CACHE_VERSION = "tpgt-cache-19"
-# Default / legacy (v7–v16): Re+Im. ``im`` = Im-only; ``im_rho`` = Im+ρ; ``rho`` = ρ only.
+# Default / legacy (v7–v16): Re+Im. ``im`` = Im-only; ``im_rho`` = Im+ρ;
+# ``rho`` = ρ only; ``cij`` = gen-grounded C/s_C only.
 RPE_FEATURE_NAMES_RE_IM = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_FEATURE_NAMES_IM = ("Zeff_Im_norm",)
 RPE_FEATURE_NAMES_IM_RHO = ("Zeff_Im_norm", "rho_ij")
 RPE_FEATURE_NAMES_RHO = ("rho_ij",)
+RPE_FEATURE_NAMES_CIJ = ("Cij_norm",)
 # Legacy alias name kept for older call sites; same channels as ``IM_RHO``.
 RPE_FEATURE_NAMES_RE_IM_GEN = RPE_FEATURE_NAMES_IM_RHO
 RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM
@@ -257,6 +259,7 @@ RPE_CHANNEL_SLUGS = {
     RPE_FEATURE_NAMES_IM: "im",
     RPE_FEATURE_NAMES_IM_RHO: "im-rho",
     RPE_FEATURE_NAMES_RHO: "rho",
+    RPE_FEATURE_NAMES_CIJ: "cij",
 }
 # v15 pair-rotary electrical pair features (ablate these, not Zeff RPE).
 PAIR_ELEC_FEATURE_NAMES = ("elec_dist", "edge_on", "edge_weight")
@@ -486,7 +489,7 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "RPE_CHANNELS": "re_im",
     },
     # v16 GRIT + selectable gen-support RPE (default ρ-only). Override with
-    # GENCO_TPGT_RPE_CHANNELS=im_rho|im|re_im|rho (notebook RPE_CHANNELS).
+    # GENCO_TPGT_RPE_CHANNELS=rho|cij|im_rho|im|re_im (notebook RPE_CHANNELS).
     # C=L[U,U]^{-1} still built when ρ is selected; invalid PQ islands flagged.
     # Train-only s_X / s_C; pair encoder in_features = RPE_DIM.
     "v17": {
@@ -5487,6 +5490,7 @@ def meshed_rpe(
     Im-only (``RPE_CHANNELS=im`` / ``v17im``): Im only (1 channel).
     Im+ρ (``RPE_CHANNELS=im_rho``): ``Zeff_Im_norm`` + ``ρ_ij`` (2).
     ρ-only (``RPE_CHANNELS=rho`` / default ``v17``): ``ρ_ij`` (1).
+    C-only (``RPE_CHANNELS=cij``): ``Cij_norm = C / s_C`` (1); Slack/PV rows/cols 0.
     ``ρ`` is PQ–PQ only and zero on ``invalid_support`` buses (unsupported islands /
     singular ``L_UU``); those zeros are a numerical fallback, not physical zero
     sensitivity — see ``Network.gen_support_invalid``. Generator outages change
@@ -5548,9 +5552,13 @@ def meshed_rpe(
         features[..., 1] = im
     elif RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM and RPE_DIM == 1:
         features[..., 0] = im
-    elif RPE_FEATURE_NAMES in (RPE_FEATURE_NAMES_IM_RHO, RPE_FEATURE_NAMES_RHO):
+    elif RPE_FEATURE_NAMES in (
+        RPE_FEATURE_NAMES_IM_RHO,
+        RPE_FEATURE_NAMES_RHO,
+        RPE_FEATURE_NAMES_CIJ,
+    ):
         if types is None:
-            raise ValueError("meshed_rpe rho channels require bus types for generator grounding")
+            raise ValueError("meshed_rpe gen-support channels require bus types for grounding")
         type_np = np.asarray(types, dtype=np.int64).reshape(-1)
         if type_np.size != bus_count:
             raise ValueError(f"types length {type_np.size} != bus_count {bus_count}")
@@ -5563,23 +5571,29 @@ def meshed_rpe(
         ):
             if not check.passed:
                 raise RuntimeError(f"gen-support validation failed: {check.name}: {check.detail}")
-        # ρ is scale-free. Train-fit s_C is stored on Network.rpe_c_scale for audits /
-        # cache plumbing; never recompute it per contingency topology.
-        _ = c_scale
-        both_pq = pq[:, None] & pq[None, :]
         invalid_support = built.invalid_support.astype(bool, copy=False)
-        valid = (~invalid_support)[:, None] & (~invalid_support)[None, :]
-        rho = generator_support_rho(built.c_full).astype(np.float32)
-        rho_masked = np.where(both_pq & valid, rho, 0.0).astype(np.float32)
-        if RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM_RHO and RPE_DIM == 2:
-            features[..., 0] = im
-            features[..., 1] = rho_masked
-        elif RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_RHO and RPE_DIM == 1:
-            features[..., 0] = rho_masked
+        if RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_CIJ and RPE_DIM == 1:
+            # Train-fit s_C; reuse on valid/test — never recompute per contingency.
+            c_div = float(c_scale) if c_scale is not None and float(c_scale) > 0 else 1.0
+            features[..., 0] = (built.c_full / c_div).astype(np.float32)
         else:
-            raise RuntimeError(
-                f"meshed_rpe rho layout mismatch RPE_FEATURE_NAMES={RPE_FEATURE_NAMES} RPE_DIM={RPE_DIM}"
-            )
+            # ρ is scale-free. Train-fit s_C is stored on Network.rpe_c_scale for audits /
+            # cache plumbing; never recompute it per contingency topology.
+            _ = c_scale
+            both_pq = pq[:, None] & pq[None, :]
+            valid = (~invalid_support)[:, None] & (~invalid_support)[None, :]
+            rho = generator_support_rho(built.c_full).astype(np.float32)
+            rho_masked = np.where(both_pq & valid, rho, 0.0).astype(np.float32)
+            if RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM_RHO and RPE_DIM == 2:
+                features[..., 0] = im
+                features[..., 1] = rho_masked
+            elif RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_RHO and RPE_DIM == 1:
+                features[..., 0] = rho_masked
+            else:
+                raise RuntimeError(
+                    f"meshed_rpe gen-support layout mismatch "
+                    f"RPE_FEATURE_NAMES={RPE_FEATURE_NAMES} RPE_DIM={RPE_DIM}"
+                )
     else:
         raise RuntimeError(
             f"meshed_rpe cannot map Zeff into RPE_FEATURE_NAMES={RPE_FEATURE_NAMES} RPE_DIM={RPE_DIM}"
@@ -6305,14 +6319,17 @@ def _parse_mlp_hiddens(raw: object, default: tuple[int, ...] = (128, 64)) -> tup
 
 
 def rpe_channels_slug() -> str:
-    """Short tag for the active RPE layout (``rho``, ``im-rho``, ``im``, ``re-im``)."""
+    """Short tag for the active RPE layout (``rho``, ``cij``, ``im-rho``, …)."""
     return RPE_CHANNEL_SLUGS.get(RPE_FEATURE_NAMES, f"{RPE_DIM}ch")
+
+
+_RPE_VERSION_SLUG_RE = r"(?:im-rho|re-im|gensupport|cij|rho|im)"
 
 
 def apply_rpe_channel_config(channels: str) -> None:
     """Set global ``RPE_FEATURE_NAMES`` / ``RPE_DIM`` from channel preset name.
 
-    Notebook / env: ``GENCO_TPGT_RPE_CHANNELS`` ∈ ``{re_im, im, im_rho, rho}``.
+    Notebook / env: ``GENCO_TPGT_RPE_CHANNELS`` ∈ ``{re_im, im, im_rho, rho, cij}``.
     """
     global RPE_FEATURE_NAMES, RPE_DIM
     key = str(channels).strip().lower().replace("+", "_").replace("-", "_")
@@ -6330,16 +6347,18 @@ def apply_rpe_channel_config(channels: str) -> None:
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_IM_RHO
     elif key in ("rho", "rho_only", "rho_ij", "gen_support", "gensupport"):
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RHO
+    elif key in ("cij", "cij_only", "cij_norm", "c_ij"):
+        RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_CIJ
     else:
         raise ValueError(
-            f"unknown RPE_CHANNELS {channels!r}; use re_im, im, im_rho, or rho"
+            f"unknown RPE_CHANNELS {channels!r}; use re_im, im, im_rho, rho, or cij"
         )
     RPE_DIM = len(RPE_FEATURE_NAMES)
 
 
 def uses_generator_support_rpe() -> bool:
-    """True when the active RPE includes gen-grounded ``ρ_ij`` (needs bus types / C)."""
-    return "rho_ij" in RPE_FEATURE_NAMES
+    """True when the active RPE needs gen-grounded ``C`` (ρ and/or ``Cij_norm``)."""
+    return any(name in RPE_FEATURE_NAMES for name in ("rho_ij", "Cij_norm", "Cii_norm", "Cjj_norm"))
 
 
 def retag_checkpoint_version_for_rpe(*, force_slug: bool = False) -> None:
@@ -6354,11 +6373,11 @@ def retag_checkpoint_version_for_rpe(*, force_slug: bool = False) -> None:
     global CHECKPOINT_VERSION
     slug = rpe_channels_slug()
     cv = re.sub(r"meshed-rpe-\d+", f"meshed-rpe-{RPE_DIM}", str(CHECKPOINT_VERSION), count=1)
-    has_slug = re.search(r"-(?:im-rho|re-im|gensupport|rho|im)-v\d+$", cv) is not None
+    has_slug = re.search(rf"-{_RPE_VERSION_SLUG_RE}-v\d+$", cv) is not None
     if has_slug:
         # Replace existing channel tag (no-op when it already matches).
         CHECKPOINT_VERSION = re.sub(
-            r"-(?:im-rho|re-im|gensupport|rho|im)(?=-v\d+$)",
+            rf"-{_RPE_VERSION_SLUG_RE}(?=-v\d+$)",
             f"-{slug}",
             cv,
             count=1,

@@ -162,6 +162,49 @@ def test_v17_rho_only_rpe():
         tpgt.CHECKPOINT_VERSION = previous_cv
 
 
+def test_v17_cij_only_rpe():
+    """Selectable Cij_norm = C/s_C (1 channel); gen rows/cols stay 0."""
+    previous_names = tpgt.RPE_FEATURE_NAMES
+    previous_dim = tpgt.RPE_DIM
+    previous_d = tpgt.D
+    previous_de = tpgt.D_E
+    previous_cv = tpgt.CHECKPOINT_VERSION
+    try:
+        tpgt.apply_rpe_channel_config("cij")
+        tpgt.D = 96
+        tpgt.D_E = 48
+        tpgt.CHECKPOINT_VERSION = "meshed-rpe-1-d12-w96-h4-pqvt-busBS-rho-v17"
+        tpgt.retag_checkpoint_version_for_rpe()
+        assert tpgt.RPE_DIM == 1
+        assert tpgt.RPE_FEATURE_NAMES == ("Cij_norm",)
+        assert tpgt.uses_generator_support_rpe()
+        assert tpgt.rpe_channels_slug() == "cij"
+        assert tpgt.CHECKPOINT_VERSION.endswith("-cij-v17")
+        xg, xij = 0.2, 0.5
+        branches = [(0, 1, 0.0, xg), (1, 2, 0.0, xij)]
+        types = np.array([1, 0, 0], dtype=np.int64)
+        ybus = np.zeros((3, 3), dtype=np.complex64)
+        features, _, invalid = meshed_rpe(
+            3, branches, ybus, types=types, c_scale=1.0, return_invalid=True
+        )
+        assert features.shape == (3, 3, 1)
+        assert invalid is not None and not np.any(invalid)
+        # C_UU = [[xg, xg], [xg, xg+xij]] with PV grounded.
+        assert np.isclose(features[1, 1, 0], xg, atol=1e-5)
+        assert np.isclose(features[1, 2, 0], xg, atol=1e-5)
+        assert np.isclose(features[2, 2, 0], xg + xij, atol=1e-5)
+        assert np.allclose(features[0, :], 0.0)
+        assert np.allclose(features[:, 0], 0.0)
+        model = TPGT()
+        assert model.pair_encoder.net[0].in_features == 1
+    finally:
+        tpgt.RPE_FEATURE_NAMES = previous_names
+        tpgt.RPE_DIM = previous_dim
+        tpgt.D = previous_d
+        tpgt.D_E = previous_de
+        tpgt.CHECKPOINT_VERSION = previous_cv
+
+
 def test_v17_gen_support_no_pinv_on_pq_island():
     """PQ island without Slack/PV → invalid_support; C=0 is numerical fallback only."""
     previous_names = tpgt.RPE_FEATURE_NAMES
