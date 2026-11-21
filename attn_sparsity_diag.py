@@ -267,16 +267,18 @@ def plot_attention_heatmap(
     types: np.ndarray | None = None,
     type_names: tuple[str, ...] = ("PQ", "PV", "Slack"),
     cbar_label: str = "Attention weight α",
+    log1p: bool = False,
 ) -> None:
     apply_plot_style()
+    shown = np.log1p(np.maximum(grid, 0.0) * 1e3) if log1p else grid
     buses = int(grid.shape[0])
     fig, axis = plt.subplots(figsize=(8.5, 7.2))
-    im = axis.imshow(grid, aspect="equal", interpolation="nearest", cmap="magma")
+    im = axis.imshow(shown, aspect="equal", interpolation="nearest", cmap="magma")
     axis.set_xlabel("Sender bus")
     axis.set_ylabel("Receiver bus")
     axis.set_title(title)
     cbar = fig.colorbar(im, ax=axis, fraction=0.046, pad=0.04)
-    cbar.set_label(cbar_label)
+    cbar.set_label("log1p(1000·α)" if log1p else cbar_label)
     if types is not None and buses <= 80:
         # Light type ticks so PQ/PV/Slack structure is readable on case57.
         ticks = list(range(0, buses, max(1, buses // 12)))
@@ -506,6 +508,13 @@ def run_attention_sparsity_diagnostic(
                 types=types,
                 cbar_label="Attention weight α",
             )
+            plot_attention_heatmap(
+                grid,
+                work_dir / f"heatmap_{stem}_mean_heads_log.png",
+                title=f"{label} stage {stage_i + 1}: log1p mean α",
+                types=types,
+                log1p=True,
+            )
             if contrib is not None:
                 msg_grid = mean_attention_grid(contrib)
                 stage_msg_grids.append(msg_grid)
@@ -599,6 +608,13 @@ def run_attention_sparsity_diagnostic(
                 title=f"{label}: mean α over stages×batch×heads",
                 types=types,
                 cbar_label="Attention weight α",
+            )
+            plot_attention_heatmap(
+                mean_all,
+                work_dir / f"heatmap_{label}_all_stages_mean_log.png",
+                title=f"{label}: log1p mean α over stages",
+                types=types,
+                log1p=True,
             )
             np_path = work_dir / f"attn_grid_{label}_all_stages.npy"
             np.save(np_path, mean_all)
@@ -698,6 +714,7 @@ def display_attn_sparsity(out_dir: Path, labels: tuple[str, ...] = ("N", "N-1", 
     for label in labels:
         for name in (
             f"heatmap_{label}_all_stages_mean.png",
+            f"heatmap_{label}_all_stages_mean_log.png",
             f"heatmap_{label}_all_stages_message_mean.png",
         ):
             path = out_dir / name
