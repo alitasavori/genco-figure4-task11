@@ -99,7 +99,15 @@ def main() -> None:
         enc_pq = mlp_params(node_in_pq, t.D)
         enc_pv_slack = enc_pq
         node_txt = f"{node_in_pq}"
-    pe_one = 0 if t.ATTENTION_KIND in t.RAW_RPE_ATTENTION_KINDS else mlp_params(t.RPE_DIM, t.D_E)
+    if t.ATTENTION_KIND in t.RAW_RPE_ATTENTION_KINDS:
+        pe_one = 0
+        pe_label = "Pair encoder (Identity / raw RPE)"
+    elif getattr(t, "USE_TYPE_CONDITIONED_RPE", False):
+        pe_one = mlp_params(2, t.D_E) + mlp_params(1, t.D_E)
+        pe_label = "Pair encoders E_PQ(2)+E_other(1) -> D_E"
+    else:
+        pe_one = mlp_params(t.RPE_DIM, t.D_E)
+        pe_label = "Pair encoder MLP (RPE -> D_E)"
     grpe_shared = shared_grpe_params() if t.ATTENTION_KIND in t.GRPE_ATTENTION_KINDS else 0
     exph_shared = shared_exphormer_params() if t.ATTENTION_KIND == "exphormer" else 0
 
@@ -116,11 +124,7 @@ def main() -> None:
         ("PQ type encoder MLP", enc_pq, 1),
         ("PV type encoder MLP", enc_pv_slack, 1),
         ("Slack type encoder MLP", enc_pv_slack, 1),
-        (
-            "Pair encoder MLP (RPE -> D_E)" if pe_one else "Pair encoder (Identity / raw RPE)",
-            pe_one,
-            1,
-        ),
+        (pe_label, pe_one, 1),
     ]
     if grpe_shared:
         rows.append(("Shared GRPE hop/edge encodings (P/E QKV)", grpe_shared, 1))

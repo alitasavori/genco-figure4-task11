@@ -62,12 +62,14 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
   uses ``η_angle=1``.
 * **RPE**: legacy ``Zeff_Re_norm`` + ``Zeff_Im_norm`` (v7–v16 / v19/v20);
   **v17** RPE is selectable via preset / ``GENCO_TPGT_RPE_CHANNELS`` / notebook
-  ``RPE_CHANNELS``: ``rho`` (default: gen-grounded ``ρ_ij`` only), ``cij``
-  (``Cij_norm=C/s_C``), ``im_rho`` (Im+ρ), ``im``, or ``re_im``. ``C``/``ρ`` come
-  from ``C=L_{UU}^{-1}`` (Slack∪PV grounded). Generator outages change ``G`` and
-  thus ``C/ρ``; unsupported PQ islands are flagged invalid (``C=0`` is a numerical
-  fallback, not physical zero sensitivity). Train-only ``s_C`` / ``s_X`` — never
-  re-fit per test topology. **v17im** is Im-only Zeff.
+  ``RPE_CHANNELS``: ``type_cond`` (default: type-conditioned dual encoders —
+  PQ–PQ uses ``[Zeff_Im, ρ]``, other type pairs use ``Zeff_Im`` only), ``im_rho``
+  (shared MLP on Im+ρ; controlled-comparison baseline), ``rho``, ``cij``, ``im``,
+  or ``re_im``. ``C``/``ρ`` come from ``C=L_{UU}^{-1}`` (Slack∪PV grounded).
+  Generator outages change ``G`` and thus ``C/ρ``; unsupported PQ islands are
+  flagged invalid (``C=0`` is a numerical fallback, not physical zero
+  sensitivity). Train-only ``s_C`` / ``s_X`` — never re-fit per test topology.
+  **v17im** is Im-only Zeff.
 * **Node features**: v9–v16 ``(P,Q,V,θ,busBS)`` with net ``P=Ps−Pd``; **v19/v20** keep PQ
   at 5-D ``(P,Q,V,θ,busBS)`` and give PV/Slack ``(Pd,Qd,Ps,Qs,V,θ,busBS)``.
   PV/Slack pack ``Ps/Qs``; AC residual injects ``Ps−Pd``, ``Qs−Qd``.
@@ -242,8 +244,9 @@ PHYSICS_STAGE_DECAY = 0.5
 MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
 CACHE_VERSION = "tpgt-cache-19"
-# Default / legacy (v7–v16): Re+Im. ``im`` = Im-only; ``im_rho`` = Im+ρ;
-# ``rho`` = ρ only; ``cij`` = gen-grounded C/s_C only.
+# Default / legacy (v7–v16): Re+Im. ``im`` = Im-only; ``im_rho`` = shared Im+ρ;
+# ``type_cond`` = Im+ρ with dual type-conditioned encoders; ``rho`` = ρ only;
+# ``cij`` = gen-grounded C/s_C only.
 RPE_FEATURE_NAMES_RE_IM = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_FEATURE_NAMES_IM = ("Zeff_Im_norm",)
 RPE_FEATURE_NAMES_IM_RHO = ("Zeff_Im_norm", "rho_ij")
@@ -253,6 +256,8 @@ RPE_FEATURE_NAMES_CIJ = ("Cij_norm",)
 RPE_FEATURE_NAMES_RE_IM_GEN = RPE_FEATURE_NAMES_IM_RHO
 RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM
 RPE_DIM = len(RPE_FEATURE_NAMES)
+# When True, GRIT uses independent E_PQ([Im,ρ]) and E_other(Im) instead of one shared MLP.
+USE_TYPE_CONDITIONED_RPE = False
 # Short tags used in checkpoint_version / notebook banners.
 RPE_CHANNEL_SLUGS = {
     RPE_FEATURE_NAMES_RE_IM: "re-im",
@@ -261,6 +266,7 @@ RPE_CHANNEL_SLUGS = {
     RPE_FEATURE_NAMES_RHO: "rho",
     RPE_FEATURE_NAMES_CIJ: "cij",
 }
+RPE_CHANNEL_SLUG_TYPE_COND = "type-cond"
 # v15 pair-rotary electrical pair features (ablate these, not Zeff RPE).
 PAIR_ELEC_FEATURE_NAMES = ("elec_dist", "edge_on", "edge_weight")
 # Per optimizer step, each RPE channel is zeroed (whole 118x118 plane, no rescaling) with this
@@ -488,10 +494,11 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "ATTENTION_KIND": "grit",
         "RPE_CHANNELS": "re_im",
     },
-    # v16 GRIT + selectable gen-support RPE (default ρ-only). Override with
-    # GENCO_TPGT_RPE_CHANNELS=rho|cij|im_rho|im|re_im (notebook RPE_CHANNELS).
+    # v16 GRIT + selectable gen-support RPE. Default: type-conditioned dual
+    # encoders (PQ–PQ: Im+ρ; other pairs: Im only). Override with
+    # GENCO_TPGT_RPE_CHANNELS=type_cond|im_rho|rho|cij|im|re_im (notebook RPE_CHANNELS).
     # C=L[U,U]^{-1} still built when ρ is selected; invalid PQ islands flagged.
-    # Train-only s_X / s_C; pair encoder in_features = RPE_DIM.
+    # Train-only s_X / s_C; stored RPE_DIM=2 for type_cond / im_rho.
     "v17": {
         "D": 96,
         "D_E": 48,
@@ -499,10 +506,10 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
         "HEADS": 4,
         "DEPTH": 12,
         "RUN_TAG": "v17",
-        "CHECKPOINT_VERSION": "meshed-rpe-1-d12-w96-h4-pqvt-busBS-rho-v17",
+        "CHECKPOINT_VERSION": "meshed-rpe-2-d12-w96-h4-pqvt-busBS-type-cond-v17",
         "USE_NODE_SHUNT": True,
         "ATTENTION_KIND": "grit",
-        "RPE_CHANNELS": "rho",
+        "RPE_CHANNELS": "type_cond",
     },
     # Former Im-only GRIT (v16 dims, drop Real Zeff). Kept so old runs remain selectable.
     "v17im": {
@@ -1050,6 +1057,52 @@ class MLP(nn.Module):
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         return self.net(values)
+
+
+class TypeConditionedPairEncoder(nn.Module):
+    """Independent PQ–PQ and other-pair RPE encoders (v17 ``type_cond``).
+
+    Stored pair features are always ``[Zeff_Im_norm, rho_ij]``. PQ–PQ pairs
+    (``t_i=t_j=0``) use ``E_PQ`` on both channels; all other type pairs use
+    ``E_other`` on the reactance channel only. Parameters are not shared.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pq_encoder = MLP(2, D_E)
+        self.other_encoder = MLP(1, D_E)
+
+    def forward(self, rpe: torch.Tensor, types: torch.Tensor) -> torch.Tensor:
+        if rpe.shape[-1] != 2:
+            raise ValueError(
+                f"type-conditioned pair encoder expects last-dim 2 (Im, ρ), got {tuple(rpe.shape)}"
+            )
+        if types is None:
+            raise ValueError("type-conditioned pair encoder requires bus types")
+        type_tensor = types
+        if not torch.is_tensor(type_tensor):
+            raise TypeError("types must be a LongTensor of bus types")
+        # rpe: (N,N,2) or (U,N,N,2); types: (N,) or (U,N)
+        x_eff = rpe[..., :1]
+        e_other = self.other_encoder(x_eff)
+        e_pq = self.pq_encoder(rpe)
+        if type_tensor.dim() == 1:
+            pq = type_tensor == 0
+            both_pq = pq.unsqueeze(-1) & pq.unsqueeze(-2)  # (N, N)
+            # Broadcast over leading batch dims of rpe when present.
+            while both_pq.dim() < rpe.dim() - 1:
+                both_pq = both_pq.unsqueeze(0)
+        elif type_tensor.dim() == 2:
+            if rpe.dim() != 4 or type_tensor.shape[0] != rpe.shape[0]:
+                raise ValueError(
+                    f"batched types shape {tuple(type_tensor.shape)} incompatible with "
+                    f"rpe shape {tuple(rpe.shape)}"
+                )
+            pq = type_tensor == 0
+            both_pq = pq.unsqueeze(-1) & pq.unsqueeze(-2)  # (U, N, N)
+        else:
+            raise ValueError(f"types must be (N,) or (U,N), got shape {tuple(type_tensor.shape)}")
+        return torch.where(both_pq.unsqueeze(-1), e_pq, e_other)
 
 
 def _init_matrices(weight: torch.Tensor) -> None:
@@ -2109,7 +2162,13 @@ class TPGT(nn.Module):
         self.attention_kind = ATTENTION_KIND
         # v10/v11/v11e/v12 consume raw RPE path; GRIT still uses a learned pair encoder.
         self.use_raw_rpe = ATTENTION_KIND in RAW_RPE_ATTENTION_KINDS
-        self.pair_encoder: nn.Module = nn.Identity() if self.use_raw_rpe else MLP(RPE_DIM, D_E)
+        self.use_type_conditioned_rpe = bool(USE_TYPE_CONDITIONED_RPE) and not self.use_raw_rpe
+        if self.use_raw_rpe:
+            self.pair_encoder: nn.Module = nn.Identity()
+        elif self.use_type_conditioned_rpe:
+            self.pair_encoder = TypeConditionedPairEncoder()
+        else:
+            self.pair_encoder = MLP(RPE_DIM, D_E)
         self.grpe_encodings: GrpeEncodings | None = (
             GrpeEncodings() if ATTENTION_KIND in GRPE_ATTENTION_KINDS else None
         )
@@ -2123,9 +2182,23 @@ class TPGT(nn.Module):
             nn.init.xavier_uniform_(self.virt_rpe)
         self.stages = nn.ModuleList(CorrectionStage() for _ in range(DEPTH))
 
-    def encode_pairs(self, rpe: torch.Tensor) -> torch.Tensor:
-        """Features for correction-stage attention (raw RPE for v10/v11/v12, else ``pair_encoder``)."""
-        return rpe if self.use_raw_rpe else self.pair_encoder(rpe)
+    def encode_pairs(
+        self,
+        rpe: torch.Tensor,
+        types: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Features for correction-stage attention (raw RPE for v10/v11/v12, else ``pair_encoder``).
+
+        Type-conditioned v17 requires ``types`` so PQ–PQ pairs use ``E_PQ([Im,ρ])``
+        and all other type pairs use ``E_other(Im)``.
+        """
+        if self.use_raw_rpe:
+            return rpe
+        if self.use_type_conditioned_rpe:
+            if types is None:
+                raise ValueError("type-conditioned RPE encoder requires bus types")
+            return self.pair_encoder(rpe, types)
+        return self.pair_encoder(rpe)
 
     def clear_grit_elec_proj_caches(self) -> None:
         """Invalidate per-stage ``W_Ew e`` / ``W_Eb e`` caches (weights changed or ablation flags)."""
@@ -2185,7 +2258,10 @@ class TPGT(nn.Module):
         Pair-rotary needs ``pair_elec`` and ``component``.
         """
         if pair is None:
-            pair = self.encode_pairs(rpe)
+            type_tensor = types if torch.is_tensor(types) else None
+            if type_tensor is None and layout is not None:
+                type_tensor = layout.types
+            pair = self.encode_pairs(rpe, types=type_tensor)
         if layout is None:
             if pair_type_masks is None:
                 raise ValueError("TPGT forward needs pair_type_masks or a layout")
@@ -2719,6 +2795,21 @@ def pair_encoder_input_weight_norms(model: TPGT) -> list[dict[str, float]]:
     """L2 norm of each column of the pair_encoder first layer (how strongly each RPE channel is wired in)."""
     if getattr(model, "use_raw_rpe", False) or isinstance(model.pair_encoder, nn.Identity):
         return [{"name": name, "weight_l2": 0.0} for name in RPE_FEATURE_NAMES]
+    if getattr(model, "use_type_conditioned_rpe", False):
+        enc = model.pair_encoder
+        if not isinstance(enc, TypeConditionedPairEncoder):
+            raise TypeError("type-conditioned model.pair_encoder must be TypeConditionedPairEncoder")
+        pq_first = enc.pq_encoder.net[0]
+        other_first = enc.other_encoder.net[0]
+        if not isinstance(pq_first, nn.Linear) or not isinstance(other_first, nn.Linear):
+            raise TypeError("type-conditioned encoder first layers must be Linear")
+        pq_norms = torch.linalg.vector_norm(pq_first.weight.detach(), dim=0)
+        other_norms = torch.linalg.vector_norm(other_first.weight.detach(), dim=0)
+        return [
+            {"name": "Zeff_Im_norm(other)", "weight_l2": float(other_norms[0])},
+            {"name": "Zeff_Im_norm(pq)", "weight_l2": float(pq_norms[0])},
+            {"name": "rho_ij(pq)", "weight_l2": float(pq_norms[1])},
+        ]
     first = model.pair_encoder.net[0]
     if not isinstance(first, nn.Linear):
         raise TypeError("pair_encoder first layer must be Linear")
@@ -2862,7 +2953,7 @@ def collect_rpe_channel_ablation(
     for channel, name in enumerate(RPE_FEATURE_NAMES):
         rpe_ablated = network.rpe.clone()
         rpe_ablated[..., channel] = 0.0
-        ablated_pair = model.encode_pairs(rpe_ablated)
+        ablated_pair = model.encode_pairs(rpe_ablated, types=network.types)
         metrics = eval_batch_with_pair(model, split, network, index, device, ablated_pair)
         rows.append(
             {
@@ -5488,8 +5579,10 @@ def meshed_rpe(
 
     Legacy (``RPE_CHANNELS=re_im``): normalized Re and Im (2 channels).
     Im-only (``RPE_CHANNELS=im`` / ``v17im``): Im only (1 channel).
-    Im+ρ (``RPE_CHANNELS=im_rho``): ``Zeff_Im_norm`` + ``ρ_ij`` (2).
-    ρ-only (``RPE_CHANNELS=rho`` / default ``v17``): ``ρ_ij`` (1).
+    Im+ρ shared (``RPE_CHANNELS=im_rho``): ``Zeff_Im_norm`` + ``ρ_ij`` (2), one MLP.
+    Type-conditioned (``RPE_CHANNELS=type_cond`` / default ``v17``): same 2 stored
+    channels; ``E_PQ`` on PQ–PQ, ``E_other`` (Im only) on the other eight type pairs.
+    ρ-only (``RPE_CHANNELS=rho``): ``ρ_ij`` (1).
     C-only (``RPE_CHANNELS=cij``): ``Cij_norm = C / s_C`` (1); Slack/PV rows/cols 0.
     ``ρ`` is PQ–PQ only and zero on ``invalid_support`` buses (unsupported islands /
     singular ``L_UU``); those zeros are a numerical fallback, not physical zero
@@ -5583,7 +5676,8 @@ def meshed_rpe(
             both_pq = pq[:, None] & pq[None, :]
             valid = (~invalid_support)[:, None] & (~invalid_support)[None, :]
             rho = generator_support_rho(built.c_full).astype(np.float32)
-            rho_masked = np.where(both_pq & valid, rho, 0.0).astype(np.float32)
+            # Keep zero-diagonal encoder convention (ρ_ii would be 1 mathematically).
+            rho_masked = np.where(both_pq & valid & off_diagonal, rho, 0.0).astype(np.float32)
             if RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM_RHO and RPE_DIM == 2:
                 features[..., 0] = im
                 features[..., 1] = rho_masked
@@ -6319,28 +6413,35 @@ def _parse_mlp_hiddens(raw: object, default: tuple[int, ...] = (128, 64)) -> tup
 
 
 def rpe_channels_slug() -> str:
-    """Short tag for the active RPE layout (``rho``, ``cij``, ``im-rho``, …)."""
+    """Short tag for the active RPE layout (``type-cond``, ``rho``, ``cij``, …)."""
+    if USE_TYPE_CONDITIONED_RPE:
+        return RPE_CHANNEL_SLUG_TYPE_COND
     return RPE_CHANNEL_SLUGS.get(RPE_FEATURE_NAMES, f"{RPE_DIM}ch")
 
 
-_RPE_VERSION_SLUG_RE = r"(?:im-rho|re-im|gensupport|cij|rho|im)"
+_RPE_VERSION_SLUG_RE = r"(?:type-cond|im-rho|re-im|gensupport|cij|rho|im)"
 
 
 def apply_rpe_channel_config(channels: str) -> None:
-    """Set global ``RPE_FEATURE_NAMES`` / ``RPE_DIM`` from channel preset name.
+    """Set global ``RPE_FEATURE_NAMES`` / ``RPE_DIM`` / type-conditioned flag.
 
-    Notebook / env: ``GENCO_TPGT_RPE_CHANNELS`` ∈ ``{re_im, im, im_rho, rho, cij}``.
+    Notebook / env: ``GENCO_TPGT_RPE_CHANNELS`` ∈
+    ``{type_cond, re_im, im, im_rho, rho, cij}``.
     """
-    global RPE_FEATURE_NAMES, RPE_DIM
+    global RPE_FEATURE_NAMES, RPE_DIM, USE_TYPE_CONDITIONED_RPE
     key = str(channels).strip().lower().replace("+", "_").replace("-", "_")
-    if key in ("re_im", "reim", "both"):
+    USE_TYPE_CONDITIONED_RPE = False
+    if key in ("type_cond", "typecond", "pq_rho", "tc", "im_rho_tc"):
+        RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_IM_RHO
+        USE_TYPE_CONDITIONED_RPE = True
+    elif key in ("re_im", "reim", "both"):
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM
     elif key in ("im", "im_only", "zeff_im"):
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_IM
     elif key in (
         "im_rho",
         "imrho",
-        "re_im_gen",  # legacy alias → Im+ρ
+        "re_im_gen",  # legacy alias → shared Im+ρ
         "reim_gen",
         "2_im_rho",
     ):
@@ -6351,7 +6452,7 @@ def apply_rpe_channel_config(channels: str) -> None:
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_CIJ
     else:
         raise ValueError(
-            f"unknown RPE_CHANNELS {channels!r}; use re_im, im, im_rho, rho, or cij"
+            f"unknown RPE_CHANNELS {channels!r}; use type_cond, re_im, im, im_rho, rho, or cij"
         )
     RPE_DIM = len(RPE_FEATURE_NAMES)
 
@@ -8313,7 +8414,7 @@ def pair_features(
             else cached.to(device=network.rpe.device, dtype=torch.float32, non_blocking=True)
         )
         return network.pair_embed
-    encoded = model.encode_pairs(network.rpe)
+    encoded = model.encode_pairs(network.rpe, types=network.types)
     if not model.training:
         network.pair_embed = encoded
         if host is not None:
@@ -8447,9 +8548,22 @@ def stacked_pair_and_ybus(
     keep: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pair features (U, N, N, *) via ``encode_pairs`` and complex128 Ybus (U, N, N)."""
+    if getattr(model, "use_type_conditioned_rpe", False) and len(networks) > 1:
+        type_keys = {network_type_key(network) for network in networks}
+        if len(type_keys) > 1:
+            rows: list[torch.Tensor] = []
+            for network in networks:
+                rpe_i = rpe_channel_dropout(
+                    network.rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep
+                )
+                rows.append(model.encode_pairs(rpe_i, types=network.types))
+            pair = torch.stack(rows)
+            ybus = torch.stack([network.ybus for network in networks]).to(torch.complex128)
+            return pair, ybus
     rpe = torch.stack([network.rpe for network in networks])
     rpe = rpe_channel_dropout(rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
-    pair = model.encode_pairs(rpe)
+    types = networks[0].types if getattr(model, "use_type_conditioned_rpe", False) else None
+    pair = model.encode_pairs(rpe, types=types)
     ybus = torch.stack([network.ybus for network in networks]).to(torch.complex128)
     return pair, ybus
 
@@ -8504,21 +8618,31 @@ class PassBatch:
 
     def encode(self, model: TPGT, keep: torch.Tensor | None = None) -> torch.Tensor:
         """Pair features for attention: raw RPE (v10) or ``pair_encoder`` output (GRIT)."""
+        type_cond = getattr(model, "use_type_conditioned_rpe", False)
         if self.kind == "single":
             network = self.networks[0]
             if not model.training:
                 return pair_features(model, network)
             rpe = rpe_channel_dropout(network.rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
-            return model.encode_pairs(rpe)
+            return model.encode_pairs(rpe, types=network.types if type_cond else None)
         # Multi-topology: encode once, then (in eval) write each row back for later single-topo reuse.
         if not model.training:
             encoded_rows: list[torch.Tensor] = []
             for network in self.networks:
                 encoded_rows.append(pair_features(model, network))
             return torch.stack(encoded_rows)
+        if type_cond and self.kind == "mixed":
+            mixed_rows: list[torch.Tensor] = []
+            for network in self.networks:
+                rpe_i = rpe_channel_dropout(
+                    network.rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep
+                )
+                mixed_rows.append(model.encode_pairs(rpe_i, types=network.types))
+            return torch.stack(mixed_rows)
         rpe = torch.stack([network.rpe for network in self.networks])
         rpe = rpe_channel_dropout(rpe, RPE_CHANNEL_DROPOUT, model.training, keep=keep)
-        return model.encode_pairs(rpe)
+        types = self.networks[0].types if type_cond else None
+        return model.encode_pairs(rpe, types=types)
 
     def run(
         self,
@@ -9078,12 +9202,29 @@ def checkpoint_version_reason(payload: dict) -> str | None:
 
 
 def pair_encoder_input_mismatch(payload: dict) -> str | None:
-    """Detect checkpoints from an older RPE width (e.g. 6-feature tree RPE) before load."""
+    """Detect checkpoints from an older RPE width / encoder layout before load."""
     state = payload.get("model")
     if not isinstance(state, dict):
         return None
+    if USE_TYPE_CONDITIONED_RPE:
+        pq_w = state.get("pair_encoder.pq_encoder.net.0.weight")
+        other_w = state.get("pair_encoder.other_encoder.net.0.weight")
+        shared_w = state.get("pair_encoder.net.0.weight")
+        if shared_w is not None and (pq_w is None or other_w is None):
+            return "pair_encoder expects type-conditioned dual MLPs, checkpoint has shared pair_encoder"
+        if pq_w is None or other_w is None or not hasattr(pq_w, "shape") or not hasattr(other_w, "shape"):
+            return None
+        if int(pq_w.shape[1]) != 2 or int(other_w.shape[1]) != 1:
+            return (
+                f"type-conditioned pair_encoder expects pq in=2 / other in=1, "
+                f"checkpoint has pq in={int(pq_w.shape[1])} other in={int(other_w.shape[1])}"
+            )
+        return None
     weight = state.get("pair_encoder.net.0.weight")
     if weight is None or not hasattr(weight, "shape"):
+        # Dual-encoder checkpoint under a shared-encoder RPE setting.
+        if state.get("pair_encoder.pq_encoder.net.0.weight") is not None:
+            return "pair_encoder expects shared MLP, checkpoint has type-conditioned dual MLPs"
         return None
     in_features = int(weight.shape[1])
     if in_features == RPE_DIM:

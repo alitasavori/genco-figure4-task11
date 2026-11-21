@@ -71,6 +71,7 @@ def test_v17_generator_grounded_support_rpe():
     """Radial PV→i→j: C built for ρ; RPE is Im+ρ only; shared 2→D_E encoder."""
     previous_names = tpgt.RPE_FEATURE_NAMES
     previous_dim = tpgt.RPE_DIM
+    previous_tc = tpgt.USE_TYPE_CONDITIONED_RPE
     previous_d = tpgt.D
     previous_de = tpgt.D_E
     try:
@@ -79,6 +80,7 @@ def test_v17_generator_grounded_support_rpe():
         tpgt.D_E = 48
         assert tpgt.RPE_DIM == 2
         assert tpgt.RPE_FEATURE_NAMES == ("Zeff_Im_norm", "rho_ij")
+        assert not tpgt.USE_TYPE_CONDITIONED_RPE
         assert tpgt.uses_generator_support_rpe()
         xg, xij = 0.2, 0.5
         # bus 0 = PV, 1 = i (PQ), 2 = j (PQ)
@@ -116,14 +118,109 @@ def test_v17_generator_grounded_support_rpe():
     finally:
         tpgt.RPE_FEATURE_NAMES = previous_names
         tpgt.RPE_DIM = previous_dim
+        tpgt.USE_TYPE_CONDITIONED_RPE = previous_tc
         tpgt.D = previous_d
         tpgt.D_E = previous_de
 
 
-def test_v17_rho_only_rpe():
-    """Default v17 layout: RPE is ρ only (1 channel); pair encoder 1→D→D→D_E."""
+def test_v17_type_conditioned_rpe():
+    """Default v17: Im+ρ stored; E_PQ on PQ–PQ, E_other(Im) on other type pairs."""
     previous_names = tpgt.RPE_FEATURE_NAMES
     previous_dim = tpgt.RPE_DIM
+    previous_tc = tpgt.USE_TYPE_CONDITIONED_RPE
+    previous_d = tpgt.D
+    previous_de = tpgt.D_E
+    previous_cv = tpgt.CHECKPOINT_VERSION
+    previous_run = tpgt.RUN_TAG
+    try:
+        tpgt.apply_rpe_channel_config("type_cond")
+        tpgt.D = 96
+        tpgt.D_E = 48
+        tpgt.RUN_TAG = "v17"
+        tpgt.CHECKPOINT_VERSION = "meshed-rpe-1-d12-w96-h4-pqvt-busBS-rho-v17"
+        tpgt.retag_checkpoint_version_for_rpe()
+        assert tpgt.RPE_DIM == 2
+        assert tpgt.RPE_FEATURE_NAMES == ("Zeff_Im_norm", "rho_ij")
+        assert tpgt.USE_TYPE_CONDITIONED_RPE
+        assert tpgt.uses_generator_support_rpe()
+        assert tpgt.rpe_channels_slug() == "type-cond"
+        assert "meshed-rpe-2-" in tpgt.CHECKPOINT_VERSION
+        assert tpgt.CHECKPOINT_VERSION.endswith("-type-cond-v17")
+
+        xg, xij = 0.2, 0.5
+        branches = [(0, 1, 0.0, xg), (1, 2, 0.0, xij)]
+        types_np = np.array([1, 0, 0], dtype=np.int64)  # PV, PQ, PQ
+        ybus = np.zeros((3, 3), dtype=np.complex64)
+        features, _, invalid = meshed_rpe(
+            3, branches, ybus, types=types_np, c_scale=1.0, return_invalid=True
+        )
+        assert features.shape == (3, 3, 2)
+        assert invalid is not None and not np.any(invalid)
+
+        model = TPGT()
+        assert model.use_type_conditioned_rpe
+        enc = model.pair_encoder
+        assert isinstance(enc, tpgt.TypeConditionedPairEncoder)
+        assert enc.pq_encoder.net[0].in_features == 2
+        assert enc.other_encoder.net[0].in_features == 1
+        assert enc.pq_encoder.net[-1].out_features == 48
+        assert enc.other_encoder.net[-1].out_features == 48
+
+        types = torch.as_tensor(types_np, dtype=torch.long)
+        rpe = torch.as_tensor(features, dtype=torch.float32)
+        out = model.encode_pairs(rpe, types=types)
+        assert out.shape == (3, 3, 48)
+
+        # PQ–PQ uses E_PQ; PV–PQ / other pairs use E_other(Im only).
+        e_pq = enc.pq_encoder(rpe)
+        e_other = enc.other_encoder(rpe[..., :1])
+        assert torch.allclose(out[1, 2], e_pq[1, 2])
+        assert torch.allclose(out[2, 1], e_pq[2, 1])
+        assert torch.allclose(out[0, 1], e_other[0, 1])
+        assert torch.allclose(out[1, 0], e_other[1, 0])
+        assert torch.allclose(out[0, 0], e_other[0, 0])
+
+        # Zero diagonal convention preserved in encoder inputs (ρ_ii stored as 0).
+        assert float(rpe[1, 1, 1]) == 0.0
+        assert float(rpe[2, 2, 1]) == 0.0
+
+        # Zeroing ρ changes PQ–PQ embeds only.
+        rpe_no_rho = rpe.clone()
+        rpe_no_rho[..., 1] = 0.0
+        out_no_rho = model.encode_pairs(rpe_no_rho, types=types)
+        assert not torch.allclose(out[1, 2], out_no_rho[1, 2])
+        assert torch.allclose(out[0, 1], out_no_rho[0, 1])
+
+        # Gradients reach both encoders.
+        loss = out.sum()
+        loss.backward()
+        assert enc.pq_encoder.net[0].weight.grad is not None
+        assert enc.other_encoder.net[0].weight.grad is not None
+        assert float(enc.pq_encoder.net[0].weight.grad.abs().sum()) > 0.0
+        assert float(enc.other_encoder.net[0].weight.grad.abs().sum()) > 0.0
+
+        weight_rows = pair_encoder_input_weight_norms(model)
+        assert len(weight_rows) == 3
+        assert {row["name"] for row in weight_rows} == {
+            "Zeff_Im_norm(other)",
+            "Zeff_Im_norm(pq)",
+            "rho_ij(pq)",
+        }
+    finally:
+        tpgt.RPE_FEATURE_NAMES = previous_names
+        tpgt.RPE_DIM = previous_dim
+        tpgt.USE_TYPE_CONDITIONED_RPE = previous_tc
+        tpgt.D = previous_d
+        tpgt.D_E = previous_de
+        tpgt.CHECKPOINT_VERSION = previous_cv
+        tpgt.RUN_TAG = previous_run
+
+
+def test_v17_rho_only_rpe():
+    """Selectable ρ-only layout: 1 channel; pair encoder 1→D→D→D_E."""
+    previous_names = tpgt.RPE_FEATURE_NAMES
+    previous_dim = tpgt.RPE_DIM
+    previous_tc = tpgt.USE_TYPE_CONDITIONED_RPE
     previous_d = tpgt.D
     previous_de = tpgt.D_E
     previous_cv = tpgt.CHECKPOINT_VERSION
@@ -135,6 +232,7 @@ def test_v17_rho_only_rpe():
         tpgt.retag_checkpoint_version_for_rpe()
         assert tpgt.RPE_DIM == 1
         assert tpgt.RPE_FEATURE_NAMES == ("rho_ij",)
+        assert not tpgt.USE_TYPE_CONDITIONED_RPE
         assert tpgt.uses_generator_support_rpe()
         assert tpgt.rpe_channels_slug() == "rho"
         assert "meshed-rpe-1-" in tpgt.CHECKPOINT_VERSION
@@ -157,6 +255,7 @@ def test_v17_rho_only_rpe():
     finally:
         tpgt.RPE_FEATURE_NAMES = previous_names
         tpgt.RPE_DIM = previous_dim
+        tpgt.USE_TYPE_CONDITIONED_RPE = previous_tc
         tpgt.D = previous_d
         tpgt.D_E = previous_de
         tpgt.CHECKPOINT_VERSION = previous_cv
@@ -166,6 +265,7 @@ def test_v17_cij_only_rpe():
     """Selectable Cij_norm = C/s_C (1 channel); gen rows/cols stay 0."""
     previous_names = tpgt.RPE_FEATURE_NAMES
     previous_dim = tpgt.RPE_DIM
+    previous_tc = tpgt.USE_TYPE_CONDITIONED_RPE
     previous_d = tpgt.D
     previous_de = tpgt.D_E
     previous_cv = tpgt.CHECKPOINT_VERSION
@@ -177,6 +277,7 @@ def test_v17_cij_only_rpe():
         tpgt.retag_checkpoint_version_for_rpe()
         assert tpgt.RPE_DIM == 1
         assert tpgt.RPE_FEATURE_NAMES == ("Cij_norm",)
+        assert not tpgt.USE_TYPE_CONDITIONED_RPE
         assert tpgt.uses_generator_support_rpe()
         assert tpgt.rpe_channels_slug() == "cij"
         assert tpgt.CHECKPOINT_VERSION.endswith("-cij-v17")
@@ -200,6 +301,7 @@ def test_v17_cij_only_rpe():
     finally:
         tpgt.RPE_FEATURE_NAMES = previous_names
         tpgt.RPE_DIM = previous_dim
+        tpgt.USE_TYPE_CONDITIONED_RPE = previous_tc
         tpgt.D = previous_d
         tpgt.D_E = previous_de
         tpgt.CHECKPOINT_VERSION = previous_cv
@@ -209,6 +311,7 @@ def test_v17_gen_support_no_pinv_on_pq_island():
     """PQ island without Slack/PV → invalid_support; C=0 is numerical fallback only."""
     previous_names = tpgt.RPE_FEATURE_NAMES
     previous_dim = tpgt.RPE_DIM
+    previous_tc = tpgt.USE_TYPE_CONDITIONED_RPE
     try:
         tpgt.apply_rpe_channel_config("im_rho")
         # Two PQ buses linked; no generator in the component.
@@ -232,11 +335,13 @@ def test_v17_gen_support_no_pinv_on_pq_island():
     finally:
         tpgt.RPE_FEATURE_NAMES = previous_names
         tpgt.RPE_DIM = previous_dim
+        tpgt.USE_TYPE_CONDITIONED_RPE = previous_tc
 
 
 def test_v17_gen_support_flags_nonpositive_x():
     previous_names = tpgt.RPE_FEATURE_NAMES
     previous_dim = tpgt.RPE_DIM
+    previous_tc = tpgt.USE_TYPE_CONDITIONED_RPE
     try:
         tpgt.apply_rpe_channel_config("im_rho")
         # PV—PQ with negative x (excluded) plus positive spur so PQ stays gen-supported.
@@ -249,12 +354,14 @@ def test_v17_gen_support_flags_nonpositive_x():
     finally:
         tpgt.RPE_FEATURE_NAMES = previous_names
         tpgt.RPE_DIM = previous_dim
+        tpgt.USE_TYPE_CONDITIONED_RPE = previous_tc
 
 
 def test_v17_rpe_zeros_disconnected_pairs():
     """Im+ρ are zero across components; isolated PQ is invalid_support (ρ=0)."""
     previous_names = tpgt.RPE_FEATURE_NAMES
     previous_dim = tpgt.RPE_DIM
+    previous_tc = tpgt.USE_TYPE_CONDITIONED_RPE
     try:
         tpgt.apply_rpe_channel_config("im_rho")
         # Component A: PV—PQ; component B: isolated PQ (invalid_support → ρ=0).
@@ -274,6 +381,7 @@ def test_v17_rpe_zeros_disconnected_pairs():
     finally:
         tpgt.RPE_FEATURE_NAMES = previous_names
         tpgt.RPE_DIM = previous_dim
+        tpgt.USE_TYPE_CONDITIONED_RPE = previous_tc
 
 
 def test_bus_shunt_b_row_sum_includes_charging_unlike_device_bs():
