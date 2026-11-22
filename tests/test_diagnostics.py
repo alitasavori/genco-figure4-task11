@@ -216,6 +216,96 @@ def test_v17_type_conditioned_rpe():
         tpgt.RUN_TAG = previous_run
 
 
+def test_v17_type_conditioned_cij_rpe():
+    """type_cond_cij: Im+Cij stored; E_PQ on PQ–PQ, E_other(Im) elsewhere; distinct slug."""
+    previous_names = tpgt.RPE_FEATURE_NAMES
+    previous_dim = tpgt.RPE_DIM
+    previous_tc = tpgt.USE_TYPE_CONDITIONED_RPE
+    previous_d = tpgt.D
+    previous_de = tpgt.D_E
+    previous_cv = tpgt.CHECKPOINT_VERSION
+    previous_run = tpgt.RUN_TAG
+    try:
+        tpgt.apply_rpe_channel_config("type_cond_cij")
+        tpgt.D = 96
+        tpgt.D_E = 48
+        tpgt.RUN_TAG = "v17"
+        tpgt.CHECKPOINT_VERSION = "meshed-rpe-1-d12-w96-h4-pqvt-busBS-type-cond-v17"
+        tpgt.retag_checkpoint_version_for_rpe()
+        assert tpgt.RPE_DIM == 2
+        assert tpgt.RPE_FEATURE_NAMES == ("Zeff_Im_norm", "Cij_norm")
+        assert tpgt.USE_TYPE_CONDITIONED_RPE
+        assert tpgt.uses_generator_support_rpe()
+        assert tpgt.rpe_channels_slug() == "type-cond-cij"
+        assert "meshed-rpe-2-" in tpgt.CHECKPOINT_VERSION
+        assert tpgt.CHECKPOINT_VERSION.endswith("-type-cond-cij-v17")
+        # Switching back to type_cond must not leave a trailing -cij on the slug.
+        tpgt.apply_rpe_channel_config("type_cond")
+        tpgt.retag_checkpoint_version_for_rpe()
+        assert tpgt.CHECKPOINT_VERSION.endswith("-type-cond-v17")
+        assert not tpgt.CHECKPOINT_VERSION.endswith("-type-cond-cij-v17")
+        tpgt.apply_rpe_channel_config("type_cond_cij")
+        tpgt.retag_checkpoint_version_for_rpe()
+        assert tpgt.CHECKPOINT_VERSION.endswith("-type-cond-cij-v17")
+
+        xg, xij = 0.2, 0.5
+        branches = [(0, 1, 0.0, xg), (1, 2, 0.0, xij)]
+        types_np = np.array([1, 0, 0], dtype=np.int64)  # PV, PQ, PQ
+        ybus = np.zeros((3, 3), dtype=np.complex64)
+        features, _, invalid = meshed_rpe(
+            3, branches, ybus, types=types_np, c_scale=1.0, return_invalid=True
+        )
+        assert features.shape == (3, 3, 2)
+        assert invalid is not None and not np.any(invalid)
+        # Channel 1 matches cij-only conventions (gen rows/cols 0; C_UU values).
+        assert np.isclose(features[1, 1, 1], xg, atol=1e-5)
+        assert np.isclose(features[1, 2, 1], xg, atol=1e-5)
+        assert np.isclose(features[2, 2, 1], xg + xij, atol=1e-5)
+        assert np.allclose(features[0, :, 1], 0.0)
+        assert np.allclose(features[:, 0, 1], 0.0)
+
+        model = TPGT()
+        assert model.use_type_conditioned_rpe
+        enc = model.pair_encoder
+        assert isinstance(enc, tpgt.TypeConditionedPairEncoder)
+        assert enc.pq_encoder.net[0].in_features == 2
+        assert enc.other_encoder.net[0].in_features == 1
+
+        types = torch.as_tensor(types_np, dtype=torch.long)
+        rpe = torch.as_tensor(features, dtype=torch.float32)
+        out = model.encode_pairs(rpe, types=types)
+        assert out.shape == (3, 3, 48)
+
+        e_pq = enc.pq_encoder(rpe)
+        e_other = enc.other_encoder(rpe[..., :1])
+        assert torch.allclose(out[1, 2], e_pq[1, 2])
+        assert torch.allclose(out[2, 1], e_pq[2, 1])
+        assert torch.allclose(out[0, 1], e_other[0, 1])
+        assert torch.allclose(out[1, 0], e_other[1, 0])
+
+        # Zeroing Cij changes PQ–PQ embeds only.
+        rpe_no_cij = rpe.clone()
+        rpe_no_cij[..., 1] = 0.0
+        out_no_cij = model.encode_pairs(rpe_no_cij, types=types)
+        assert not torch.allclose(out[1, 2], out_no_cij[1, 2])
+        assert torch.allclose(out[0, 1], out_no_cij[0, 1])
+
+        weight_rows = pair_encoder_input_weight_norms(model)
+        assert {row["name"] for row in weight_rows} == {
+            "Zeff_Im_norm(other)",
+            "Zeff_Im_norm(pq)",
+            "Cij_norm(pq)",
+        }
+    finally:
+        tpgt.RPE_FEATURE_NAMES = previous_names
+        tpgt.RPE_DIM = previous_dim
+        tpgt.USE_TYPE_CONDITIONED_RPE = previous_tc
+        tpgt.D = previous_d
+        tpgt.D_E = previous_de
+        tpgt.CHECKPOINT_VERSION = previous_cv
+        tpgt.RUN_TAG = previous_run
+
+
 def test_v17_rho_only_rpe():
     """Selectable ρ-only layout: 1 channel; pair encoder 1→D→D→D_E."""
     previous_names = tpgt.RPE_FEATURE_NAMES

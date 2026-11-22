@@ -63,9 +63,11 @@ Architecture (default ``v7``: checkpoint_version ``meshed-rpe-2-d4-v7``)
 * **RPE**: legacy ``Zeff_Re_norm`` + ``Zeff_Im_norm`` (v7–v16 / v19/v20);
   **v17** RPE is selectable via preset / ``GENCO_TPGT_RPE_CHANNELS`` / notebook
   ``RPE_CHANNELS``: ``type_cond`` (default: type-conditioned dual encoders —
-  PQ–PQ uses ``[Zeff_Im, ρ]``, other type pairs use ``Zeff_Im`` only), ``im_rho``
-  (shared MLP on Im+ρ; controlled-comparison baseline), ``rho``, ``cij``, ``im``,
-  or ``re_im``. ``C``/``ρ`` come from ``C=L_{UU}^{-1}`` (Slack∪PV grounded).
+  PQ–PQ uses ``[Zeff_Im, ρ]``, other type pairs use ``Zeff_Im`` only),
+  ``type_cond_cij`` (same dual encoders with ``[Zeff_Im, Cij_norm]`` on PQ–PQ),
+  ``im_rho`` (shared MLP on Im+ρ; controlled-comparison baseline), ``rho``,
+  ``cij``, ``im``, or ``re_im``. ``C``/``ρ`` come from ``C=L_{UU}^{-1}``
+  (Slack∪PV grounded).
   Generator outages change ``G`` and thus ``C/ρ``; unsupported PQ islands are
   flagged invalid (``C=0`` is a numerical fallback, not physical zero
   sensitivity). Train-only ``s_C`` / ``s_X`` — never re-fit per test topology.
@@ -245,28 +247,32 @@ MODEL_NAME = "TPGT"
 TYPE_NAMES = ("PQ", "PV", "Slack")
 CACHE_VERSION = "tpgt-cache-19"
 # Default / legacy (v7–v16): Re+Im. ``im`` = Im-only; ``im_rho`` = shared Im+ρ;
-# ``type_cond`` = Im+ρ with dual type-conditioned encoders; ``rho`` = ρ only;
+# ``type_cond`` = Im+ρ with dual type-conditioned encoders;
+# ``type_cond_cij`` = Im+Cij_norm with the same dual encoders; ``rho`` = ρ only;
 # ``cij`` = gen-grounded C/s_C only.
 RPE_FEATURE_NAMES_RE_IM = ("Zeff_Re_norm", "Zeff_Im_norm")
 RPE_FEATURE_NAMES_IM = ("Zeff_Im_norm",)
 RPE_FEATURE_NAMES_IM_RHO = ("Zeff_Im_norm", "rho_ij")
+RPE_FEATURE_NAMES_IM_CIJ = ("Zeff_Im_norm", "Cij_norm")
 RPE_FEATURE_NAMES_RHO = ("rho_ij",)
 RPE_FEATURE_NAMES_CIJ = ("Cij_norm",)
 # Legacy alias name kept for older call sites; same channels as ``IM_RHO``.
 RPE_FEATURE_NAMES_RE_IM_GEN = RPE_FEATURE_NAMES_IM_RHO
 RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM
 RPE_DIM = len(RPE_FEATURE_NAMES)
-# When True, GRIT uses independent E_PQ([Im,ρ]) and E_other(Im) instead of one shared MLP.
+# When True, GRIT uses independent E_PQ([Im, second]) and E_other(Im) instead of one shared MLP.
 USE_TYPE_CONDITIONED_RPE = False
 # Short tags used in checkpoint_version / notebook banners.
 RPE_CHANNEL_SLUGS = {
     RPE_FEATURE_NAMES_RE_IM: "re-im",
     RPE_FEATURE_NAMES_IM: "im",
     RPE_FEATURE_NAMES_IM_RHO: "im-rho",
+    RPE_FEATURE_NAMES_IM_CIJ: "im-cij",
     RPE_FEATURE_NAMES_RHO: "rho",
     RPE_FEATURE_NAMES_CIJ: "cij",
 }
 RPE_CHANNEL_SLUG_TYPE_COND = "type-cond"
+RPE_CHANNEL_SLUG_TYPE_COND_CIJ = "type-cond-cij"
 # v15 pair-rotary electrical pair features (ablate these, not Zeff RPE).
 PAIR_ELEC_FEATURE_NAMES = ("elec_dist", "edge_on", "edge_weight")
 # Per optimizer step, each RPE channel is zeroed (whole 118x118 plane, no rescaling) with this
@@ -496,9 +502,10 @@ ARCH_PRESETS: dict[str, dict[str, int | str | bool | tuple[int, ...]]] = {
     },
     # v16 GRIT + selectable gen-support RPE. Default: type-conditioned dual
     # encoders (PQ–PQ: Im+ρ; other pairs: Im only). Override with
-    # GENCO_TPGT_RPE_CHANNELS=type_cond|im_rho|rho|cij|im|re_im (notebook RPE_CHANNELS).
-    # C=L[U,U]^{-1} still built when ρ is selected; invalid PQ islands flagged.
-    # Train-only s_X / s_C; stored RPE_DIM=2 for type_cond / im_rho.
+    # GENCO_TPGT_RPE_CHANNELS=type_cond|type_cond_cij|im_rho|rho|cij|im|re_im
+    # (notebook RPE_CHANNELS). type_cond_cij swaps ρ for Cij_norm on PQ–PQ.
+    # C=L[U,U]^{-1} still built when ρ/Cij is selected; invalid PQ islands flagged.
+    # Train-only s_X / s_C; stored RPE_DIM=2 for type_cond / type_cond_cij / im_rho.
     "v17": {
         "D": 96,
         "D_E": 48,
@@ -1060,9 +1067,10 @@ class MLP(nn.Module):
 
 
 class TypeConditionedPairEncoder(nn.Module):
-    """Independent PQ–PQ and other-pair RPE encoders (v17 ``type_cond``).
+    """Independent PQ–PQ and other-pair RPE encoders (v17 ``type_cond`` / ``type_cond_cij``).
 
-    Stored pair features are always ``[Zeff_Im_norm, rho_ij]``. PQ–PQ pairs
+    Stored pair features are ``[Zeff_Im_norm, second]`` where ``second`` is
+    ``rho_ij`` (``type_cond``) or ``Cij_norm`` (``type_cond_cij``). PQ–PQ pairs
     (``t_i=t_j=0``) use ``E_PQ`` on both channels; all other type pairs use
     ``E_other`` on the reactance channel only. Parameters are not shared.
     """
@@ -1075,7 +1083,7 @@ class TypeConditionedPairEncoder(nn.Module):
     def forward(self, rpe: torch.Tensor, types: torch.Tensor) -> torch.Tensor:
         if rpe.shape[-1] != 2:
             raise ValueError(
-                f"type-conditioned pair encoder expects last-dim 2 (Im, ρ), got {tuple(rpe.shape)}"
+                f"type-conditioned pair encoder expects last-dim 2 (Im, second), got {tuple(rpe.shape)}"
             )
         if types is None:
             raise ValueError("type-conditioned pair encoder requires bus types")
@@ -2189,8 +2197,9 @@ class TPGT(nn.Module):
     ) -> torch.Tensor:
         """Features for correction-stage attention (raw RPE for v10/v11/v12, else ``pair_encoder``).
 
-        Type-conditioned v17 requires ``types`` so PQ–PQ pairs use ``E_PQ([Im,ρ])``
-        and all other type pairs use ``E_other(Im)``.
+        Type-conditioned v17 requires ``types`` so PQ–PQ pairs use
+        ``E_PQ([Im, second])`` (``second`` = ρ or ``Cij_norm``) and all other
+        type pairs use ``E_other(Im)``.
         """
         if self.use_raw_rpe:
             return rpe
@@ -2805,10 +2814,11 @@ def pair_encoder_input_weight_norms(model: TPGT) -> list[dict[str, float]]:
             raise TypeError("type-conditioned encoder first layers must be Linear")
         pq_norms = torch.linalg.vector_norm(pq_first.weight.detach(), dim=0)
         other_norms = torch.linalg.vector_norm(other_first.weight.detach(), dim=0)
+        second = RPE_FEATURE_NAMES[1] if len(RPE_FEATURE_NAMES) > 1 else "second"
         return [
             {"name": "Zeff_Im_norm(other)", "weight_l2": float(other_norms[0])},
             {"name": "Zeff_Im_norm(pq)", "weight_l2": float(pq_norms[0])},
-            {"name": "rho_ij(pq)", "weight_l2": float(pq_norms[1])},
+            {"name": f"{second}(pq)", "weight_l2": float(pq_norms[1])},
         ]
     first = model.pair_encoder.net[0]
     if not isinstance(first, nn.Linear):
@@ -5582,6 +5592,8 @@ def meshed_rpe(
     Im+ρ shared (``RPE_CHANNELS=im_rho``): ``Zeff_Im_norm`` + ``ρ_ij`` (2), one MLP.
     Type-conditioned (``RPE_CHANNELS=type_cond`` / default ``v17``): same 2 stored
     channels; ``E_PQ`` on PQ–PQ, ``E_other`` (Im only) on the other eight type pairs.
+    Type-conditioned Cij (``RPE_CHANNELS=type_cond_cij``): ``Zeff_Im_norm`` +
+    ``Cij_norm`` (2); same dual encoders; Slack/PV Cij conventions match ``cij``.
     ρ-only (``RPE_CHANNELS=rho``): ``ρ_ij`` (1).
     C-only (``RPE_CHANNELS=cij``): ``Cij_norm = C / s_C`` (1); Slack/PV rows/cols 0.
     ``ρ`` is PQ–PQ only and zero on ``invalid_support`` buses (unsupported islands /
@@ -5647,6 +5659,7 @@ def meshed_rpe(
         features[..., 0] = im
     elif RPE_FEATURE_NAMES in (
         RPE_FEATURE_NAMES_IM_RHO,
+        RPE_FEATURE_NAMES_IM_CIJ,
         RPE_FEATURE_NAMES_RHO,
         RPE_FEATURE_NAMES_CIJ,
     ):
@@ -5665,14 +5678,17 @@ def meshed_rpe(
             if not check.passed:
                 raise RuntimeError(f"gen-support validation failed: {check.name}: {check.detail}")
         invalid_support = built.invalid_support.astype(bool, copy=False)
+        # Train-fit s_C; reuse on valid/test — never recompute per contingency.
+        c_div = float(c_scale) if c_scale is not None and float(c_scale) > 0 else 1.0
         if RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_CIJ and RPE_DIM == 1:
-            # Train-fit s_C; reuse on valid/test — never recompute per contingency.
-            c_div = float(c_scale) if c_scale is not None and float(c_scale) > 0 else 1.0
             features[..., 0] = (built.c_full / c_div).astype(np.float32)
+        elif RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM_CIJ and RPE_DIM == 2:
+            # Same Slack/PV-zero C conventions as cij-only; Im on channel 0.
+            features[..., 0] = im
+            features[..., 1] = (built.c_full / c_div).astype(np.float32)
         else:
             # ρ is scale-free. Train-fit s_C is stored on Network.rpe_c_scale for audits /
             # cache plumbing; never recompute it per contingency topology.
-            _ = c_scale
             both_pq = pq[:, None] & pq[None, :]
             valid = (~invalid_support)[:, None] & (~invalid_support)[None, :]
             rho = generator_support_rho(built.c_full).astype(np.float32)
@@ -6413,26 +6429,39 @@ def _parse_mlp_hiddens(raw: object, default: tuple[int, ...] = (128, 64)) -> tup
 
 
 def rpe_channels_slug() -> str:
-    """Short tag for the active RPE layout (``type-cond``, ``rho``, ``cij``, …)."""
+    """Short tag for the active RPE layout (``type-cond``, ``type-cond-cij``, …)."""
     if USE_TYPE_CONDITIONED_RPE:
+        if RPE_FEATURE_NAMES == RPE_FEATURE_NAMES_IM_CIJ:
+            return RPE_CHANNEL_SLUG_TYPE_COND_CIJ
         return RPE_CHANNEL_SLUG_TYPE_COND
     return RPE_CHANNEL_SLUGS.get(RPE_FEATURE_NAMES, f"{RPE_DIM}ch")
 
 
-_RPE_VERSION_SLUG_RE = r"(?:type-cond|im-rho|re-im|gensupport|cij|rho|im)"
+# Longer type-cond variants first so retag does not leave a trailing ``-cij``.
+_RPE_VERSION_SLUG_RE = r"(?:type-cond-cij|type-cond|im-rho|im-cij|re-im|gensupport|cij|rho|im)"
 
 
 def apply_rpe_channel_config(channels: str) -> None:
     """Set global ``RPE_FEATURE_NAMES`` / ``RPE_DIM`` / type-conditioned flag.
 
     Notebook / env: ``GENCO_TPGT_RPE_CHANNELS`` ∈
-    ``{type_cond, re_im, im, im_rho, rho, cij}``.
+    ``{type_cond, type_cond_cij, re_im, im, im_rho, rho, cij}``.
     """
     global RPE_FEATURE_NAMES, RPE_DIM, USE_TYPE_CONDITIONED_RPE
     key = str(channels).strip().lower().replace("+", "_").replace("-", "_")
     USE_TYPE_CONDITIONED_RPE = False
     if key in ("type_cond", "typecond", "pq_rho", "tc", "im_rho_tc"):
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_IM_RHO
+        USE_TYPE_CONDITIONED_RPE = True
+    elif key in (
+        "type_cond_cij",
+        "typecond_cij",
+        "type_cond_c",
+        "tc_cij",
+        "pq_cij",
+        "im_cij_tc",
+    ):
+        RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_IM_CIJ
         USE_TYPE_CONDITIONED_RPE = True
     elif key in ("re_im", "reim", "both"):
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_RE_IM
@@ -6452,7 +6481,8 @@ def apply_rpe_channel_config(channels: str) -> None:
         RPE_FEATURE_NAMES = RPE_FEATURE_NAMES_CIJ
     else:
         raise ValueError(
-            f"unknown RPE_CHANNELS {channels!r}; use type_cond, re_im, im, im_rho, rho, or cij"
+            f"unknown RPE_CHANNELS {channels!r}; use type_cond, type_cond_cij, "
+            "re_im, im, im_rho, rho, or cij"
         )
     RPE_DIM = len(RPE_FEATURE_NAMES)
 
