@@ -66,8 +66,9 @@ def main() -> None:
             ],
             cwd=ROOT,
         )
-        args.epochs = min(args.epochs, 15)
+        args.epochs = min(args.epochs, 5)
     manifest_path = args.manifest or args.data_root / "manifest.json"
+    print(f"phase3_synthetic: pilot={args.pilot} epochs={args.epochs}", flush=True)
     samples, _ = load_manifest(manifest_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_ablation(args.ablation) if args.ablation in (

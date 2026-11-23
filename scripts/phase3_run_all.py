@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -13,13 +14,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def run(cmd: list[str]) -> None:
     print("+", " ".join(cmd), flush=True)
-    if len(cmd) > 1:
-        script = Path(cmd[1])
+    py = Path(cmd[0]).name if cmd else ""
+    if py.endswith("python") or "python" in py:
+        cmd = [cmd[0], "-u", *cmd[1:]]
+    if len(cmd) > 2:
+        script = Path(cmd[2] if cmd[1] == "-u" else cmd[1])
         if script.suffix == ".py" and not (ROOT / script).is_file():
             raise FileNotFoundError(
                 f"Missing {ROOT / script}. Re-run notebook cell 1 (git pull) — Phase 3 must be on origin/main."
             )
-    subprocess.check_call(cmd, cwd=ROOT)
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    subprocess.check_call(cmd, cwd=ROOT, env=env)
 
 
 def _pfdelta_has_samples(root: Path) -> bool:
@@ -43,6 +48,8 @@ def main() -> None:
     py = sys.executable
     pilot = ["--pilot"] if args.pilot else []
     pfdelta_root = ROOT / "results" / "jmat" / "pfdelta_pilot"
+    print("JMAT Phase 3 run_all starting", flush=True)
+    print(f"  pilot={args.pilot} skip_pfdelta={args.skip_pfdelta} vendor={args.vendor_root}", flush=True)
 
     run([py, "scripts/phase3_verify.py"])
     run([py, "scripts/phase3_synthetic.py", *pilot, "--ablation", "jmat_full"])
@@ -87,7 +94,7 @@ def main() -> None:
     if not args.skip_ablation and not args.pilot:
         run([py, "scripts/phase3_ablation.py"])
     elif args.pilot and not args.skip_ablation:
-        run([py, "scripts/phase3_ablation.py", "--pilot", "--epochs", "8"])
+        print("Pilot mode: skipping 6× ablation train (use --no-skip-ablation to enable).", flush=True)
 
     if ckpt.is_file():
         run([py, "scripts/phase3_zeroshot.py", "--checkpoint", str(ckpt), *([] if not do_pfdelta else ["--suitesparse"])])

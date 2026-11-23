@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> None:
+    print("phase3_verify: pytest + Jacobian + backends ...", flush=True)
     out = ROOT / "results" / "jmat" / "phase3"
     out.mkdir(parents=True, exist_ok=True)
     pytest = subprocess.run(

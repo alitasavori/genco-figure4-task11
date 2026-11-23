@@ -22,8 +22,12 @@ from pfdelta_case_parquet import HF_REPO, _load_json, list_raw_sample_paths  # n
 def process_grid(raw_dir: Path, grid_id: str, source_split: str, topology: str, max_samples: int, out: Path):
     manifest = []
     stats = {"scenarios": 0, "steps": 0, "failed_scenarios": 0, "j_dims": [], "nnz": [], "cond": []}
-    for sample_path in list_raw_sample_paths(raw_dir)[:max_samples]:
+    paths = list_raw_sample_paths(raw_dir)[:max_samples]
+    print(f"  {grid_id}: {len(paths)} scenarios from {raw_dir}", flush=True)
+    for si, sample_path in enumerate(paths):
         stats["scenarios"] += 1
+        if si % 5 == 0:
+            print(f"    {grid_id} scenario {si + 1}/{len(paths)}", flush=True)
         try:
             pm = _load_json(sample_path)
             case = case_from_pfdelta_json(pm)
@@ -69,6 +73,7 @@ def main() -> None:
     p.add_argument("--pilot", action="store_true", help="20 samples/grid for smoke")
     args = p.parse_args()
     n = 20 if args.pilot else args.per_grid
+    print(f"phase3_pfdelta_pilot: pilot={args.pilot} per_grid={n} vendor={args.vendor_root}", flush=True)
     grids_train = list(TRAIN_GRIDS)
     grids_hold = list(HOLDOUT_GRIDS)
     all_manifest = []

@@ -97,6 +97,10 @@ def train_epochs(
         stat = TrainStats(epoch=ep, mean_loss=float(np.mean(losses)) if losses else float("nan"), n_steps=len(losses), val_mean_loss=vloss)
         log.train.append(stat)
         log.val_loss.append(vloss)
+        print(
+            f"epoch {ep + 1}/{epochs} train_loss={stat.mean_loss:.4f} val_loss={vloss:.4f} steps={stat.n_steps}",
+            flush=True,
+        )
         if val_paths and vloss < best_val:
             best_val = vloss
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
