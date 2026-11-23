@@ -1,0 +1,1 @@
+"""PFΔ adapters and Newton trace pipeline (stage A — stub)."""

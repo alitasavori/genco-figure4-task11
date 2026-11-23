@@ -1,0 +1,10 @@
+# JMAT pilot defaults (engineering brief §5.3, §6.2)
+d_model: 64
+n_latent: 16
+n_heads: 4
+n_loops: 3
+learning_rate: 3.0e-4
+weight_decay: 1.0e-5
+grad_clip: 1.0
+loss_lambda: 1.0
+seed: 42

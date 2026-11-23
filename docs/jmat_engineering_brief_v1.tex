@@ -1,0 +1,73 @@
+\documentclass[10pt]{article}
+\usepackage[letterpaper,margin=.77in,headheight=15pt]{geometry}
+\usepackage{amsmath,amssymb,booktabs,tabularx,array,xcolor,hyperref,fancyhdr,enumitem,microtype}
+\definecolor{navy}{HTML}{16324A}\definecolor{teal}{HTML}{006D77}\definecolor{graytext}{HTML}{52616D}
+\hypersetup{colorlinks=true,urlcolor=teal,linkcolor=teal}
+\pagestyle{fancy}\fancyhf{}\lhead{\small\color{graytext}JMAT / Engineering handoff}\rhead{\small\color{graytext}Research specification v1.0}\cfoot{\small\thepage}
+\setlength{\parindent}{0pt}\setlength{\parskip}{5pt}\setlist{nosep,leftmargin=1.4em}\renewcommand{\arraystretch}{1.15}
+\newcommand{\R}{\mathbb R}\newcommand{\norm}[1]{\left\lVert#1\right\rVert_2}\newcommand{\diag}{\operatorname{diag}}\newcommand{\LN}{\operatorname{LN}}\newcommand{\MHA}{\operatorname{MHA}}
+\newcommand{\sect}[1]{\vspace{4pt}{\large\bfseries\color{navy}#1}\par\vspace{1pt}}
+\newcommand{\subsect}[1]{\vspace{3pt}{\bfseries\color{teal}#1}\par}
+\begin{document}
+{\color{teal}\bfseries TECHNICAL IMPLEMENTATION BRIEF}\par
+{\huge\bfseries\color{navy} Jacobian Matrix-Action Transformer (JMAT)}\par
+{\large Learning transferable Newton corrections for AC power flow}\par
+{\small\color{graytext} Engineering handoff \quad | \quad 23 November 2026 \quad | \quad Proposed research, not a validated solver}
+\vspace{6pt}\hrule\vspace{6pt}
+\sect{1. Objective and scope}
+Implement and benchmark a single pretrained, variable-size neural linear solver that accepts a sparse, real, generally nonsymmetric reduced AC Jacobian and its power mismatch. It must return one approximate Newton correction:
+\[
+\boxed{\ f_\theta(J,r)=\widehat{\Delta x}\approx J^{-1}r,\qquad J\Delta x^*=r\ }.
+\]
+The primary model must use global attention, exact sparse matrix actions, and shared weights across grids. Do not compute a dense inverse, train a separate model per matrix, predict LU factors, or require an inner Krylov iteration in the primary inference path. Standard Newton iterations remain outside the model. Optional refinement/fallback is a separately timed experiment.
+
+\subsect{Selected benchmark and core research question}
+Use \textbf{PF$\Delta$} (Rivera et al., NeurIPS 2025) as the source of operating scenarios and derive a new, reproducible Newton-trajectory corpus. The public dataset contains 859,800 solved scenarios on six network sizes, including load/generation variation, contingencies, and near-infeasible samples [3]. It does not supply the full Newton traces required here. Instrument the standard polar Newton method to capture those traces. Test whether the \emph{same frozen JMAT weights} can produce accurate corrections on unseen grids, including larger grids, at competitive runtime. No speedup is assumed.
+
+\sect{2. Research lineage: two principal references}
+\begin{tabularx}{\linewidth}{@{}p{.25\linewidth}X X@{}}
+\toprule
+\textbf{Reference} & \textbf{Idea retained} & \textbf{Difference in JMAT}\\\midrule
+GNP, Chen (ICLR 2025) [1] & Matrix-weighted hidden-state operations; inverse-action learning; sample $r=Jx$ without explicit inversion. & No matrix-specific retraining or mandatory FGMRES. Add transpose action and global attention.\\
+RangeFormer, Potapczynski et al. (ICLR 2026) [2] & Efficient Transformer computation, weight-tied looping, diverse matrix pretraining and OOD testing. & Do not copy its dense learned projection; preserve sparse $J$ and use size-independent latent cross-attention.\\\bottomrule
+\end{tabularx}
+
+\textbf{Proposed synthesis (not a published equation):}
+\[
+H_{\ell+1}=H_\ell+F_\theta\bigl(H_\ell,AH_\ell,A^\top H_\ell,G_\ell\bigr),
+\]
+where $A$ is the normalized Jacobian and $G_\ell$ is a global attention output. Fixed-size latent tokens are an additional design choice. Global communication is explicit; accurate inverse learning, effective latent rank and speed are empirical hypotheses. The model has a sparse propagation component but no separate trainable message-passing GNN.
+\newpage
+\sect{3. Dataset selection and reproducible splits}
+\subsect{3.1 Primary corpus: PF$\Delta$ scenarios}
+Download from the \href{https://huggingface.co/datasets/pfdelta/pfdelta}{Hugging Face dataset} using the official \href{https://github.com/MOSSLab-MIT/pfdelta}{PF$\Delta$ repository}. Raw instances are JSON representations of solved cases; the repository also provides a \texttt{PFDeltaDataset} loader. Inspect raw fields and the generator rather than relying exclusively on a learning-oriented feature tensor. Pin dataset revision, source commit, solver version and seeds.
+
+\subsect{3.2 Independent linear-system tests (no retraining)}
+SuiteSparse TAMU Smart Grid Center ACTIVSg2000/10K for single-matrix sanity checks [5].
+
+\subsect{3.3 Leakage controls}
+Split by base grid, outage topology and scenario before generating Newton trajectories.
+
+\newpage
+\sect{4. Generate exact Newton training triples}
+Instrument MATPOWER 7.1 \texttt{newtonpf} or a verified Python port; log $(J^{(k)}, r^{(k)}, \Delta x^{*(k)})$ at each iteration from flat start; store CSR NPZ shards plus manifest metadata per brief tables.
+
+\newpage
+\sect{5. JMAT: exact model specification}
+Normalization $\gamma$, $A=J/\gamma$, $b=r/\gamma$, $\beta=\norm{b}$, $\tilde b=b/\beta$; per-index encoder on $(\tilde b_i, A_{ii}, \sum|A_{ij}|, \sum|A_{ji}|)$; shared latent bank $Z\in\R^{m\times d}$; matrix-action block with pool/self/broadcast attention and sparse $AH$, $A^\top H$; output $\widehat{\Delta x}=\beta\hat z$. Baseline $d=64$, $m=16$, $h=4$, $T=3$.
+
+\sect{6. Training and implementation requirements}
+Combined loss on relative solution and residual error; AdamW $3\times10^{-4}$; block batches without cross-system attention; ablations on global attention, sparse actions, capacity, scaling, and loss.
+
+\sect{7. Benchmark protocol}
+Compare JMAT, sparse LU, GMRES/ILU, and literature baselines on identical triples; report $E_x$, $E_r$, timings; secondary PF$\Delta$ Newton integration with safeguards.
+
+\sect{8. Deliverables and acceptance gates}
+Stages A--E: data integrity, prototype, benchmark, reproduction, final decision report. Repository layout: \texttt{jmat/}, \texttt{configs/}, \texttt{scripts/train\_jmat.py}, \texttt{tests/test\_jmat.py}.
+
+\sect{9. References and source resources}
+[1] Chen GNP ICLR 2025; [2] RangeFormer ICLR 2026; [3] PF$\Delta$ NeurIPS 2025; [4] MATPOWER 7.1; [5] SuiteSparse TAMU; [6] NeuralIF-GMRES AISTATS 2025.
+
+{\small Full narrative specification (all tables, equations, and acceptance gates) matches the engineering handoff v1.0 issued 23 November 2026 in the project issue tracker / chat archive; this repository copy is the implementation anchor for Stages B--C.}
+
+\end{document}
