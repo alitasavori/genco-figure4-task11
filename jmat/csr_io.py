@@ -40,20 +40,27 @@ def apply_permutation(
     r: torch.Tensor,
     perm: torch.Tensor,
 ):
-    """Return (PJPᵀ, Pr) as new CSR + r; perm maps new index → old index."""
+    """Return (J', r') for reordering unknowns/equations with P.
+
+    ``perm[i_new] = i_old``: new index ``i_new`` carries the old label ``i_old``.
+    Then ``J'_{i,j} = J_{perm[i], perm[j]}`` and ``r'_i = r_{perm[i]}``.
+    A consistent correction satisfies ``Δx' = P Δx`` with
+    ``Δx'[i_new] = Δx[perm[i_new]]``.
+    """
     from scipy.sparse import csr_matrix
 
-    p = perm.cpu().numpy()
-    inv = np.empty(n, dtype=np.int64)
-    inv[p] = np.arange(n)
-    rows, cols, data = [], [], []
-    for i in range(n):
-        a, b = int(crow[i].item()), int(crow[i + 1].item())
-        for k in range(a, b):
-            rows.append(int(inv[i]))
-            cols.append(int(inv[int(col[k].item())]))
-            data.append(float(val[k].item()))
-    j_perm = csr_matrix((data, (rows, cols)), shape=(n, n))
-    crow_p, col_p, val_p, _ = scipy_csr_to_torch(j_perm, device=r.device, dtype=r.dtype)
+    p = perm.cpu().numpy().astype(np.int64)
+    j_dense = csr_matrix(
+        (
+            val.detach().cpu().numpy(),
+            col.detach().cpu().numpy(),
+            crow.detach().cpu().numpy(),
+        ),
+        shape=(n, n),
+    ).toarray()
+    j_perm = j_dense[np.ix_(p, p)]
+    crow_p, col_p, val_p, _ = scipy_csr_to_torch(
+        csr_matrix(j_perm), device=r.device, dtype=r.dtype
+    )
     r_perm = r[perm]
     return crow_p, col_p, val_p, r_perm

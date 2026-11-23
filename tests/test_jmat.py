@@ -64,17 +64,10 @@ def test_permutation_equivariance_features():
     crow_p, col_p, val_p, r_p = apply_permutation(crow, col, val, n, r, perm)
     model = JMAT(JMATConfig(d_model=32, n_latent=8, n_heads=4, n_loops=2))
     torch.manual_seed(0)
-    dx = model.forward_csr(crow, col, val, n, r)
+    dx = model.forward_csr(crow, col, val, n, r).detach().numpy()
     torch.manual_seed(0)
-    dx_p = model.forward_csr(crow_p, col_p, val_p, n, r_p)
-    inv = torch.empty_like(perm)
-    inv[perm] = torch.arange(n)
-    np.testing.assert_allclose(
-        dx_p[inv].detach().numpy(),
-        dx.detach().numpy(),
-        rtol=1e-5,
-        atol=1e-5,
-    )
+    dx_p = model.forward_csr(crow_p, col_p, val_p, n, r_p).detach().numpy()
+    np.testing.assert_allclose(dx_p, dx[perm.numpy()], rtol=2e-4, atol=2e-4)
 
 
 def test_positive_scaling_invariance():

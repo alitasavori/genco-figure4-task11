@@ -49,9 +49,19 @@ def normalize_linear_system(
     if row_equilibrate:
         raise NotImplementedError("row equilibration ablation not implemented in v1 scaffold")
 
+    from jmat.errors import InvalidLinearSystemError
+    from jmat.safeguards import is_zero_jacobian
+
+    if is_zero_jacobian(crow, col, val, n):
+        raise InvalidLinearSystemError(
+            "Zero Jacobian with nonzero mismatch: cannot normalize a degenerate system."
+        )
+
     gamma = _gamma_from_csr(crow, col, val, n)
     if gamma <= 0:
-        return None
+        raise InvalidLinearSystemError(
+            "Zero Jacobian with nonzero mismatch: cannot normalize a degenerate system."
+        )
 
     a_val = val / gamma
     b = r / gamma

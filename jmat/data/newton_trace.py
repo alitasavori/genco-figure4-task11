@@ -24,6 +24,5 @@ class NewtonStepRecord:
 
 def not_implemented_trace_from_pfdelta(*_args: Any, **_kwargs: Any) -> list[NewtonStepRecord]:
     raise NotImplementedError(
-        "PFΔ Newton trace generation is specified in docs/jmat_engineering_brief_v1.tex; "
-        "implement prepare_data.py next."
+        "Use scripts/generate_pfdelta_newton_traces.py (jmat.pf.newton_logger) for PFΔ JSON inputs."
     )

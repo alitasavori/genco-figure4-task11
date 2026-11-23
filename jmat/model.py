@@ -82,6 +82,12 @@ class JMAT(nn.Module):
         r: torch.Tensor,
     ) -> torch.Tensor:
         """Public API: sparse J and mismatch r → Δx (n,); zeros if r == 0."""
+        from jmat.safeguards import is_zero_mismatch, validate_linear_system
+
+        r = r.reshape(-1).to(dtype=val.dtype, device=val.device)
+        if is_zero_mismatch(r):
+            return torch.zeros(n, dtype=val.dtype, device=val.device)
+        validate_linear_system(crow, col, val, n, r)
         norm = normalize_linear_system(crow, col, val, n, r)
         if norm is None:
             return torch.zeros(n, dtype=val.dtype, device=val.device)
