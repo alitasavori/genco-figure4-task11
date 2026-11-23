@@ -16,6 +16,7 @@ from jmat.data.shard_io import save_triple_npz  # noqa: E402
 from jmat.data.splits import HOLDOUT_GRIDS, TRAIN_GRIDS  # noqa: E402
 from jmat.pf.newton_logger import newton_trace  # noqa: E402
 from jmat.pf.pfdelta_case import case_from_pfdelta_json  # noqa: E402
+from jmat.pf.pfdelta_paths import resolve_pfdelta_raw_dir  # noqa: E402
 from pfdelta_case_parquet import HF_REPO, _load_json, list_raw_sample_paths  # noqa: E402
 
 
@@ -78,17 +79,10 @@ def main() -> None:
     grids_hold = list(HOLDOUT_GRIDS)
     all_manifest = []
     grid_stats = {}
-    vendor = args.vendor_root
-    vendor_parent = vendor.parent if vendor.name == "pfdelta_task1.1" else vendor
-    pfdelta_root = vendor if vendor.name == "pfdelta_task1.1" else vendor / "pfdelta_task1.1"
     for grid in grids_train + grids_hold:
-        raw = vendor_parent / f"pfdelta_task1.1_{grid}" / "n" / "feasible" / "raw"
-        if not raw.is_dir():
-            raw = pfdelta_root / grid / "n" / "feasible" / "raw"
-        if not raw.is_dir():
-            raw = vendor / grid / "n" / "feasible" / "raw"
-        if not raw.is_dir():
-            print(f"skip {grid}: no raw at {raw}")
+        raw = resolve_pfdelta_raw_dir(args.vendor_root, grid)
+        if raw is None:
+            print(f"skip {grid}: no sample_*.json under Task 1.1 paths (see jmat/pf/pfdelta_paths.py)", flush=True)
             continue
         src = "train" if grid in grids_train else "holdout"
         man, st = process_grid(raw, grid, src, "n", n, args.out)

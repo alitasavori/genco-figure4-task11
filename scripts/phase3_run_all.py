@@ -74,9 +74,10 @@ def main() -> None:
         ckpt = ROOT / "results" / "jmat" / "phase3" / "synthetic_jmat_full.pt"
     man = ROOT / "results" / "jmat" / "pfdelta_pilot" / "manifest.json"
     data = ROOT / "results" / "jmat" / "pfdelta_pilot"
-    if not man.is_file():
+    if not man.is_file() or not _pfdelta_has_samples(data):
         man = ROOT / "results" / "jmat" / "synthetic" / "manifest.json"
         data = ROOT / "results" / "jmat" / "synthetic"
+        print(f"benchmark: using synthetic manifest ({man})", flush=True)
     run(
         [
             py,
