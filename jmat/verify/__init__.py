@@ -1,0 +1,1 @@
+"""Jacobian and mismatch verification (Phase 3 §1)."""

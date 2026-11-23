@@ -13,6 +13,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from jmat.data.manifest import write_manifest  # noqa: E402
 from jmat.data.shard_io import save_triple_npz  # noqa: E402
 from jmat.data.synthetic import SyntheticFamily, sample_matrix, sample_rhs_ensemble  # noqa: E402
 
@@ -43,19 +44,28 @@ def main() -> None:
                         f"{split}/{family.value}/n{n}/mat{mid}/rhs{rhs_id}.npz"
                     )
                     out_path = args.out / rel_path
+                    eval_slice = "trainpool"
+                    if split == "test":
+                        if family == SyntheticFamily.ILL_CONDITIONED:
+                            eval_slice = "ill_conditioned"
+                        elif n in args.holdout_n:
+                            eval_slice = "unseen_dim"
+                        elif mid % 2 == 1:
+                            eval_slice = "unseen_matrix"
+                        else:
+                            eval_slice = "unseen_family"
                     meta_dict = {
                         "family": family.value,
                         "n": n,
                         "matrix_id": mid,
                         "rhs_id": rhs_id,
                         "split": split,
+                        "eval_slice": eval_slice,
                         "cond_hint": meta.cond_hint,
                     }
                     save_triple_npz(out_path, j, r, x_star, meta_dict)
                     manifest.append({"path": rel_path, **meta_dict})
-    stats_path = args.out / "manifest.json"
-    stats_path.parent.mkdir(parents=True, exist_ok=True)
-    stats_path.write_text(json.dumps({"samples": manifest, "split_assign": split_assign}, indent=2), encoding="utf-8")
+    write_manifest(args.out / "manifest.json", manifest, meta={"kind": "synthetic", "seed": args.seed})
     print(f"Wrote {len(manifest)} samples -> {args.out}")
 
 
