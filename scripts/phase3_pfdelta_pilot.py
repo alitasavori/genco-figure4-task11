@@ -18,7 +18,11 @@ from jmat.data.shard_io import save_triple_npz  # noqa: E402
 from jmat.data.splits import HOLDOUT_GRIDS, TRAIN_GRIDS  # noqa: E402
 from jmat.pf.newton_logger import newton_trace  # noqa: E402
 from jmat.pf.pfdelta_case import case_from_pfdelta_json  # noqa: E402
-from jmat.pf.pfdelta_paths import resolve_pfdelta_raw_dir  # noqa: E402
+from jmat.pf.pfdelta_paths import (  # noqa: E402
+    diagnose_raw_dirs,
+    resolve_pfdelta_raw_dir,
+    resolve_vendor_for_grid,
+)
 from pfdelta_case_parquet import HF_REPO, _load_json, list_raw_sample_paths  # noqa: E402
 
 
@@ -167,21 +171,45 @@ def main() -> None:
     all_oc: list[dict] = []
     all_iter: list[dict] = []
     grid_rows: list[dict] = []
+    path_diag: list[dict] = []
     for grid in grids_train + grids_hold:
-        raw = resolve_pfdelta_raw_dir(args.vendor_root, grid)
+        raw = None
+        used_vendor = args.vendor_root
+        for vroot in resolve_vendor_for_grid(args.vendor_root, grid):
+            raw = resolve_pfdelta_raw_dir(vroot, grid)
+            if raw is not None:
+                used_vendor = vroot
+                break
+        for row in diagnose_raw_dirs(args.vendor_root, grid):
+            path_diag.append({"grid_id": grid, "vendor_root": str(args.vendor_root), **row})
         if raw is None:
             grid_rows.append(
                 {
                     "grid_id": grid,
                     "raw_dir": "",
+                    "vendor_used": "",
                     "requested_oc": num_oc,
                     "available_json_oc": 0,
                     "processed_oc": 0,
                     "saved_shards": 0,
+                    "converged_oc": 0,
+                    "failed_oc": 0,
+                    "newton_iters_total": 0,
                     "status": "skipped_no_json",
                 }
             )
-            print(f"skip {grid}: no sample_*.json (jmat/pf/pfdelta_paths.py)", flush=True)
+            print(f"\n*** NO JSON for {grid} — path check ***", flush=True)
+            for row in path_diag:
+                if row["grid_id"] != grid:
+                    continue
+                print(
+                    f"  exists={row['exists']}  n_json={row['n_json']}  {row['path'][:100]}",
+                    flush=True,
+                )
+            print(
+                f"  Fix: use --vendor-root with pfdelta_task1.1_{grid} or ensure train/.../raw has sample_*.json",
+                flush=True,
+            )
             continue
         available = len(list_raw_sample_paths(raw))
         src = "train" if grid in grids_train else "holdout"
@@ -193,6 +221,7 @@ def main() -> None:
             {
                 "grid_id": grid,
                 "raw_dir": str(raw),
+                "vendor_used": str(used_vendor),
                 "requested_oc": num_oc,
                 "available_json_oc": available,
                 "processed_oc": st["processed_oc"],
@@ -222,6 +251,7 @@ def main() -> None:
         [
             "grid_id",
             "raw_dir",
+            "vendor_used",
             "requested_oc",
             "available_json_oc",
             "processed_oc",
@@ -288,14 +318,51 @@ def main() -> None:
         ],
     )
 
-    print("\n=== PFΔ → JMAT dataset report ===", flush=True)
-    print(f"  NPZ shards (training): {len(all_manifest)} under {args.out}", flush=True)
-    print(f"  CSV reports: {reports}", flush=True)
-    print(f"    grid_summary.csv     rows={n_grid}", flush=True)
-    print(f"    oc_summary.csv       rows={n_oc}  (one row per operating condition)", flush=True)
-    print(f"    iteration_log.csv    rows={n_iter} (one row per saved Newton iter)", flush=True)
-    print(f"    training_triples_index.csv rows={n_triple}", flush=True)
-    print(f"    generation_run.csv   run metadata", flush=True)
+    write_csv(
+        reports / "path_diagnostics.csv",
+        ["grid_id", "vendor_root", "path", "exists", "n_json"],
+        path_diag,
+    )
+
+    print("\n" + "=" * 60, flush=True)
+    print("PFΔ → JMAT  INTERPRETABLE SUMMARY", flush=True)
+    print("=" * 60, flush=True)
+    for g in grid_rows:
+        print(
+            f"Grid {g['grid_id']}: status={g['status']}  "
+            f"OCs processed={g.get('processed_oc', 0)}/{g.get('requested_oc', 0)}  "
+            f"saved Newton steps={g.get('saved_shards', 0)}  "
+            f"converged OC={g.get('converged_oc', 0)}",
+            flush=True,
+        )
+        if g.get("raw_dir"):
+            print(f"  raw_json: {g['raw_dir']}", flush=True)
+    if all_oc:
+        iters = [int(r["newton_iters_total"]) for r in all_oc if r.get("newton_iters_total")]
+        saved = [int(r["saved_iterations"]) for r in all_oc if r.get("saved_iterations")]
+        if iters:
+            print(
+                f"Per OC Newton iters: min={min(iters)} max={max(iters)} avg={sum(iters)/len(iters):.1f}",
+                flush=True,
+            )
+        if saved:
+            print(
+                f"Saved training rows per OC: min={min(saved)} max={max(saved)} total={sum(saved)}",
+                flush=True,
+            )
+        print("\nFirst 5 operating conditions (see oc_summary.csv):", flush=True)
+        for r in all_oc[:5]:
+            print(
+                f"  {r['scenario_id']}: newton_iters={r['newton_iters_total']} "
+                f"saved={r['saved_iterations']} converged={r['converged']}",
+                flush=True,
+            )
+    else:
+        print("\n>>> ZERO operating conditions processed — only CSV diagnostics written.", flush=True)
+        print(f"    Open: {reports / 'path_diagnostics.csv'}", flush=True)
+    print(f"\nCSV folder: {reports}", flush=True)
+    print(f"NPZ training shards: {len(all_manifest)} under {args.out}", flush=True)
+    print("=" * 60 + "\n", flush=True)
 
 
 if __name__ == "__main__":
