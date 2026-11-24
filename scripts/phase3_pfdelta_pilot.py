@@ -202,21 +202,6 @@ def main() -> None:
         for row in diagnose_raw_dirs(args.vendor_root, grid):
             path_diag.append({"grid_id": grid, "vendor_root": str(args.vendor_root), **row})
         if raw is None:
-            grid_rows.append(
-                {
-                    "grid_id": grid,
-                    "raw_dir": "",
-                    "vendor_used": "",
-                    "requested_oc": num_oc,
-                    "available_json_oc": 0,
-                    "processed_oc": 0,
-                    "saved_shards": 0,
-                    "converged_oc": 0,
-                    "failed_oc": 0,
-                    "newton_iters_total": 0,
-                    "status": "skipped_no_json",
-                }
-            )
             print(f"\n*** NO JSON for {grid} — path check ***", flush=True)
             for row in path_diag:
                 if row["grid_id"] != grid:
@@ -238,6 +223,21 @@ def main() -> None:
                     "  Drive vendor has parquet only (no sample_*.json). "
                     "Re-run with --fetch-json or download case57.tar.gz to json_cache.",
                     flush=True,
+                )
+                grid_rows.append(
+                    {
+                        "grid_id": grid,
+                        "raw_dir": "",
+                        "vendor_used": "",
+                        "requested_oc": num_oc,
+                        "available_json_oc": 0,
+                        "processed_oc": 0,
+                        "saved_shards": 0,
+                        "converged_oc": 0,
+                        "failed_oc": 0,
+                        "newton_iters_total": 0,
+                        "status": "skipped_no_json",
+                    }
                 )
                 continue
         available = len(list_raw_sample_paths(raw))
