@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from jmat.data.csv_reports import manifest_to_triples_csv, write_csv  # noqa: E402
+from jmat.paths_drive import DRIVE_JMAT, pfdelta_output_dir, print_output_location  # noqa: E402
 from jmat.data.manifest import assign_pfdelta_bucket, write_manifest  # noqa: E402
 from jmat.data.shard_io import save_triple_npz  # noqa: E402
 from jmat.data.splits import HOLDOUT_GRIDS, TRAIN_GRIDS  # noqa: E402
@@ -132,7 +133,12 @@ def process_grid(
 def main() -> None:
     p = argparse.ArgumentParser(description="Generate JMAT PFΔ Newton dataset + CSV reports.")
     p.add_argument("--vendor-root", type=Path, default=ROOT.parent / "Foundation Model" / "vendor")
-    p.add_argument("--out", type=Path, default=ROOT / "results" / "jmat" / "pfdelta_pilot")
+    p.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help=f"Dataset root (default: Google Drive {DRIVE_JMAT} when mounted)",
+    )
     p.add_argument(
         "--num-oc",
         "--per-grid",
@@ -152,6 +158,11 @@ def main() -> None:
     )
     args = p.parse_args()
     num_oc = 20 if args.pilot else args.num_oc
+    grid_list = None
+    if args.grids:
+        grid_list = [g if g.startswith("case") else f"case{g}" for g in args.grids]
+    args.out = pfdelta_output_dir(grids=grid_list, explicit=args.out)
+    print_output_location(args.out)
     reports = args.out / "reports"
     reports.mkdir(parents=True, exist_ok=True)
     print(

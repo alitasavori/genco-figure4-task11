@@ -10,6 +10,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from jmat.paths_drive import pfdelta_output_dir, print_output_location  # noqa: E402
 
 
 def run(cmd: list[str]) -> None:
@@ -50,7 +53,7 @@ def main() -> None:
     args = p.parse_args()
     py = sys.executable
     pilot = ["--pilot"] if args.pilot else []
-    pfdelta_root = args.pfdelta_out or (ROOT / "results" / "jmat" / "pfdelta_pilot")
+    pfdelta_root = pfdelta_output_dir(grids=args.grids, explicit=args.pfdelta_out)
     print("JMAT Phase 3 run_all starting", flush=True)
     print(f"  pilot={args.pilot} skip_pfdelta={args.skip_pfdelta} vendor={args.vendor_root}", flush=True)
 
@@ -59,13 +62,12 @@ def main() -> None:
 
     do_pfdelta = not args.skip_pfdelta
     if do_pfdelta:
-        pf_cmd = [py, "scripts/phase3_pfdelta_pilot.py", *pilot]
+        print_output_location(pfdelta_root)
+        pf_cmd = [py, "scripts/phase3_pfdelta_pilot.py", *pilot, "--out", str(pfdelta_root)]
         if args.vendor_root:
             pf_cmd.extend(["--vendor-root", str(args.vendor_root)])
         if args.num_oc is not None and not args.pilot:
             pf_cmd.extend(["--num-oc", str(args.num_oc)])
-        if args.pfdelta_out:
-            pf_cmd.extend(["--out", str(args.pfdelta_out)])
         if args.grids:
             pf_cmd.extend(["--grids", *args.grids])
         run(pf_cmd)
