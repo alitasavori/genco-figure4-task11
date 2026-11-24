@@ -139,6 +139,13 @@ def main() -> None:
     )
     p.add_argument("--pilot", action="store_true", help="20 OCs/grid smoke test")
     p.add_argument("--lin-tol", type=float, default=1e-8)
+    p.add_argument(
+        "--grids",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Only these grid ids (e.g. case57). Default: all train + holdout grids.",
+    )
     args = p.parse_args()
     num_oc = 20 if args.pilot else args.num_oc
     reports = args.out / "reports"
@@ -149,6 +156,13 @@ def main() -> None:
     )
     grids_train = list(TRAIN_GRIDS)
     grids_hold = list(HOLDOUT_GRIDS)
+    if args.grids:
+        want = {g if g.startswith("case") else f"case{g}" for g in args.grids}
+        grids_train = [g for g in grids_train if g in want]
+        grids_hold = [g for g in grids_hold if g in want]
+        if not grids_train and not grids_hold:
+            raise SystemExit(f"No matching grids in {want}; train={TRAIN_GRIDS} holdout={HOLDOUT_GRIDS}")
+        print(f"Grid filter: train={grids_train} holdout={grids_hold}", flush=True)
     all_manifest: list[dict] = []
     all_oc: list[dict] = []
     all_iter: list[dict] = []

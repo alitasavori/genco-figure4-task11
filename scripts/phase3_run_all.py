@@ -44,6 +44,7 @@ def main() -> None:
     p.add_argument("--vendor-root", type=Path, default=None, help="PFΔ raw JSON vendor tree")
     p.add_argument("--num-oc", type=int, default=None, help="PFΔ operating conditions per grid")
     p.add_argument("--pfdelta-out", type=Path, default=None, help="PFΔ dataset + CSV output directory")
+    p.add_argument("--grids", type=str, nargs="*", default=None, help="PFΔ grids only, e.g. case57")
     p.add_argument("--skip-pfdelta", action="store_true")
     p.add_argument("--skip-ablation", action="store_true")
     args = p.parse_args()
@@ -65,6 +66,8 @@ def main() -> None:
             pf_cmd.extend(["--num-oc", str(args.num_oc)])
         if args.pfdelta_out:
             pf_cmd.extend(["--out", str(args.pfdelta_out)])
+        if args.grids:
+            pf_cmd.extend(["--grids", *args.grids])
         run(pf_cmd)
         if not _pfdelta_has_samples(pfdelta_root):
             print("No PFΔ samples found — skipping PFΔ train/benchmark holdout (set --vendor-root).", flush=True)
