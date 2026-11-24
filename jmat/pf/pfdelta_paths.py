@@ -45,7 +45,16 @@ def diagnose_raw_dirs(vendor_root: Path, grid_id: str) -> list[dict]:
     for raw in candidate_raw_dirs(vendor_root, grid_id):
         exists = raw.is_dir()
         n_json = len(list_raw_sample_paths(raw)) if exists else 0
-        rows.append({"path": str(raw), "exists": exists, "n_json": n_json})
+        n_parquet = len(list(raw.glob("*.parquet"))) if exists else 0
+        rows.append(
+            {
+                "path": str(raw),
+                "exists": exists,
+                "n_json": n_json,
+                "n_parquet": n_parquet,
+                "hint": "parquet_only" if exists and n_json == 0 and n_parquet else "",
+            }
+        )
     return rows
 
 

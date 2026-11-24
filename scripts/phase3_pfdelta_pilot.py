@@ -19,6 +19,7 @@ from jmat.data.shard_io import save_triple_npz  # noqa: E402
 from jmat.data.splits import HOLDOUT_GRIDS, TRAIN_GRIDS  # noqa: E402
 from jmat.pf.newton_logger import newton_trace  # noqa: E402
 from jmat.pf.pfdelta_case import case_from_pfdelta_json  # noqa: E402
+from jmat.pf.pfdelta_fetch import ensure_pfdelta_json_raw, json_cache_dir  # noqa: E402
 from jmat.pf.pfdelta_paths import (  # noqa: E402
     diagnose_raw_dirs,
     resolve_pfdelta_raw_dir,
@@ -150,6 +151,13 @@ def main() -> None:
     p.add_argument("--pilot", action="store_true", help="20 OCs/grid smoke test")
     p.add_argument("--lin-tol", type=float, default=1e-8)
     p.add_argument(
+        "--fetch-json",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Download PFΔ JSON from Hugging Face when Drive vendor has parquet only",
+    )
+    p.add_argument("--json-cache", type=Path, default=None, help="Cache for downloaded JSON (default: Drive)")
+    p.add_argument(
         "--grids",
         type=str,
         nargs="*",
@@ -217,11 +225,21 @@ def main() -> None:
                     f"  exists={row['exists']}  n_json={row['n_json']}  {row['path'][:100]}",
                     flush=True,
                 )
-            print(
-                f"  Fix: use --vendor-root with pfdelta_task1.1_{grid} or ensure train/.../raw has sample_*.json",
-                flush=True,
-            )
-            continue
+            if args.fetch_json:
+                try:
+                    cache = args.json_cache or json_cache_dir()
+                    raw = ensure_pfdelta_json_raw(grid, min_samples=min(1, num_oc), work=cache)
+                    used_vendor = cache
+                except Exception as exc:
+                    print(f"  JSON fetch failed: {exc}", flush=True)
+                    raw = None
+            if raw is None:
+                print(
+                    "  Drive vendor has parquet only (no sample_*.json). "
+                    "Re-run with --fetch-json or download case57.tar.gz to json_cache.",
+                    flush=True,
+                )
+                continue
         available = len(list_raw_sample_paths(raw))
         src = "train" if grid in grids_train else "holdout"
         man, st, oc_rows, iter_rows = process_grid(raw, grid, src, "n", num_oc, args.out, lin_tol=args.lin_tol)
@@ -331,7 +349,7 @@ def main() -> None:
 
     write_csv(
         reports / "path_diagnostics.csv",
-        ["grid_id", "vendor_root", "path", "exists", "n_json"],
+        ["grid_id", "vendor_root", "path", "exists", "n_json", "n_parquet", "hint"],
         path_diag,
     )
 
