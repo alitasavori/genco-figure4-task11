@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Phase 3 §3 — PFΔ Newton traces (500 scenarios/grid pilot)."""
+"""Phase 3 §3 — PFΔ Newton traces with interpretable CSV reports."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from jmat.data.csv_reports import manifest_to_triples_csv, write_csv  # noqa: E402
 from jmat.data.manifest import assign_pfdelta_bucket, write_manifest  # noqa: E402
 from jmat.data.shard_io import save_triple_npz  # noqa: E402
 from jmat.data.splits import HOLDOUT_GRIDS, TRAIN_GRIDS  # noqa: E402
@@ -20,15 +22,48 @@ from jmat.pf.pfdelta_paths import resolve_pfdelta_raw_dir  # noqa: E402
 from pfdelta_case_parquet import HF_REPO, _load_json, list_raw_sample_paths  # noqa: E402
 
 
-def process_grid(raw_dir: Path, grid_id: str, source_split: str, topology: str, max_samples: int, out: Path):
-    manifest = []
-    stats = {"scenarios": 0, "steps": 0, "failed_scenarios": 0, "j_dims": [], "nnz": [], "cond": []}
-    paths = list_raw_sample_paths(raw_dir)[:max_samples]
-    print(f"  {grid_id}: {len(paths)} scenarios from {raw_dir}", flush=True)
+def process_grid(
+    raw_dir: Path,
+    grid_id: str,
+    source_split: str,
+    topology: str,
+    num_oc: int,
+    out: Path,
+    *,
+    lin_tol: float = 1e-8,
+) -> tuple[list[dict], dict, list[dict], list[dict]]:
+    manifest: list[dict] = []
+    oc_rows: list[dict] = []
+    iter_rows: list[dict] = []
+    stats = {
+        "requested_oc": num_oc,
+        "processed_oc": 0,
+        "failed_oc": 0,
+        "saved_shards": 0,
+        "newton_iters_total": 0,
+        "converged_oc": 0,
+    }
+    paths = list_raw_sample_paths(raw_dir)[:num_oc]
+    print(f"  {grid_id}: {len(paths)} OCs (requested {num_oc}) from {raw_dir}", flush=True)
     for si, sample_path in enumerate(paths):
-        stats["scenarios"] += 1
+        stats["processed_oc"] += 1
+        oc_id = sample_path.stem
         if si % 5 == 0:
-            print(f"    {grid_id} scenario {si + 1}/{len(paths)}", flush=True)
+            print(f"    {grid_id} OC {si + 1}/{len(paths)} ({oc_id})", flush=True)
+        row: dict = {
+            "grid_id": grid_id,
+            "scenario_id": oc_id,
+            "topology_id": topology,
+            "source_split": source_split,
+            "json_path": str(sample_path),
+            "requested": 1,
+            "newton_iters_total": 0,
+            "saved_iterations": 0,
+            "converged": 0,
+            "final_mismatch_inf": "",
+            "status": "ok",
+            "error": "",
+        }
         try:
             pm = _load_json(sample_path)
             case = case_from_pfdelta_json(pm)
@@ -40,57 +75,213 @@ def process_grid(raw_dir: Path, grid_id: str, source_split: str, topology: str, 
                 case["q_spec"],
                 v_set=case["v_set"],
             )
-            if not st["converged"]:
-                stats["failed_scenarios"] += 1
+            row["newton_iters_total"] = len(steps)
+            row["final_mismatch_inf"] = st.get("final_mismatch_inf", "")
+            row["converged"] = int(bool(st.get("converged")))
+            stats["newton_iters_total"] += len(steps)
+            if st.get("converged"):
+                stats["converged_oc"] += 1
+            else:
+                stats["failed_oc"] += 1
             for step in steps:
-                if step.lin_residual_rel > 1e-8:
+                if step.lin_residual_rel > lin_tol:
                     continue
-                bucket = assign_pfdelta_bucket(grid_id, source_split, sample_path.stem, topology)
+                bucket = assign_pfdelta_bucket(grid_id, source_split, oc_id, topology)
                 meta = {
                     "grid_id": grid_id,
                     "topology_id": topology,
-                    "scenario_id": sample_path.stem,
+                    "scenario_id": oc_id,
                     "iteration": step.iteration,
                     "split_bucket": bucket,
                     "source_split": source_split,
                     "hf_repo": HF_REPO,
+                    "n_reduced": step.j.shape[0],
+                    "j_nnz": int(step.j.nnz),
+                    "lin_residual_rel": step.lin_residual_rel,
                 }
-                rel = f"{bucket}/{grid_id}/{topology}/{sample_path.stem}/iter{step.iteration:02d}.npz"
+                rel = f"{bucket}/{grid_id}/{topology}/{oc_id}/iter{step.iteration:02d}.npz"
                 save_triple_npz(out / rel, step.j, step.r, step.dx_star, meta)
                 manifest.append({"path": rel, **meta})
-                stats["steps"] += 1
-                stats["j_dims"].append(step.j.shape[0])
-                stats["nnz"].append(int(step.j.nnz))
-        except Exception:
-            stats["failed_scenarios"] += 1
-    return manifest, stats
+                iter_rows.append(
+                    {
+                        "grid_id": grid_id,
+                        "scenario_id": oc_id,
+                        "topology_id": topology,
+                        "split_bucket": bucket,
+                        "iteration": step.iteration,
+                        "n_reduced": step.j.shape[0],
+                        "j_nnz": int(step.j.nnz),
+                        "lin_residual_rel": step.lin_residual_rel,
+                        "npz_path": rel,
+                    }
+                )
+                row["saved_iterations"] += 1
+                stats["saved_shards"] += 1
+        except Exception as exc:
+            row["status"] = "error"
+            row["error"] = f"{type(exc).__name__}: {exc}"
+            stats["failed_oc"] += 1
+        oc_rows.append(row)
+    return manifest, stats, oc_rows, iter_rows
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="Generate JMAT PFΔ Newton dataset + CSV reports.")
     p.add_argument("--vendor-root", type=Path, default=ROOT.parent / "Foundation Model" / "vendor")
     p.add_argument("--out", type=Path, default=ROOT / "results" / "jmat" / "pfdelta_pilot")
-    p.add_argument("--per-grid", type=int, default=500)
-    p.add_argument("--pilot", action="store_true", help="20 samples/grid for smoke")
+    p.add_argument(
+        "--num-oc",
+        "--per-grid",
+        type=int,
+        dest="num_oc",
+        default=500,
+        help="Operating conditions (PFΔ scenarios) per grid",
+    )
+    p.add_argument("--pilot", action="store_true", help="20 OCs/grid smoke test")
+    p.add_argument("--lin-tol", type=float, default=1e-8)
     args = p.parse_args()
-    n = 20 if args.pilot else args.per_grid
-    print(f"phase3_pfdelta_pilot: pilot={args.pilot} per_grid={n} vendor={args.vendor_root}", flush=True)
+    num_oc = 20 if args.pilot else args.num_oc
+    reports = args.out / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    print(
+        f"phase3_pfdelta_pilot: num_oc_per_grid={num_oc} pilot={args.pilot} vendor={args.vendor_root} out={args.out}",
+        flush=True,
+    )
     grids_train = list(TRAIN_GRIDS)
     grids_hold = list(HOLDOUT_GRIDS)
-    all_manifest = []
-    grid_stats = {}
+    all_manifest: list[dict] = []
+    all_oc: list[dict] = []
+    all_iter: list[dict] = []
+    grid_rows: list[dict] = []
     for grid in grids_train + grids_hold:
         raw = resolve_pfdelta_raw_dir(args.vendor_root, grid)
         if raw is None:
-            print(f"skip {grid}: no sample_*.json under Task 1.1 paths (see jmat/pf/pfdelta_paths.py)", flush=True)
+            grid_rows.append(
+                {
+                    "grid_id": grid,
+                    "raw_dir": "",
+                    "requested_oc": num_oc,
+                    "available_json_oc": 0,
+                    "processed_oc": 0,
+                    "saved_shards": 0,
+                    "status": "skipped_no_json",
+                }
+            )
+            print(f"skip {grid}: no sample_*.json (jmat/pf/pfdelta_paths.py)", flush=True)
             continue
+        available = len(list_raw_sample_paths(raw))
         src = "train" if grid in grids_train else "holdout"
-        man, st = process_grid(raw, grid, src, "n", n, args.out)
+        man, st, oc_rows, iter_rows = process_grid(raw, grid, src, "n", num_oc, args.out, lin_tol=args.lin_tol)
         all_manifest.extend(man)
-        grid_stats[grid] = st
-    write_manifest(args.out / "manifest.json", all_manifest, meta={"per_grid": n, "stats": grid_stats})
-    (args.out / "dataset_stats.json").write_text(json.dumps(grid_stats, indent=2), encoding="utf-8")
-    print(f"manifest entries={len(all_manifest)} stats={grid_stats}")
+        all_oc.extend(oc_rows)
+        all_iter.extend(iter_rows)
+        grid_rows.append(
+            {
+                "grid_id": grid,
+                "raw_dir": str(raw),
+                "requested_oc": num_oc,
+                "available_json_oc": available,
+                "processed_oc": st["processed_oc"],
+                "saved_shards": st["saved_shards"],
+                "converged_oc": st["converged_oc"],
+                "failed_oc": st["failed_oc"],
+                "newton_iters_total": st["newton_iters_total"],
+                "status": "ok" if st["saved_shards"] else "no_shards",
+            }
+        )
+    meta = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "num_oc_per_grid": num_oc,
+        "pilot": args.pilot,
+        "vendor_root": str(args.vendor_root),
+        "total_shards": len(all_manifest),
+        "total_oc": len(all_oc),
+    }
+    write_manifest(args.out / "manifest.json", all_manifest, meta=meta)
+    (args.out / "dataset_stats.json").write_text(
+        json.dumps({"meta": meta, "grids": grid_rows}, indent=2),
+        encoding="utf-8",
+    )
+
+    n_grid = write_csv(
+        reports / "grid_summary.csv",
+        [
+            "grid_id",
+            "raw_dir",
+            "requested_oc",
+            "available_json_oc",
+            "processed_oc",
+            "saved_shards",
+            "converged_oc",
+            "failed_oc",
+            "newton_iters_total",
+            "status",
+        ],
+        grid_rows,
+    )
+    n_oc = write_csv(
+        reports / "oc_summary.csv",
+        [
+            "grid_id",
+            "scenario_id",
+            "topology_id",
+            "source_split",
+            "json_path",
+            "newton_iters_total",
+            "saved_iterations",
+            "converged",
+            "final_mismatch_inf",
+            "status",
+            "error",
+        ],
+        all_oc,
+    )
+    n_iter = write_csv(
+        reports / "iteration_log.csv",
+        [
+            "grid_id",
+            "scenario_id",
+            "topology_id",
+            "split_bucket",
+            "iteration",
+            "n_reduced",
+            "j_nnz",
+            "lin_residual_rel",
+            "npz_path",
+        ],
+        all_iter,
+    )
+    n_triple = manifest_to_triples_csv(all_manifest, reports / "training_triples_index.csv")
+    write_csv(
+        reports / "generation_run.csv",
+        [
+            "generated_at_utc",
+            "num_oc_per_grid",
+            "pilot",
+            "vendor_root",
+            "out_dir",
+            "total_oc",
+            "total_saved_iterations",
+            "total_npz_shards",
+        ],
+        [
+            {
+                **meta,
+                "out_dir": str(args.out),
+                "total_saved_iterations": n_iter,
+                "total_npz_shards": n_triple,
+            }
+        ],
+    )
+
+    print("\n=== PFΔ → JMAT dataset report ===", flush=True)
+    print(f"  NPZ shards (training): {len(all_manifest)} under {args.out}", flush=True)
+    print(f"  CSV reports: {reports}", flush=True)
+    print(f"    grid_summary.csv     rows={n_grid}", flush=True)
+    print(f"    oc_summary.csv       rows={n_oc}  (one row per operating condition)", flush=True)
+    print(f"    iteration_log.csv    rows={n_iter} (one row per saved Newton iter)", flush=True)
+    print(f"    training_triples_index.csv rows={n_triple}", flush=True)
+    print(f"    generation_run.csv   run metadata", flush=True)
 
 
 if __name__ == "__main__":

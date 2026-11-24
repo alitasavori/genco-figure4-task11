@@ -42,12 +42,14 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--pilot", action="store_true", help="Small data + short training (Colab-friendly)")
     p.add_argument("--vendor-root", type=Path, default=None, help="PFΔ raw JSON vendor tree")
+    p.add_argument("--num-oc", type=int, default=None, help="PFΔ operating conditions per grid")
+    p.add_argument("--pfdelta-out", type=Path, default=None, help="PFΔ dataset + CSV output directory")
     p.add_argument("--skip-pfdelta", action="store_true")
     p.add_argument("--skip-ablation", action="store_true")
     args = p.parse_args()
     py = sys.executable
     pilot = ["--pilot"] if args.pilot else []
-    pfdelta_root = ROOT / "results" / "jmat" / "pfdelta_pilot"
+    pfdelta_root = args.pfdelta_out or (ROOT / "results" / "jmat" / "pfdelta_pilot")
     print("JMAT Phase 3 run_all starting", flush=True)
     print(f"  pilot={args.pilot} skip_pfdelta={args.skip_pfdelta} vendor={args.vendor_root}", flush=True)
 
@@ -59,6 +61,10 @@ def main() -> None:
         pf_cmd = [py, "scripts/phase3_pfdelta_pilot.py", *pilot]
         if args.vendor_root:
             pf_cmd.extend(["--vendor-root", str(args.vendor_root)])
+        if args.num_oc is not None and not args.pilot:
+            pf_cmd.extend(["--num-oc", str(args.num_oc)])
+        if args.pfdelta_out:
+            pf_cmd.extend(["--out", str(args.pfdelta_out)])
         run(pf_cmd)
         if not _pfdelta_has_samples(pfdelta_root):
             print("No PFΔ samples found — skipping PFΔ train/benchmark holdout (set --vendor-root).", flush=True)

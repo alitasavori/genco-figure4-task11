@@ -30,4 +30,25 @@ subprocess.check_call(cmd, cwd=cwd)
 
 Set `FULL_RUN = True` in the notebook cell (and drop `--pilot`) for full 500/grid training.
 
-Outputs: `results/jmat/phase3/`.
+PFΔ dataset + CSV reports (default on Drive in notebook):
+
+`My Drive/Foundation Model/results/jmat/pfdelta_pilot/reports/`
+
+| CSV | Meaning |
+|-----|---------|
+| `grid_summary.csv` | Per grid: requested OCs, saved shards, failures |
+| `oc_summary.csv` | Per PFΔ scenario: Newton iters, saved iters, converged |
+| `iteration_log.csv` | Per saved Newton step: iter, nnz, NPZ path |
+| `training_triples_index.csv` | Flat index of all training shards |
+| `generation_run.csv` | One-line run metadata |
+
+Training matrices stay in `.npz` (sparse Jacobians); use CSVs to interpret coverage.
+
+Dataset-only generation:
+
+```bash
+python scripts/phase3_pfdelta_pilot.py \
+  --vendor-root "/content/drive/MyDrive/Foundation Model/vendor/pfdelta_task1.1" \
+  --num-oc 500 \
+  --out "/content/drive/MyDrive/Foundation Model/results/jmat/pfdelta_pilot"
+```
